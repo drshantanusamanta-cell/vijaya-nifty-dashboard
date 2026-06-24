@@ -1418,9 +1418,13 @@ def compute_section34_bias(df_band_records, m, spot):
     elif bias_score <= -15: direction = "BEARISH"
     else:                   direction = "NEUTRAL"
 
+    # v4: expose smart money quality strikes count for the Leading Signals panel
+    _qcount = int(_quality_mask.sum())
+
     return {
         "bias_score":  bias_score,
         "direction":   direction,
+        "quality_strikes_count": _qcount,
         "signal_breakdown": {
             "S1 Net OI":     round(s1, 1),
             "S2 Momentum":   round(s2, 1),
@@ -4966,8 +4970,9 @@ with _ls_col3:
         st.markdown('<div class="card"><div style="font-size:11px;font-weight:700;color:#6B7280;">Inter-Expiry OI Flow</div><div style="font-size:12px;color:#9CA3AF;margin-top:6px;">Need 2+ expiries from Dhan API</div></div>', unsafe_allow_html=True)
 
     # Smart Money OI Filter Stats
-    _sm_label = "SMART MONEY" if _quality_mask.sum() > 5 else "MIXED"
-    _sm_color = "#059669" if _quality_mask.sum() > 5 else "#F59E0B"
+    _sm_quality_count = _s34_bias.get("quality_strikes_count", 0)
+    _sm_label = "SMART MONEY" if _sm_quality_count > 5 else "MIXED"
+    _sm_color = "#059669" if _sm_quality_count > 5 else "#F59E0B"
     st.markdown(f"""
     <div class="card">
       <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Smart Money OI Filter</div>
