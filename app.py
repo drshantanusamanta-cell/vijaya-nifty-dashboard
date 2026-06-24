@@ -1249,7 +1249,7 @@ def compute_nifty_bias(m, history=None):
 
 
 # ─── Section 3 & 4 Bias Engine ───────────────────────────────────────────────
-def compute_section34_bias(df_band_records, m, spot):
+def compute_section34_bias(df_band_records, m, spot, roll_discount=1.0):
     """
     5-signal market bias from Section 3 (metrics) + Section 4 (±10 strike band).
     Score range: -100 (strongly bearish) to +100 (strongly bullish).
@@ -1325,8 +1325,10 @@ def compute_section34_bias(df_band_records, m, spot):
       + (_qf["call_oi_chg"].abs() * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
     )
     s2 = (net_mom / abs_mom * 25.0) if abs_mom > 0 else 0.0
-    s2 = max(-25.0, min(25.0, s2))
-
+    # roll_discount < 1.0 when detect_roll_activity() identifies mechanical expiry
+    # roll as the dominant cause of OI change — prevents institutional roll from
+    # being misread as genuine directional selling / covering pressure.
+    s2 = round(max(-25.0, min(25.0, s2)) * roll_discount, 1)
 
     # ── Signal 3: Key Level Position (±20 pts) ────────────────────────────────
     # Sub-A: Spot vs S/R band (±6 pts)
@@ -1419,10 +1421,12 @@ def compute_section34_bias(df_band_records, m, spot):
     return {
         "bias_score":  bias_score,
         "direction":   direction,
-        "quality_strikes_count": _qcount,
+        "quality_strikes_count":  _qcount,
+        "roll_discount_applied":  round(roll_discount, 2),
+        "roll_window_active":     is_roll_window(),
         "signal_breakdown": {
             "S1 Net OI":     round(s1, 1),
-            "S2 Momentum":   round(s2, 1),
+            "S2 Momentum":   round(s2, 1),   # already roll-discounted
             "S3 Key Levels": round(s3, 1),
             "S4 IV Skew":    round(s4, 1),
             "S5 PCR":        round(s5, 1),
@@ -2183,6 +2187,171 @@ def fetch_back_expiry_atm_iv(back_expiry: str):
         return round(atm_iv_back, 2) if atm_iv_back > 0 else None
     except Exception:
         return None
+
+
+# ─── Roll Detection — Inter-Expiry OI Comparison ────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_back_expiry_oi_band(back_expiry: str):
+    """
+    Fetch strike-level OI + OI change for the back expiry — lightweight version.
+    Returns only the columns needed for roll detection:
+        strike, call_oi, put_oi, call_oi_chg, put_oi_chg
+    Unlike fetch_back_expiry_atm_iv(), this fetches the FULL OI band so we can
+    compare OI changes at shared strikes between front and back expiry.
+    """
+    if not USE_DHAN or not back_expiry:
+        return pd.DataFrame()
+    import requests
+    headers = {
+        "access-token": DHAN_ACCESS_TOKEN,
+        "client-id":    str(DHAN_CLIENT_ID),
+        "Content-Type": "application/json",
+    }
+    sec = DHAN_SECURITY["NIFTY"]
+    try:
+        resp = requests.post(
+            "https://api.dhan.co/v2/optionchain",
+            headers=headers,
+            json={"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
+                  "Expiry": back_expiry},
+            timeout=15,
+        )
+        data = resp.json().get("data", {}) or {}
+        oc   = data.get("oc", {}) or {}
+        if not oc:
+            return pd.DataFrame()
+        rows = []
+        for strike_str, chain in oc.items():
+            K  = safe_num(strike_str, 0)
+            if K <= 0:
+                continue
+            ce = (chain or {}).get("ce", {}) or {}
+            pe = (chain or {}).get("pe", {}) or {}
+            c_oi      = int(ce.get("oi", 0) or 0)
+            c_prev_oi = int(ce.get("previous_oi", 0) or 0)
+            p_oi      = int(pe.get("oi", 0) or 0)
+            p_prev_oi = int(pe.get("previous_oi", 0) or 0)
+            rows.append({
+                "strike":      K,
+                "call_oi":     c_oi,
+                "put_oi":      p_oi,
+                "call_oi_chg": c_oi - c_prev_oi,
+                "put_oi_chg":  p_oi - p_prev_oi,
+            })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        return df.sort_values("strike").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def is_roll_window() -> bool:
+    """
+    True during the mechanical weekly roll window:
+    Tuesday 14:00 IST → Wednesday 15:30 IST (before Thursday expiry).
+    During this window institutional desks systematically roll front-week
+    positions to the next expiry, making OI momentum signals unreliable.
+    """
+    n = now_ist()
+    wd = n.weekday()   # 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
+    hm = (n.hour, n.minute)
+    if wd == 1 and hm >= (14, 0):   # Tuesday afternoon
+        return True
+    if wd == 2:                      # All day Wednesday
+        return True
+    return False
+
+
+def detect_roll_activity(front_df, back_df, spot: float) -> dict:
+    """
+    Distinguish mechanical OI roll from genuine directional liquidation.
+
+    Roll signature   : front OI falling AND back OI rising at the SAME strike.
+    Liquidation sig  : front OI falling with NO corresponding back-expiry build.
+
+    Returns:
+      roll_fraction     (float 0–1) : share of unwinding front strikes that have
+                                      a matching back-expiry build.
+      roll_detected     (bool)      : True if roll_fraction >= 0.50
+      momentum_discount (float 0–1) : multiplier applied to S2 — scales linearly
+                                      from 1.0 (no roll) → 0.20 (pure roll).
+                                      Never fully zero: real positioning co-exists.
+      roll_pts_call / _put (int)    : net call/put OI draining from front expiry
+      details           (list[str]) : human-readable lines for the UI card
+    """
+    _base = {
+        "roll_fraction": 0.0, "roll_detected": False,
+        "momentum_discount": 1.0,
+        "roll_pts_call": 0, "roll_pts_put": 0,
+        "details": [],
+    }
+    if front_df is None or front_df.empty or back_df is None or back_df.empty:
+        _base["details"] = ["Back-expiry OI unavailable — roll detection inactive"]
+        return _base
+
+    # Near-ATM band: ±10 strikes where rolls concentrate
+    lo = spot - 10 * NIFTY_STEP
+    hi = spot + 10 * NIFTY_STEP
+    f = front_df[front_df["strike"].between(lo, hi)].copy()
+    b = back_df[back_df["strike"].between(lo, hi)].copy()
+    if f.empty or b.empty:
+        _base["details"] = ["Insufficient near-ATM OI data for roll detection"]
+        return _base
+
+    shared = pd.merge(
+        f[["strike", "call_oi_chg", "put_oi_chg"]],
+        b[["strike", "call_oi_chg", "put_oi_chg"]],
+        on="strike", suffixes=("_f", "_b"),
+    )
+    if shared.empty:
+        _base["details"] = ["No shared strikes between front and back expiry"]
+        return _base
+
+    # Significance threshold: ignore trivial lot movements
+    _MIN_LOTS = 100
+    call_unwind = shared["call_oi_chg_f"] < -_MIN_LOTS
+    call_roll   = call_unwind & (shared["call_oi_chg_b"] >  _MIN_LOTS // 2)
+    put_unwind  = shared["put_oi_chg_f"]  < -_MIN_LOTS
+    put_roll    = put_unwind  & (shared["put_oi_chg_b"]  >  _MIN_LOTS // 2)
+
+    total_unwind   = call_unwind.sum() + put_unwind.sum()
+    total_roll     = call_roll.sum()   + put_roll.sum()
+    roll_fraction  = (total_roll / total_unwind) if total_unwind > 0 else 0.0
+
+    roll_pts_call = int(shared.loc[call_unwind, "call_oi_chg_f"].sum())
+    roll_pts_put  = int(shared.loc[put_unwind,  "put_oi_chg_f"].sum())
+
+    # Linear discount: 1.0 at 0% roll → 0.20 at 100% roll
+    momentum_discount = round(max(0.20, 1.0 - roll_fraction * 0.80), 2)
+    roll_detected     = roll_fraction >= 0.50
+
+    details = []
+    if roll_detected:
+        details.append(
+            f"⚠ ROLL: {roll_fraction*100:.0f}% of near-ATM OI unwind matched "
+            f"by back-expiry build — S2 discounted to {momentum_discount*100:.0f}%"
+        )
+        if roll_pts_call < -500:
+            details.append(f"Call roll: {roll_pts_call:,} lots draining front expiry")
+        if roll_pts_put < -500:
+            details.append(f"Put roll: {roll_pts_put:,} lots draining front expiry")
+    elif total_unwind > 0:
+        details.append(
+            f"Liquidation dominant ({roll_fraction*100:.0f}% roll fraction) — "
+            f"OI unwind is genuine; S2 at full strength"
+        )
+    else:
+        details.append("No significant near-ATM OI unwind detected")
+
+    return {
+        "roll_fraction":      round(roll_fraction, 3),
+        "roll_detected":      roll_detected,
+        "momentum_discount":  momentum_discount,
+        "roll_pts_call":      roll_pts_call,
+        "roll_pts_put":       roll_pts_put,
+        "details":            details,
+    }
 
 
 def compute_term_structure_signal(front_atm_iv: float, back_atm_iv):
@@ -4025,7 +4194,16 @@ bc              = GREEN if bs > 15 else (RED if bs < -15 else AMBER)
 direction_label = bias["direction"]
 regime          = bias["regime"]
 # ── Section 3 & 4 bias (5-signal engine) — recorded every 5 minutes ──────────
-_s34_bias = compute_section34_bias(payload["df_band"], m, spot)
+# Step 0: Roll detection — fetch back-expiry full OI band to assess whether
+# near-ATM OI changes are mechanical roll vs genuine directional activity.
+# This runs BEFORE S34 bias so the roll_discount reaches S2 at score time.
+_roll_back_exp     = _expiry_list[1] if len(_expiry_list) > 1 else None
+_back_oi_band_df   = fetch_back_expiry_oi_band(_roll_back_exp) if _roll_back_exp else None
+_front_df_for_roll = pd.DataFrame(payload["df_band"]) if payload.get("df_band") else None
+_roll_data         = detect_roll_activity(_front_df_for_roll, _back_oi_band_df, spot)
+_s34_bias = compute_section34_bias(
+    payload["df_band"], m, spot, roll_discount=_roll_data["momentum_discount"]
+)
 _s34_score = _s34_bias["bias_score"]
 _s34_breakdown = _s34_bias.get("signal_breakdown", {})
 
@@ -4950,19 +5128,38 @@ with _ls_col2:
 
 with _ls_col3:
     # Inter-Expiry OI Flow
+    # ── Inter-Expiry OI Flow: enhanced with roll detection output ────────────
+    _rd = _roll_data   # from detect_roll_activity() computed above
+    _roll_frac  = _rd.get("roll_fraction", 0.0)
+    _roll_det   = _rd.get("roll_detected", False)
+    _mom_disc   = _rd.get("momentum_discount", 1.0)
+    _roll_win   = _s34_bias.get("roll_window_active", False)
+    _roll_disc_applied = _s34_bias.get("roll_discount_applied", 1.0)
+    _rd_detail  = (_rd.get("details") or ["Roll detection inactive"])[0]
+    _card_color = "#DC2626" if _roll_det else ("#D97706" if _roll_win else "#059669")
+    _disc_label = f"{_mom_disc*100:.0f}% S2 strength" if _mom_disc < 1.0 else "Full S2 strength"
     if _inter_expiry_signal and _inter_expiry_signal["available"]:
         _ie = _inter_expiry_signal
-        _ie_color = "#D97706" if _ie["roll_signal"] else "#6B7280"
         st.markdown(f"""
-        <div class="card">
+        <div class="card" style="border-left:4px solid {_card_color};">
           <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Inter-Expiry OI Flow</div>
           <div style="font-size:13px;font-weight:700;color:#1A1A2E;">Front PCR: {_ie["front_pcr"]:.2f} · Back PCR: {_ie["back_pcr"]:.2f}</div>
-          <div style="font-size:12px;color:#374151;">PCR diff (front-back): {_ie["pcr_diff"]:+.2f}</div>
-          <div style="font-size:12px;color:#374151;">Front mom: {_ie["front_momentum"]:+,.0f} · Back mom: {_ie["back_momentum"]:+,.0f}</div>
-          {f'<div style="font-size:12px;font-weight:700;color:{_ie_color};margin-top:6px;">{_ie["roll_signal"]}</div>' if _ie["roll_signal"] else '<div style="font-size:12px;color:#9CA3AF;margin-top:6px;">No active roll signal</div>'}
+          <div style="font-size:12px;color:#374151;">PCR diff (front–back): {_ie["pcr_diff"]:+.2f} · Front mom: {_ie["front_momentum"]:+,.0f}</div>
+          <div style="font-size:11px;color:{_card_color};font-weight:700;margin-top:5px;">
+            {"⚠ ROLL WINDOW ACTIVE" if _roll_win else "✓ No roll window"} · Roll fraction: {_roll_frac*100:.0f}% · {_disc_label}
+          </div>
+          <div style="font-size:11px;color:#6B7280;margin-top:3px;">{_rd_detail}</div>
         </div>""", unsafe_allow_html=True)
     else:
-        st.markdown('<div class="card"><div style="font-size:11px;font-weight:700;color:#6B7280;">Inter-Expiry OI Flow</div><div style="font-size:12px;color:#9CA3AF;margin-top:6px;">Need 2+ expiries from Dhan API</div></div>', unsafe_allow_html=True)
+        # Even without cross-PCR data, show roll detection status
+        st.markdown(f"""
+        <div class="card" style="border-left:4px solid {_card_color};">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Inter-Expiry OI Flow</div>
+          <div style="font-size:11px;color:{_card_color};font-weight:700;margin-top:5px;">
+            {"⚠ ROLL WINDOW ACTIVE" if _roll_win else "✓ No roll window"} · Roll fraction: {_roll_frac*100:.0f}% · {_disc_label}
+          </div>
+          <div style="font-size:11px;color:#6B7280;margin-top:3px;">{_rd_detail}</div>
+        </div>""", unsafe_allow_html=True)
 
     # Smart Money OI Filter Stats
     _sm_quality_count = _s34_bias.get("quality_strikes_count", 0)
