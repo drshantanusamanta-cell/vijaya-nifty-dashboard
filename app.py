@@ -1306,16 +1306,11 @@ def compute_section34_bias(df_band_records, m, spot):
     _qf = _quality_df
 
     # ── Signal 1: Moneyness-Adjusted Δ-Weighted Net OI (±35 pts) ─────────────
-    sum_call_s1 = (_qf["call_oi"] * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
-    sum_put_s1  = (_qf["put_oi"]  * _qf["put_delta"].abs()  * _qf["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)).sum()
-    denom_s1    = sum_call_s1 + sum_put_s1
-    s1 = ((sum_put_s1 - sum_call_s1) / denom_s1 * 35.0) if denom_s1 > 0 else 0.0
-    s1 = max(-35.0, min(35.0, s1))
-
     # Positive = put-side dominant = BULLISH (floor > ceiling)
     # Negative = call-side dominant = BEARISH (ceiling > floor)
-    sum_call_s1 = (df["call_oi"] * call_delta_abs * call_wt).sum()
-    sum_put_s1  = (df["put_oi"]  * put_delta_abs  * put_wt).sum()
+    # Uses smart-money quality filter (_qf) — near-ATM, significant OI changes only
+    sum_call_s1 = (_qf["call_oi"] * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
+    sum_put_s1  = (_qf["put_oi"]  * _qf["put_delta"].abs()  * _qf["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)).sum()
     denom_s1    = sum_call_s1 + sum_put_s1
     s1 = ((sum_put_s1 - sum_call_s1) / denom_s1 * 35.0) if denom_s1 > 0 else 0.0
     s1 = max(-35.0, min(35.0, s1))
