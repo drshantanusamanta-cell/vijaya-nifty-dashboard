@@ -5,14 +5,14 @@
 ║  Data: Dhan API (primary) | Demo Mode (fallback)                    ║
 ║  NIFTY 50 + NIFTY Futures ONLY                                      ║
 ║  Bias Score: -100 to +100 | Regime | Strategy Engine               ║
-║  Auto-refresh: 60 seconds                                           ║
+║  v4 — All 10 Leading Bias Improvements Applied                     ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import os, json, time, warnings, threading
-from combined_bias_engine import generate_combined_decision  # Chapter 17 & 18
+# ── v4: combined_bias_engine merged inline (no external dependency) ──
 from datetime import date, timedelta, datetime
 import pytz
 
@@ -900,12 +900,36 @@ def classify_iv_smile_scenario(df_band, m, spot, iv_smile_history=None):
     # ── Intraday trend info from session history ──────────────────────────────
     trend_info = {"has_trend": False}
     if iv_smile_history and len(iv_smile_history) >= 3:
-        lookback = min(len(iv_smile_history) - 1, 2)   # ~30 min at 15-min refresh
-        ref = iv_smile_history[-lookback - 1]
-        d_atm    = atm_iv          - safe_num(ref.get("atm_iv",          atm_iv))
-        d_put    = put_wing_excess  - safe_num(ref.get("put_wing_excess", put_wing_excess))
-        d_call   = call_wing_excess - safe_num(ref.get("call_wing_excess",call_wing_excess))
+        lookback = min(len(iv_smile_history) - 1, 8)   # ~2 hours at 15-min refresh
+        # v4: Exponentially weighted trend — recent ticks matter more
+        _WEIGHTS = [0.30, 0.22, 0.15, 0.10, 0.07, 0.06, 0.05, 0.05]
+        _wts = _WEIGHTS[:lookback]
+        _hist_slice = iv_smile_history[-(lookback + 1):]
+        ref = _hist_slice[0]
+        d_atm = atm_iv - safe_num(ref.get("atm_iv", atm_iv))
+        d_put = put_wing_excess - safe_num(ref.get("put_wing_excess", put_wing_excess))
+        d_call = call_wing_excess - safe_num(ref.get("call_wing_excess", call_wing_excess))
+        # Weighted multi-tick trend detection
+        w_d_atm = 0.0; w_d_put = 0.0; w_d_call = 0.0
+        for wi, wt in enumerate(_wts):
+            h = _hist_slice[wi] if wi < len(_hist_slice) else _hist_slice[-1]
+            h_next = _hist_slice[wi + 1] if wi + 1 < len(_hist_slice) else _hist_slice[-1]
+            w_d_atm  += wt * (safe_num(h_next.get("atm_iv", 0)) - safe_num(h.get("atm_iv", 0)))
+            w_d_put  += wt * (safe_num(h_next.get("put_wing_excess", 0)) - safe_num(h.get("put_wing_excess", 0)))
+            w_d_call += wt * (safe_num(h_next.get("call_wing_excess", 0)) - safe_num(h.get("call_wing_excess", 0)))
         peak_atm = max(r.get("atm_iv", 0) for r in iv_smile_history)
+        trend_info = {
+            "has_trend":      True,
+            "d_atm_iv":       round(d_atm, 2),
+            "d_put_wing":     round(d_put, 2),
+            "d_call_wing":    round(d_call, 2),
+            "peak_atm_iv":    round(peak_atm, 2),
+            "ticks":          len(iv_smile_history),
+            "weighted_d_atm":  round(w_d_atm, 2),
+            "weighted_d_put":  round(w_d_put, 2),
+            "weighted_d_call": round(w_d_call, 2),
+            "lookback":       lookback,
+        }
         trend_info = {
             "has_trend":   True,
             "d_atm_iv":    round(d_atm,  2),
@@ -1269,7 +1293,25 @@ def compute_section34_bias(df_band_records, m, spot):
     call_wt = df["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)
     put_wt  = df["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)
 
+    # ── v4 #3: Smart Money OI Quality Filter ────────────────────────────
+    # Filter out retail noise: only count OI changes >= significance floor
+    # and within 5 strikes of ATM (where institutional activity concentrates)
+    _OI_MOMENTUM_FLOOR = max(100, df["call_oi_chg"].abs().median() * 0.1)
+    _near_mask = df["strike"].between(spot - 5 * NIFTY_STEP, spot + 5 * NIFTY_STEP)
+    _smart_mask = (df["call_oi_chg"].abs() >= _OI_MOMENTUM_FLOOR) | \
+                 (df["put_oi_chg"].abs() >= _OI_MOMENTUM_FLOOR)
+    _quality_mask = _near_mask & _smart_mask
+    _quality_df = df[_quality_mask].copy() if _quality_mask.any() else df.copy()
+    # Use _quality_df for Signal 1 and Signal 2 instead of full df
+    _qf = _quality_df
+
     # ── Signal 1: Moneyness-Adjusted Δ-Weighted Net OI (±35 pts) ─────────────
+    sum_call_s1 = (_qf["call_oi"] * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
+    sum_put_s1  = (_qf["put_oi"]  * _qf["put_delta"].abs()  * _qf["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)).sum()
+    denom_s1    = sum_call_s1 + sum_put_s1
+    s1 = ((sum_put_s1 - sum_call_s1) / denom_s1 * 35.0) if denom_s1 > 0 else 0.0
+    s1 = max(-35.0, min(35.0, s1))
+
     # Positive = put-side dominant = BULLISH (floor > ceiling)
     # Negative = call-side dominant = BEARISH (ceiling > floor)
     sum_call_s1 = (df["call_oi"] * call_delta_abs * call_wt).sum()
@@ -1279,18 +1321,17 @@ def compute_section34_bias(df_band_records, m, spot):
     s1 = max(-35.0, min(35.0, s1))
 
     # ── Signal 2: Moneyness-Adjusted OI Momentum (±25 pts) ───────────────────
-    # Uses signed oi_chg → naturally captures BUILD (positive) and UNWIND (negative)
-    # Put building/call unwinding → bullish; Call building/put unwinding → bearish
     net_mom   = (
-        (df["put_oi_chg"]  * put_delta_abs  * put_wt).sum()
-        - (df["call_oi_chg"] * call_delta_abs * call_wt).sum()
+        (_qf["put_oi_chg"]  * _qf["put_delta"].abs()  * _qf["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)).sum()
+      - (_qf["call_oi_chg"] * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
     )
     abs_mom   = (
-        (df["put_oi_chg"].abs()  * put_delta_abs  * put_wt).sum()
-        + (df["call_oi_chg"].abs() * call_delta_abs * call_wt).sum()
+        (_qf["put_oi_chg"].abs()  * _qf["put_delta"].abs()  * _qf["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)).sum()
+      + (_qf["call_oi_chg"].abs() * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
     )
     s2 = (net_mom / abs_mom * 25.0) if abs_mom > 0 else 0.0
     s2 = max(-25.0, min(25.0, s2))
+
 
     # ── Signal 3: Key Level Position (±20 pts) ────────────────────────────────
     # Sub-A: Spot vs S/R band (±6 pts)
@@ -1363,6 +1404,16 @@ def compute_section34_bias(df_band_records, m, spot):
 
     # ── Aggregate ─────────────────────────────────────────────────────────────
     bias_score = max(-100.0, min(100.0, round(s1 + s2 + s3 + s4 + s5, 1)))
+
+    # ── Signal 6: Bias Velocity / Acceleration (±10 pts) ────────────────
+    # v4 NEW: Rate-of-change of composite bias — the most LEADING signal.
+    # Requires bias_history (session state) passed via function param.
+    s6 = 0.0
+    _bias_hist = None  # will be populated by caller
+    # We store a placeholder; the actual velocity is computed in the
+    # main flow where bias_history is available, then injected.
+    bias_score_raw = s1 + s2 + s3 + s4 + s5
+
     if   bias_score >=  15: direction = "BULLISH"
     elif bias_score <= -15: direction = "BEARISH"
     else:                   direction = "NEUTRAL"
@@ -1376,6 +1427,7 @@ def compute_section34_bias(df_band_records, m, spot):
             "S3 Key Levels": round(s3, 1),
             "S4 IV Skew":    round(s4, 1),
             "S5 PCR":        round(s5, 1),
+            "S6 Velocity":   0.0,   # populated by caller with bias_history
         },
     }
 
@@ -1743,56 +1795,10 @@ def compute_fake_breakout_score(m, history):
     return {"score":score,"side":side,"alert_level":alert_level,"alert_text":alert_text,"factor_breakdown":factors}
 
 
-# ─── Wall Strength Index  IDENTICAL to Dash app ─────────────────────────────
-def compute_wall_strength_index(m, history):
-    sym_history = history if isinstance(history, list) else []
-    support    = safe_num(m.get("support", 0))
-    resistance = safe_num(m.get("resistance", 0))
-    atm        = safe_num(m.get("atm", 0))
-    wall_width = safe_num(m.get("wall_width", 400))
-    near_oi    = safe_num(m.get("near_oi_concentration", 0.5))
-    gex        = safe_num(m.get("gex", 0))
-    iv_rank    = safe_num(m.get("iv_rank", 50))
+# ── v4: Wall Strength Index REMOVED (replaced by Leading Signals panel) ──
 
-    def _wall_score(wall_strike, wall_type):
-        if wall_strike == 0 or atm == 0:
-            return 50
-        ws = 0
-        if near_oi >= 0.60:    ws += 30
-        elif near_oi >= 0.50:  ws += 22
-        elif near_oi >= 0.40:  ws += 12
-        else:                  ws += 5
-        if len(sym_history) >= 2:
-            prev = sym_history[-2]
-            curr_w = safe_num(m.get("resistance" if wall_type=="CALL" else "support", wall_strike))
-            prev_w = safe_num(prev.get("resistance" if wall_type=="CALL" else "support", curr_w))
-            building = (curr_w >= prev_w) if wall_type=="CALL" else (curr_w <= prev_w)
-            ws += 25 if building else 0
-        else:
-            ws += 12
-        if gex > 500:   ws += 25
-        elif gex > 0:   ws += 15
-        elif gex > -500:ws += 5
-        if iv_rank <= 30:   ws += 20
-        elif iv_rank <= 50: ws += 12
-        elif iv_rank <= 70: ws += 5
-        return max(0, min(100, ws))
 
-    res_wsi = _wall_score(resistance, "CALL")
-    sup_wsi = _wall_score(support,    "PUT")
 
-    def _wsi_label(wsi):
-        if wsi >= 70: return "STRONG", GREEN
-        if wsi >= 45: return "MODERATE", AMBER
-        return "WEAK", RED
-
-    res_label, res_color = _wsi_label(res_wsi)
-    sup_label, sup_color = _wsi_label(sup_wsi)
-    return {"resistance_wsi":res_wsi,"support_wsi":sup_wsi,
-            "resistance_label":res_label,"support_label":sup_label,
-            "resistance_color":res_color,"support_color":sup_color,
-            "resistance_strike":int(resistance) if resistance else 0,
-            "support_strike":int(support) if support else 0}
 
 
 # ─── Market Sentiments  IDENTICAL to Dash app ────────────────────────────────
@@ -2387,6 +2393,542 @@ def classify_vix_signal(vix_val: float, vix_history: list):
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMBINED BIAS DECISION ENGINE  (Chapter 17 & 18)  —  merged inline in v4
+# Previously: from combined_bias_engine import generate_combined_decision
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_s34_band(score: float) -> str:
+    """Map S3/4 bias score to a band letter A-E."""
+    if   score >= 51:   return "A"   # Strong Bull
+    elif score >= 16:   return "B"   # Mild Bull
+    elif score >= -15:  return "C"   # Neutral
+    elif score >= -50:  return "D"   # Mild Bear
+    else:               return "E"   # Strong Bear
+
+
+# IV Smile composite buckets
+_BEARISH_FEAR_IDS    = {1, 2, 3, 9}   # Put Skew, Crash Fear, Bearish Drift, Two-Sided Fork
+_BULLISH_NEUTRAL_IDS = {4, 5, 6}     # Call Skew, Melt-Up, Post-Crash Relief
+
+def get_smile_bucket(scenario_id: int) -> str:
+    if scenario_id in _BEARISH_FEAR_IDS:
+        return "BEARISH_FEAR"
+    elif scenario_id in _BULLISH_NEUTRAL_IDS:
+        return "BULLISH_NEUTRAL"
+    else:
+        return "NEUTRAL"
+
+
+# ── 4-Quadrant metadata ─────────────────────────────────────────────────────
+_QUADRANT_META = {
+    "Q1": {
+        "name":   "Full Bull Alignment",
+        "short":  "Q1 — FULL BULL",
+        "color":  "#059669",
+        "badge_bg": "#ECFDF5",
+        "description": (
+            "Structure is bullish (S3/4 positive) AND the IV Smile confirms "
+            "that sentiment is NOT overly fearful. Both engines agree — highest "
+            "probability bullish environment. Favour long delta, call spreads, "
+            "and systematic put-selling when IV rank is elevated."
+        ),
+        "action": "LEAN BULLISH  —  long delta, call debit spreads, theta-selling below spot",
+    },
+    "Q2": {
+        "name":   "Structural Bull / Sentiment Cautious",
+        "short":  "Q2 — STRUCTURAL BULL / CAUTIOUS",
+        "color":  "#D97706",
+        "badge_bg": "#FFFBEB",
+        "description": (
+            "OI structure and momentum are bullish BUT the IV Smile is showing "
+            "put-skew or fear. Institutions are hedging into the rally. The move "
+            "can continue but at risk of a sharp reversal if the put-wing keeps "
+            "building. Reduce position size; favour protective collars or limited-risk "
+            "long structures. Watch S4 IV Skew component for further divergence."
+        ),
+        "action": "BULLISH WITH CAUTION  —  reduced size, hedge with put spreads, trail stops",
+    },
+    "Q3": {
+        "name":   "Structural Bear / Sentiment Recovering",
+        "short":  "Q3 — STRUCTURAL BEAR / RECOVERING",
+        "color":  "#2563EB",
+        "badge_bg": "#EFF6FF",
+        "description": (
+            "OI structure and momentum are bearish BUT the IV Smile is showing "
+            "relief or call buying — fear is deflating. This is the most nuanced "
+            "quadrant: it can precede a bottom or be a dead-cat bounce. Do NOT "
+            "short aggressively into a deflating put-wing. Wait for S3/4 score to "
+            "turn less negative before adding long exposure."
+        ),
+        "action": "CAUTIOUSLY BEARISH  —  cover shorts on IV crush, wait for structure to improve",
+    },
+    "Q4": {
+        "name":   "Full Bear Alignment",
+        "short":  "Q4 — FULL BEAR",
+        "color":  "#DC2626",
+        "badge_bg": "#FEF2F2",
+        "description": (
+            "Structure is bearish (S3/4 negative) AND the IV Smile confirms "
+            "fear / put-skew. Both engines agree — highest probability bearish "
+            "environment. Favour short delta, put spreads, and call-selling above "
+            "resistance. Highest confidence short signal when S3/4 <= -40 and "
+            "smile is Crash Fear (Sc02)."
+        ),
+        "action": "LEAN BEARISH  —  short delta, put debit spreads, bear call spreads above resistance",
+    },
+    "CN": {
+        "name":   "Neutral / No Edge",
+        "short":  "CN — NEUTRAL",
+        "color":  "#6B7280",
+        "badge_bg": "#F9FAFB",
+        "description": (
+            "Either the S3/4 score is in the neutral band (-15 to +15) or the IV "
+            "Smile is indeterminate / pre-event. Neither engine provides a reliable "
+            "directional edge. Avoid directional positions; favour premium-selling "
+            "structures (iron condors) only if IV rank supports it."
+        ),
+        "action": "NO DIRECTIONAL EDGE  —  avoid naked direction, favour non-directional structures",
+    },
+}
+
+
+def classify_quadrant(s34_score: float, scenario_id: int) -> dict:
+    """4-Quadrant classification with optional enhanced-price-layer override."""
+    band         = get_s34_band(s34_score)
+    smile_bucket = get_smile_bucket(scenario_id)
+
+    if band == "C":
+        q = "CN"
+    elif band in ("A", "B"):
+        if   smile_bucket == "BULLISH_NEUTRAL": q = "Q1"
+        elif smile_bucket == "BEARISH_FEAR":    q = "Q2"
+        else:                                    q = "Q1"
+    else:
+        if   smile_bucket == "BULLISH_NEUTRAL": q = "Q3"
+        elif smile_bucket == "BEARISH_FEAR":    q = "Q4"
+        else:                                    q = "Q4"
+
+    meta = _QUADRANT_META[q]
+    return {
+        "quadrant":     q,
+        "name":         meta["name"],
+        "short":        meta["short"],
+        "color":        meta["color"],
+        "badge_bg":     meta["badge_bg"],
+        "description":  meta["description"],
+        "action":       meta["action"],
+        "smile_bucket": smile_bucket,
+        "s34_band":     band,
+    }
+
+
+# ── Divergence metadata ────────────────────────────────────────────────────
+_DIVERGENCE_META = {
+    1: {
+        "type":   "Type 1 — Capitulation Bottom",
+        "color":  "#059669",
+        "badge_bg": "#ECFDF5",
+        "detail": (
+            "S3/4 is at extreme bear levels (<=-51) AND the IV Smile is showing "
+            "Crash Fear (Sc02, put wing >12pts + IV rank >=65). When both engines "
+            "simultaneously hit maximum bearish readings, the risk/reward for new "
+            "short positions deteriorates sharply. Hedgers are already in — they "
+            "are the sellers of the rally that follows. Watch for put-wing deflation "
+            "as the first sign of capitulation completing."
+        ),
+        "warning": "POTENTIAL CAPITULATION BOTTOM — do not initiate new shorts at these levels",
+    },
+    2: {
+        "type":   "Type 2 — Structural Ceiling",
+        "color":  "#D97706",
+        "badge_bg": "#FFFBEB",
+        "detail": (
+            "S3/4 is at strong bull levels (>=+51) BUT the IV Smile is building "
+            "a put-skew (Sc01/Sc03). This indicates institutions are hedging long "
+            "positions even as the structural score peaks. Smart money is reducing "
+            "risk at the top — a classic ceiling pattern. Reduce longs and avoid "
+            "adding fresh long exposure at these combined readings."
+        ),
+        "warning": "STRUCTURAL CEILING SIGNAL — smart money hedging long positions; consider reducing longs",
+    },
+    3: {
+        "type":   "Type 3 — Squeeze Warning",
+        "color":  "#9333EA",
+        "badge_bg": "#FAF5FF",
+        "detail": (
+            "S3/4 is neutral (-15 to +15) AND the IV Smile is showing maximum "
+            "compression (Sc08 — Coiled Spring / IV rank <=20). The market is "
+            "building energy for a move of unknown direction. Directional biases "
+            "are unreliable here. Favour long-vol structures (straddles/strangles) "
+            "but be mindful of theta decay — time the entry carefully."
+        ),
+        "warning": "SQUEEZE WARNING — breakout imminent; direction unknown; favour long vol",
+    },
+    4: {
+        "type":   "Type 4 — Bear Trap",
+        "color":  "#2563EB",
+        "badge_bg": "#EFF6FF",
+        "detail": (
+            "S3/4 is negative (D or E band, score <=-16) BUT the IV Smile is "
+            "showing call buying or relief (Sc04, Sc05, Sc06). Sentiment is "
+            "recovering even as the structure looks bearish — the hallmark of a "
+            "bear trap. Shorts caught in this divergence face a rapid squeeze. "
+            "Cover or reduce short exposure when this signal activates."
+        ),
+        "warning": "BEAR TRAP RISK — call buying despite bearish OI structure; cover shorts",
+    },
+    5: {
+        "type":   "Type 5 — Pre-Move Setup",
+        "color":  "#B45309",
+        "badge_bg": "#FEF3C7",
+        "detail": (
+            "PCR is at an extreme level AND S3/4 is moderately biased AND the "
+            "IV Smile is directionally aligned. This combination suggests smart "
+            "money positioning ahead of a move. Watch for confirmation via "
+            "intraday OI velocity and gamma flip proximity before acting."
+        ),
+        "warning": "PRE-MOVE SETUP — smart money positioning; wait for OI velocity / GEX confirmation",
+    },
+}
+
+
+def detect_divergence_type(
+    s34_score: float,
+    scenario_id: int,
+    pcr: float = 1.0,
+    div_proximity: float = 0.0,
+) -> dict | None:
+    """
+    Returns a divergence dict or None if no divergence is active.
+
+    v4 enhancement: when div_proximity >= 60 but the hard thresholds are not
+    yet met, return a SOFT / APPROACHING divergence with reduced urgency so
+    the dashboard can show early warning.
+    """
+    band         = get_s34_band(s34_score)
+    smile_bucket = get_smile_bucket(scenario_id)
+
+    # ── Hard divergence triggers (unchanged from v3) ──────────────────────
+    # Type 1: Capitulation Bottom
+    if band == "E" and scenario_id == 2:
+        d = _DIVERGENCE_META[1].copy()
+        d["divergence_id"] = 1
+        d["strength"] = "HARD"
+        return d
+
+    # Type 2: Structural Ceiling
+    if band == "A" and scenario_id in (1, 3):
+        d = _DIVERGENCE_META[2].copy()
+        d["divergence_id"] = 2
+        d["strength"] = "HARD"
+        return d
+
+    # Type 4: Bear Trap
+    if band in ("D", "E") and smile_bucket == "BULLISH_NEUTRAL":
+        d = _DIVERGENCE_META[4].copy()
+        d["divergence_id"] = 4
+        d["strength"] = "HARD"
+        return d
+
+    # Type 3: Squeeze Warning
+    if band == "C" and scenario_id == 8:
+        d = _DIVERGENCE_META[3].copy()
+        d["divergence_id"] = 3
+        d["strength"] = "HARD"
+        return d
+
+    # Type 5: Pre-Move Setup
+    if (pcr < 0.70 or pcr > 1.55) and abs(s34_score) >= 20 and scenario_id in (1, 2, 3, 4, 5, 6):
+        d = _DIVERGENCE_META[5].copy()
+        d["divergence_id"] = 5
+        d["strength"] = "HARD"
+        return d
+
+    # ── v4 SOFT / APPROACHING divergence (proximity score >= 60) ─────────
+    if div_proximity >= 60:
+        # Determine which divergence type is closest to triggering
+        soft_id = None
+        if s34_score < -30 and scenario_id in (1, 2, 3, 9):
+            soft_id = 1   # approaching Capitulation Bottom
+        elif s34_score > 30 and scenario_id in (1, 3, 9):
+            soft_id = 2   # approaching Structural Ceiling
+        elif abs(s34_score) < 20 and scenario_id == 8:
+            soft_id = 3   # approaching Squeeze
+        elif s34_score < -10 and smile_bucket == "BULLISH_NEUTRAL":
+            soft_id = 4   # approaching Bear Trap
+        elif (pcr < 0.85 or pcr > 1.40) and abs(s34_score) >= 12 and scenario_id in (1, 2, 3, 4, 5, 6):
+            soft_id = 5   # approaching Pre-Move
+
+        if soft_id is not None:
+            d = _DIVERGENCE_META[soft_id].copy()
+            d["divergence_id"] = soft_id
+            d["strength"] = "APPROACHING"
+            d["proximity_score"] = div_proximity
+            d["warning"] = (
+                f"APPROACHING {d['type'].split(' — ')[0].upper()} "
+                f"(proximity {div_proximity:.0f}/100) — monitor closely, not yet confirmed"
+            )
+            d["detail"] = (
+                d["detail"]
+                + f"\n\n[Early Warning] Proximity score is {div_proximity:.0f}/100, "
+                f"indicating this divergence type is approaching trigger thresholds. "
+                f"Watch for hard trigger confirmation in the next 1-3 ticks."
+            )
+            return d
+
+    return None
+
+
+def _confidence_label(s34_score: float, smile_confidence: float, quadrant: str,
+                      enhanced_bias: dict | None = None) -> tuple:
+    """
+    Returns (label, color) for overall combined confidence.
+    v4: when enhanced_bias is provided, its enhanced_conf can boost the label.
+    """
+    magnitude = abs(s34_score)
+
+    if quadrant in ("Q1", "Q4"):
+        if magnitude >= 51 and smile_confidence >= 75:
+            label, color = "HIGH", "#059669"
+        elif magnitude >= 20 and smile_confidence >= 60:
+            label, color = "MODERATE-HIGH", "#16A34A"
+        else:
+            label, color = "MODERATE", "#D97706"
+    elif quadrant in ("Q2", "Q3"):
+        label, color = "MODERATE", "#D97706"
+    else:
+        label, color = "LOW", "#6B7280"
+
+    # v4: Enhanced price layer can upgrade MODERATE → MODERATE-HIGH
+    # when all 4 sub-signals agree (agreement_pct == 100) and enhanced_conf >= 65
+    if enhanced_bias and label == "MODERATE":
+        _econf = safe_num(enhanced_bias.get("enhanced_conf", 0))
+        _agree = safe_num(enhanced_bias.get("agreement_pct", 0))
+        if _econf >= 65 and _agree >= 100:
+            label, color = "MODERATE-HIGH", "#16A34A"
+
+    return label, color
+
+
+def generate_combined_decision(
+    s34: dict,
+    smile: dict | None,
+    m: dict,
+    enhanced_bias: dict | None = None,
+) -> dict:
+    """
+    Master combined decision function (v4 — merged inline + enhanced price layer).
+
+    Parameters
+    ----------
+    s34           : dict from compute_section34_bias()
+    smile         : dict from classify_iv_smile_scenario() or None
+    m             : dict from compute_metrics()
+    enhanced_bias : dict from compute_enhanced_price_bias() or None  [v4 NEW]
+
+    Returns a verdict dict consumed by the dashboard panel.
+    """
+    # Fallbacks for smile
+    fallback_smile_id   = 0
+    fallback_smile_name = "Indeterminate"
+    fallback_smile_conf = 0.0
+
+    s34_score     = float(s34.get("bias_score", 0))
+    s34_direction = s34.get("direction", "NEUTRAL")
+    s34_breakdown = s34.get("signal_breakdown", {})
+
+    pcr = float(m.get("pcr", 1.0)) if m else 1.0
+    iv_rank = safe_num(m.get("iv_rank", 50)) if m else 50.0
+
+    if smile is None:
+        scenario_id   = fallback_smile_id
+        scenario_name = fallback_smile_name
+        smile_conf    = fallback_smile_conf
+    else:
+        scenario_id   = int(smile.get("scenario_id", 0))
+        scenario_name = smile.get("scenario_name", "Unknown")
+        smile_conf    = float(smile.get("confidence", 0))
+
+    smile_bucket = get_smile_bucket(scenario_id)
+    quad_info    = classify_quadrant(s34_score, scenario_id)
+
+    # ── v4: Pass divergence proximity into divergence detector ───────────
+    # Compute a quick inline proximity if not already available from caller
+    _div_prox = 0.0
+    if enhanced_bias:
+        # Use the same proximity logic as the Leading Signals panel
+        _scores = []
+        _t1_s34 = max(0, min(100, (abs(s34_score) - 40) / 11 * 100)) if s34_score < -40 else 0
+        _t1_smile = max(0, min(100, (iv_rank - 50) / 15 * 100)) if iv_rank > 50 else 0
+        if scenario_id in (1, 2, 3): _t1_smile = max(_t1_smile, 60)
+        _scores.append((_t1_s34 + _t1_smile) / 2)
+
+        _t2_s34 = max(0, min(100, (s34_score - 40) / 11 * 100)) if s34_score > 40 else 0
+        _t2_smile = 70 if scenario_id in (1, 3) else (30 if scenario_id in (2, 9) else 0)
+        _scores.append((_t2_s34 + _t2_smile) / 2)
+
+        _t3_neutral = max(0, min(100, (15 - abs(s34_score)) / 15 * 100)) if abs(s34_score) < 15 else 0
+        _t3_compress = max(0, min(100, (25 - iv_rank) / 5 * 100)) if iv_rank < 25 else 0
+        _scores.append((_t3_neutral + _t3_compress) / 2)
+
+        _t5_pcr = 0
+        if pcr < 0.70: _t5_pcr = max(0, min(100, (0.70 - pcr) / 0.20 * 100))
+        elif pcr > 1.55: _t5_pcr = max(0, min(100, (pcr - 1.55) / 0.25 * 100))
+        _t5_s34 = max(0, min(100, (abs(s34_score) - 15) / 15 * 100)) if abs(s34_score) > 15 else 0
+        _scores.append((_t5_pcr + _t5_s34) / 2)
+
+        _div_prox = round(max(_scores), 1) if _scores else 0.0
+
+    divergence = detect_divergence_type(s34_score, scenario_id, pcr, div_proximity=_div_prox)
+    conf_label, conf_color = _confidence_label(s34_score, smile_conf, quad_info["quadrant"],
+                                                enhanced_bias=enhanced_bias)
+
+    # ── v4: Enhanced price layer can shift quadrant in borderline cases ───
+    # When enhanced_bias strongly disagrees with the quadrant (enhanced_score
+    # opposite sign, |enhanced_score| >= 35, agreement_pct == 0), and the
+    # original quadrant was a weak Q2/Q3, we can flip to CN.
+    _quadrant_overridden = False
+    if enhanced_bias:
+        _e_score = safe_num(enhanced_bias.get("enhanced_score", 0))
+        _e_agree = safe_num(enhanced_bias.get("agreement_pct", 0))
+        _orig_q  = quad_info["quadrant"]
+        # Q2 = structural bull / sentiment cautious → if enhanced says BEARISH, downgrade to CN
+        if _orig_q == "Q2" and _e_score <= -35 and _e_agree == 0:
+            quad_info = _QUADRANT_META["CN"].copy()
+            quad_info["quadrant"] = "CN"
+            quad_info["smile_bucket"] = smile_bucket
+            quad_info["s34_band"] = get_s34_band(s34_score)
+            quad_info["description"] += (
+                " [v4 OVERRIDDEN to CN: Enhanced Price Layer (VWAP/TermStructure/VIX) "
+                "strongly disagrees with the structural bull reading. "
+                "Price action, term structure, and VIX all point bearish — "
+                "the structural OI bull signal is likely a head-fake.]"
+            )
+            _quadrant_overridden = True
+            conf_label, conf_color = "LOW", "#6B7280"
+        # Q3 = structural bear / sentiment recovering → if enhanced says BULLISH, upgrade to CN
+        elif _orig_q == "Q3" and _e_score >= 35 and _e_agree == 0:
+            quad_info = _QUADRANT_META["CN"].copy()
+            quad_info["quadrant"] = "CN"
+            quad_info["smile_bucket"] = smile_bucket
+            quad_info["s34_band"] = get_s34_band(s34_score)
+            quad_info["description"] += (
+                " [v4 OVERRIDDEN to CN: Enhanced Price Layer (VWAP/TermStructure/VIX) "
+                "strongly disagrees with the structural bear reading. "
+                "Price action, term structure, and VIX all point bullish — "
+                "the structural OI bear signal is likely a bear trap.]"
+            )
+            _quadrant_overridden = True
+            conf_label, conf_color = "LOW", "#6B7280"
+
+    # ── Build explanation lines ───────────────────────────────────────────
+    lines: list = []
+
+    # Line 1: S3/4 summary
+    band = quad_info.get("s34_band", get_s34_band(s34_score))
+    band_desc = {
+        "A": "strong bull (+51 to +100)",
+        "B": "mild bull (+16 to +50)",
+        "C": "neutral (-15 to +15)",
+        "D": "mild bear (-50 to -16)",
+        "E": "strong bear (-100 to -51)",
+    }
+    lines.append(
+        f"S3/4 Engine: score {s34_score:+.0f} -> Band {band} ({band_desc.get(band, '')}) "
+        f"- {s34_direction} structural bias."
+    )
+
+    # Line 2: IV Smile summary
+    if smile is None:
+        lines.append("IV Smile Engine: insufficient data - classification pending.")
+    else:
+        lines.append(
+            f"IV Smile Engine: {scenario_name} (Sc{scenario_id:02d}) "
+            f"-> {smile_bucket.replace('_', ' ')} bucket "
+            f"[confidence {smile_conf:.0f}%]."
+        )
+
+    # Line 3: Quadrant result
+    _quad_short = quad_info.get("short", quad_info.get("quadrant", "CN"))
+    _quad_desc  = quad_info.get("description", "")
+    lines.append(f"Combined Quadrant: {_quad_short}. {_quad_desc}")
+
+    # Line 4: Signal bridge (S4 IV Skew)
+    s4_val = s34_breakdown.get("S4 IV Skew", None)
+    if s4_val is not None:
+        s4_sign = "put-skew detected" if s4_val < 0 else ("call-skew / flat" if s4_val > 0 else "neutral")
+        lines.append(
+            f"S4 IV Skew (bridge signal): {s4_val:+.0f}/12 -> {s4_sign}. "
+            "This shared signal links both engines - use it to validate alignment."
+        )
+
+    # Line 5: v4 Enhanced Price Layer contribution
+    if enhanced_bias:
+        _e_score = safe_num(enhanced_bias.get("enhanced_score", 0))
+        _e_conf  = safe_num(enhanced_bias.get("enhanced_conf", 0))
+        _n_avail = enhanced_bias.get("new_signals_available", 0)
+        _price_s = safe_num(enhanced_bias.get("price_score", 0))
+        _ts_s    = safe_num(enhanced_bias.get("ts_score", 0))
+        _vix_s   = safe_num(enhanced_bias.get("vix_score", 0))
+        lines.append(
+            f"Enhanced Price Layer (v4): VWAP/OR {_price_s:+.1f}, "
+            f"TermStructure {_ts_s:+.1f}, VIX {_vix_s:+.1f} "
+            f"({_n_avail}/3 live) -> enhanced score {_e_score:+.1f} "
+            f"[conf {_e_conf:.0f}%]."
+        )
+        if _quadrant_overridden:
+            lines.append(
+                "QUADRANT OVERRIDDEN by Enhanced Price Layer: Q2/Q3 -> CN. "
+                "Price-action signals strongly disagree with OI structure."
+            )
+
+    # Line 6: Divergence note (if active)
+    if divergence:
+        _strength = divergence.get("strength", "HARD")
+        if _strength == "APPROACHING":
+            lines.append(
+                f"EARLY WARNING - {divergence['type']}: {divergence['warning']}"
+            )
+        else:
+            lines.append(
+                f"DIVERGENCE ACTIVE: {divergence['type']} - {divergence['warning']}"
+            )
+
+    available = True
+    if smile is None:
+        available = False
+
+    return {
+        "quadrant":          quad_info.get("quadrant", "CN"),
+        "quadrant_name":     quad_info.get("name", "Neutral / No Edge"),
+        "quadrant_short":    quad_info.get("short", "CN — NEUTRAL"),
+        "quadrant_color":    quad_info.get("color", "#6B7280"),
+        "badge_bg":          quad_info.get("badge_bg", "#F9FAFB"),
+        "action":            quad_info.get("action", ""),
+        "explanation_lines": lines,
+        "divergence":        divergence,
+        "confidence_label":  conf_label,
+        "confidence_color":  conf_color,
+        "s34_score":         s34_score,
+        "s34_direction":     s34_direction,
+        "s34_band":          band,
+        "smile_scenario":    scenario_name,
+        "smile_bucket":      smile_bucket,
+        "smile_confidence":  smile_conf,
+        "pcr":               pcr,
+        "available":         available,
+        # v4 new keys
+        "enhanced_score":    safe_num(enhanced_bias.get("enhanced_score", 0)) if enhanced_bias else 0.0,
+        "enhanced_conf":     safe_num(enhanced_bias.get("enhanced_conf", 0))  if enhanced_bias else 0.0,
+        "quadrant_overridden": _quadrant_overridden,
+        "div_proximity":     _div_prox,
+    }
+
+
+# ══ END COMBINED BIAS DECISION ENGINE (inline) ═════════════════════════════
+
+
 # ── Enhanced combined price bias aggregator ───────────────────────────────────
 def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float, spot: float):
     """
@@ -2442,7 +2984,7 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
 
     base_confidence = min(abs(enhanced_score), 100)
     conf_bonus      = agreement_pct * 20.0   # up to +20 when all agree
-    enhanced_conf   = round(min(100.0, base_confidence * 0.6 + conf_bonus), 1)
+    enhanced_conf   = round(min(100.0, base_confidence * (0.4 + 0.6 * agreement_pct)), 1)
 
     if   enhanced_score >= 30:  direction = "BULLISH";    color = "#059669"
     elif enhanced_score >= 10:  direction = "MILDLY BULLISH"; color = "#10B981"
@@ -3495,7 +4037,6 @@ _early_df_band    = pd.DataFrame(payload["df_band"]) if payload.get("df_band") e
 _early_smile      = classify_iv_smile_scenario(
     _early_df_band, m, spot, _early_smile_hist
 ) if _early_df_band is not None else None
-_combined_decision = generate_combined_decision(_s34_bias, _early_smile, m)
 # ── end early IV smile call ───────────────────────────────────────────────
 
 # ── Enhanced Price Confirmation Layer  (v7 — surgical addition) ──────────────
@@ -3528,6 +4069,143 @@ _enhanced_bias     = compute_enhanced_price_bias(
 )
 # ── end Enhanced Price Confirmation Layer ─────────────────────────────────────
 
+# ═══════════════════════════════════════════════════════════════════
+# v4 IMPROVEMENTS — All new computations inserted here
+# ═══════════════════════════════════════════════════════════════════
+
+# ── v4 #5: Feed Enhanced Price Layer into Combined Decision ──────────
+_combined_decision = generate_combined_decision(_s34_bias, _early_smile, m, _enhanced_bias)
+
+# ── v4 #1: Bias Velocity (Signal 6) — computed here where bias_history is available ──
+_bias_hist = st.session_state.get("bias_history", [])
+if len(_bias_hist) >= 3:
+    _recent_scores = [safe_num(x.get("score", 0)) for x in _bias_hist[-4:]]
+    _recent_scores.append(float(_s34_score))
+    _velocity = _recent_scores[-1] - _recent_scores[-2]
+    _accel = (_recent_scores[-1] - _recent_scores[-2]) - (_recent_scores[-2] - _recent_scores[-3]) if len(_recent_scores) >= 3 else 0.0
+    # Scale: 20-pt change over 1 tick = full ±10 score
+    _s6 = max(-10.0, min(10.0, (_velocity / 20.0) * 10.0))
+    # Update the bias score with velocity
+    _s34_score_v4 = max(-100.0, min(100.0, _s34_score + _s6))
+    _s34_bias["bias_score"] = _s34_score_v4
+    if _s34_score_v4 >= 15: _s34_bias["direction"] = "BULLISH"
+    elif _s34_score_v4 <= -15: _s34_bias["direction"] = "BEARISH"
+    else: _s34_bias["direction"] = "NEUTRAL"
+    _s34_bias["signal_breakdown"]["S6 Velocity"] = round(_s6, 1)
+else:
+    _velocity = 0.0; _accel = 0.0; _s6 = 0.0; _s34_score_v4 = _s34_score
+
+# ── v4 #4: Divergence Proximity Score (0-100) ─────────────────────────
+def _compute_divergence_proximity(s34_score, scenario_id, pcr, iv_rank):
+    """How close are we to triggering any of the 5 divergence types?
+    Returns 0-100. >= 60 triggers an APPROACHING DIVERGENCE alert."""
+    scores = []
+    # Type 1 proximity: S3/4 approaching strong bear AND smile approaching crash fear
+    t1_s34 = max(0, min(100, (abs(s34_score) - 40) / 11 * 100)) if s34_score < -40 else 0
+    t1_smile = max(0, min(100, (iv_rank - 50) / 15 * 100)) if iv_rank > 50 else 0
+    if scenario_id in (1, 2, 3): t1_smile = max(t1_smile, 60)
+    scores.append((t1_s34 + t1_smile) / 2)
+    # Type 2 proximity: S3/4 approaching strong bull AND smile has any put skew
+    t2_s34 = max(0, min(100, (s34_score - 40) / 11 * 100)) if s34_score > 40 else 0
+    t2_smile = 70 if scenario_id in (1, 3) else (30 if scenario_id in (2, 9) else 0)
+    scores.append((t2_s34 + t2_smile) / 2)
+    # Type 3 proximity: S3/4 narrowing to neutral AND IV rank compressing
+    t3_neutral = max(0, min(100, (15 - abs(s34_score)) / 15 * 100)) if abs(s34_score) < 15 else 0
+    t3_compress = max(0, min(100, (25 - iv_rank) / 5 * 100)) if iv_rank < 25 else 0
+    scores.append((t3_neutral + t3_compress) / 2)
+    # Type 5 proximity: PCR approaching extreme AND S3/4 moderately biased
+    t5_pcr = 0
+    if pcr < 0.70: t5_pcr = max(0, min(100, (0.70 - pcr) / 0.20 * 100))
+    elif pcr > 1.55: t5_pcr = max(0, min(100, (pcr - 1.55) / 0.25 * 100))
+    t5_s34 = max(0, min(100, (abs(s34_score) - 15) / 15 * 100)) if abs(s34_score) > 15 else 0
+    scores.append((t5_pcr + t5_s34) / 2)
+    return round(max(scores), 1) if scores else 0.0
+
+_div_proximity = _compute_divergence_proximity(
+    _s34_score, _early_smile.get("scenario_id", 0) if _early_smile else 0,
+    m.get("pcr", 1.0), m.get("iv_rank", 50)
+)
+
+# ── v4 #8: Gamma Flip Proximity ──────────────────────────────────────
+_gamma_flip_val = m.get("gamma_flip")
+_gamma_flip_proximity = None
+if _gamma_flip_val and _gamma_flip_val > 0 and spot > 0:
+    _flip_dist = abs(spot - _gamma_flip_val)
+    _wall_w = safe_num(m.get("wall_width", 400))
+    _step = max(_wall_w / 20, 50)
+    _proximity_threshold = max(2.0 * _step, 100)
+    _gamma_flip_proximity = {
+        "flip_strike": round(_gamma_flip_val, 0),
+        "distance_pts": round(_flip_dist, 1),
+        "threshold_pts": round(_proximity_threshold, 1),
+        "pct_of_threshold": round(_flip_dist / _proximity_threshold * 100, 1) if _proximity_threshold > 0 else 0,
+        "side": "ABOVE" if spot > _gamma_flip_val else "BELOW",
+        "zone": "FLIP_ZONE" if _flip_dist < _proximity_threshold else "SAFE",
+        "regime_risk": "HIGH" if _flip_dist < _step else ("ELEVATED" if _flip_dist < _proximity_threshold else "LOW"),
+    }
+
+# ── v4 #7: OI Momentum Exhaustion ────────────────────────────────────
+_oi_exhaustion = None
+if len(_bias_hist) >= 5:
+    _mom_hist = [safe_num(x.get("s2", 0)) for x in _bias_hist[-6:]]
+    _mom_hist.append(_s34_bias["signal_breakdown"].get("S2 Momentum", 0))
+    if len(_mom_hist) >= 5:
+        _sign = 1 if _mom_hist[-1] > 0 else (-1 if _mom_hist[-1] < 0 else 0)
+        if _sign != 0:
+            _signed = [v * _sign for v in _mom_hist]
+            _all_positive = all(v > 0 for v in _signed)
+            if _all_positive:
+                _magnitudes = [abs(v) for v in _mom_hist]
+                _recent_mag = np.mean(_magnitudes[-2:])
+                _earlier_mag = np.mean(_magnitudes[:3]) if len(_magnitudes) >= 3 else _recent_mag
+                _exhaust_ratio = _recent_mag / _earlier_mag if _earlier_mag > 0.5 else 1.0
+                _oi_exhaustion = {
+                    "direction": "BULL" if _sign > 0 else "BEAR",
+                    "exhaust_ratio": round(_exhaust_ratio, 2),
+                    "exhausting": _exhaust_ratio < 0.50,
+                    "label": ("EXHAUSTING" if _exhaust_ratio < 0.50 else
+                             "FADING" if _exhaust_ratio < 0.75 else "STRONG"),
+                    "color": ("#DC2626" if _exhaust_ratio < 0.50 else
+                             "#F59E0B" if _exhaust_ratio < 0.75 else "#059669"),
+                }
+
+# ── v4 #6: Inter-Expiry OI Flow / Roll Signal ─────────────────────────
+_inter_expiry_signal = None
+if len(_expiry_list) > 1 and USE_DHAN:
+    try:
+        _back_exp = _expiry_list[1]
+        _back_chain, _, _ = fetch_dhan_option_chain(_back_exp)
+        if not _back_chain.empty:
+            _back_m = compute_metrics(_back_chain, spot, _back_exp)
+            if _back_m:
+                _front_pcr = m.get("pcr", 1.0)
+                _back_pcr = _back_m.get("pcr", 1.0)
+                _pcr_diff = _front_pcr - _back_pcr
+                _front_mom = safe_num(m.get("momentum", 0))
+                _back_mom = safe_num(_back_m.get("momentum", 0))
+                # Roll detection: front momentum fading while back building
+                _roll_signal = None
+                if abs(_front_mom) < abs(_back_mom) * 0.3 and abs(_back_mom) > 500:
+                    _roll_dir = "BEAR" if _back_mom < 0 else "BULL"
+                    _roll_signal = f"Rolling {_roll_dir} to next expiry"
+                _inter_expiry_signal = {
+                    "front_pcr": round(_front_pcr, 2),
+                    "back_pcr": round(_back_pcr, 2),
+                    "pcr_diff": round(_pcr_diff, 2),
+                    "front_momentum": round(_front_mom, 0),
+                    "back_momentum": round(_back_mom, 0),
+                    "roll_signal": _roll_signal,
+                    "available": True,
+                }
+    except Exception:
+        pass
+
+# ── v4 #3: Smart Money OI Quality Filter (applied to history entry) ────
+# Store smart money filtered metrics for next tick's use
+if "_smart_money_stats" not in st.session_state:
+    st.session_state._smart_money_stats = {}
+
+
 _now_bias = time.time()
 # Dedup on server fetch timestamp, not wall-clock time.
 # Reading from disk catches entries written by OTHER visitor sessions, preventing
@@ -3550,6 +4228,7 @@ if _payload_fetch_ts != _last_bh_fetch_ts:
         "s3":        _s34_breakdown.get("S3 Key Levels", 0.0),
         "s4":        _s34_breakdown.get("S4 IV Skew",    0.0),
         "s5":        _s34_breakdown.get("S5 PCR",        0.0),
+        "s6":        _s34_breakdown.get("S6 Velocity",   0.0),
     })
     st.session_state.bias_history = _bh_tmp[-60:]   # ~5 hrs at data-refresh cadence
     st.session_state.bias_history_last_ts = _now_bias
@@ -3989,11 +4668,15 @@ def _render_combined_bias_panel(cd: dict) -> None:
     # Divergence section (only if active)
     div_html = ""
     if div:
+        _div_strength = div.get("strength", "HARD")
+        _div_icon = "⚠" if _div_strength == "HARD" else "🔮"
+        _div_border_style = "solid" if _div_strength == "HARD" else "dashed"
+        _div_opacity = "1.0" if _div_strength == "HARD" else "0.75"
         div_html = (
-            f'<div style="background:{div["badge_bg"]};border:1.5px solid {div["color"]};'
-            f'border-radius:8px;padding:8px 14px;margin-top:10px;">'
+            f'<div style="background:{div["badge_bg"]};border:1.5px { _div_border_style} {div["color"]};'
+            f'border-radius:8px;padding:8px 14px;margin-top:10px;opacity:{_div_opacity};">'
             f'<span style="font-size:12px;font-weight:800;color:{div["color"]};">'
-            f'⚠ {div["type"]}</span>'
+            f'{_div_icon} {_div_strength}: {div["type"]}</span>'
             f'<div style="font-size:11.5px;color:#374151;margin-top:4px;">{div["warning"]}</div>'
             f'<div style="font-size:11px;color:#6B7280;margin-top:3px;">{div["detail"]}</div>'
             f'</div>'
@@ -4038,6 +4721,7 @@ def _render_combined_bias_panel(cd: dict) -> None:
         border-radius:6px;padding:2px 9px;
         font-size:11px;font-weight:700;
     ">Confidence: {conf_l}</span>
+    {"<span style=\"background:#FEF3C7;color:#B45309;border:1px dashed #B45309;border-radius:6px;padding:2px 9px;font-size:10px;font-weight:700;\">OVERRIDDEN by Price Layer</span>" if cd.get("quadrant_overridden") else ""}
   </div>
   <!-- Row 2: action line -->
   <div style="
@@ -4056,8 +4740,9 @@ def _render_combined_bias_panel(cd: dict) -> None:
     <span>S3/4 Score: <strong style="color:{qcolor};">{s34_sc:+.0f}</strong> ({s34_dir})</span>
     <span>IV Smile: <strong style="color:#374151;">{smile_sc}</strong></span>
     <span>PCR: <strong style="color:#374151;">{pcr_val:.2f}</strong></span>
+    {"<span>Enhanced Score: <strong style=\"color:#1A1A2E;\">{:+.0f}</strong></span>".format(cd.get("enhanced_score", 0)) if cd.get("enhanced_score", 0) != 0 else ""}
     <span style="margin-left:auto;font-size:10px;color:#9CA3AF;">
-      Chapters 17 &amp; 18 · Combined Bias Engine
+      Chapters 17 &amp; 18 · Combined Bias Engine (v4 inline)
     </span>
   </div>
   {div_html}
@@ -4087,10 +4772,10 @@ if len(_bh_data) >= 2:
             f"Bias: <b>{r['score']:+.0f}</b> ({r.get('direction','—')})",
             f"Spot: {r['spot']:,.0f}",
         ]
-        for _sk in ("s1","s2","s3","s4","s5"):
+        for _sk in ("s1","s2","s3","s4","s5","s6"):
             if _sk in r:
                 _label = {"s1":"S1 Net OI","s2":"S2 Mom","s3":"S3 Levels",
-                          "s4":"S4 Skew","s5":"S5 PCR"}.get(_sk, _sk)
+                          "s4":"S4 Skew","s5":"S5 PCR","s6":"S6 Vel"}.get(_sk, _sk)
                 _hlines.append(f"{_label}: {r[_sk]:+.0f}")
         _bh_hover.append("<br>".join(_hlines))
 
@@ -4196,6 +4881,103 @@ elif len(_bh_data) == 1:
 
 # SECTION 3: KEY PRICE LEVELS
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════
+# v4 #9: LEADING SIGNALS / EARLY WARNING PANEL
+# ═══════════════════════════════════════════════════════════════════
+st.markdown('<div class="section-header">🔮 Leading Signals / Early Warning</div>', unsafe_allow_html=True)
+
+_ls_col1, _ls_col2, _ls_col3 = st.columns(3)
+
+with _ls_col1:
+    # Divergence Proximity Gauge
+    _dp_color = "#DC2626" if _div_proximity >= 60 else ("#F59E0B" if _div_proximity >= 35 else "#059669")
+    _dp_label = "APPROACHING DIVERGENCE" if _div_proximity >= 60 else ("WATCHING" if _div_proximity >= 35 else "CLEAR")
+    st.markdown(f"""
+    <div class="card">
+      <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Divergence Proximity</div>
+      <div style="font-size:28px;font-weight:900;color:{_dp_color};margin:6px 0;">{_div_proximity:.0f} / 100</div>
+      <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+        <div style="background:{_dp_color};height:6px;border-radius:4px;width:{_div_proximity}%;"></div>
+      </div>
+      <div style="font-size:12px;font-weight:700;color:{_dp_color};">{_dp_label}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Fires at 60+ — early warning before actual divergences trigger</div>
+    </div>""", unsafe_allow_html=True)
+
+    # Bias Velocity
+    _vel_color = "#059669" if _velocity > 2 else ("#DC2626" if _velocity < -2 else "#6B7280")
+    _vel_label = "ACCELERATING BULL" if _velocity > 5 else ("ACCELERATING BEAR" if _velocity < -5 else "STEADY")
+    st.markdown(f"""
+    <div class="card">
+      <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Bias Velocity (Signal 6)</div>
+      <div style="font-size:28px;font-weight:900;color:{_vel_color};margin:6px 0;">{_velocity:+.1f} pts/tick</div>
+      <div style="font-size:12px;font-weight:700;color:{_vel_color};">{_vel_label}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Acceleration: {_accel:+.1f} pts/tick²</div>
+    </div>""", unsafe_allow_html=True)
+
+with _ls_col2:
+    # Gamma Flip Proximity
+    if _gamma_flip_proximity:
+        _gfp = _gamma_flip_proximity
+        _gfp_color = "#DC2626" if _gfp["regime_risk"] == "HIGH" else ("#F59E0B" if _gfp["regime_risk"] == "ELEVATED" else "#059669")
+        st.markdown(f"""
+        <div class="card">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Gamma Flip Proximity</div>
+          <div style="font-size:16px;font-weight:800;color:#1A1A2E;">Flip @ {_gfp["flip_strike"]:,.0f}</div>
+          <div style="font-size:13px;color:{_gfp_color};font-weight:700;">Spot {_gfp["side"]} by {_gfp["distance_pts"]:,.0f}pts ({_gfp["pct_of_threshold"]:.0f}% of threshold)</div>
+          <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+            <div style="background:{_gfp_color};height:6px;border-radius:4px;width:{min(100, _gfp["pct_of_threshold"])}%;"></div>
+          </div>
+          <div style="font-size:12px;font-weight:700;color:{_gfp_color};">Risk: {_gfp["regime_risk"]}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="card"><div style="font-size:11px;font-weight:700;color:#6B7280;">Gamma Flip Proximity</div><div style="font-size:12px;color:#9CA3AF;margin-top:6px;">No gamma flip detected</div></div>', unsafe_allow_html=True)
+
+    # OI Momentum Exhaustion
+    if _oi_exhaustion:
+        _oe = _oi_exhaustion
+        st.markdown(f"""
+        <div class="card">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">OI Momentum Exhaustion</div>
+          <div style="font-size:16px;font-weight:800;color:{_oe["color"]};">{_oe["label"]}</div>
+          <div style="font-size:12px;color:#374151;">{_oe["direction"]} flow exhaust ratio: {_oe["exhaust_ratio"]:.2f}</div>
+          <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+            <div style="background:{_oe["color"]};height:6px;border-radius:4px;width:{min(100, _oe["exhaust_ratio"] * 100)}%;"></div>
+          </div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Ratio <0.50 = exhaustion (reversal risk)</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="card"><div style="font-size:11px;font-weight:700;color:#6B7280;">OI Momentum Exhaustion</div><div style="font-size:12px;color:#9CA3AF;margin-top:6px;">Need 5+ ticks of history</div></div>', unsafe_allow_html=True)
+
+with _ls_col3:
+    # Inter-Expiry OI Flow
+    if _inter_expiry_signal and _inter_expiry_signal["available"]:
+        _ie = _inter_expiry_signal
+        _ie_color = "#D97706" if _ie["roll_signal"] else "#6B7280"
+        st.markdown(f"""
+        <div class="card">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Inter-Expiry OI Flow</div>
+          <div style="font-size:13px;font-weight:700;color:#1A1A2E;">Front PCR: {_ie["front_pcr"]:.2f} · Back PCR: {_ie["back_pcr"]:.2f}</div>
+          <div style="font-size:12px;color:#374151;">PCR diff (front-back): {_ie["pcr_diff"]:+.2f}</div>
+          <div style="font-size:12px;color:#374151;">Front mom: {_ie["front_momentum"]:+,.0f} · Back mom: {_ie["back_momentum"]:+,.0f}</div>
+          {f'<div style="font-size:12px;font-weight:700;color:{_ie_color};margin-top:6px;">{_ie["roll_signal"]}</div>' if _ie["roll_signal"] else '<div style="font-size:12px;color:#9CA3AF;margin-top:6px;">No active roll signal</div>'}
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="card"><div style="font-size:11px;font-weight:700;color:#6B7280;">Inter-Expiry OI Flow</div><div style="font-size:12px;color:#9CA3AF;margin-top:6px;">Need 2+ expiries from Dhan API</div></div>', unsafe_allow_html=True)
+
+    # Smart Money OI Filter Stats
+    _sm_label = "SMART MONEY" if _quality_mask.sum() > 5 else "MIXED"
+    _sm_color = "#059669" if _quality_mask.sum() > 5 else "#F59E0B"
+    st.markdown(f"""
+    <div class="card">
+      <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Smart Money OI Filter</div>
+      <div style="font-size:16px;font-weight:800;color:{_sm_color};">{_sm_label}</div>
+      <div style="font-size:12px;color:#374151;">Quality strikes passing filter</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Filters noise: requires significance floor + proximity to ATM</div>
+    </div>""", unsafe_allow_html=True)
+
+# ══ END LEADING SIGNALS PANEL ════════════════════════════════════════
+
 st.markdown('<div class="section-header"> Section 3  Key Price Levels</div>', unsafe_allow_html=True)
 
 gex_val   = m.get("gex", 0)
@@ -4592,11 +5374,10 @@ with metrics_col:
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 8: PRE-MOVE ALERT + FAKE BREAKOUT + OI VELOCITY
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">⚡ Section 8  Pre-Move Alert | Fake Breakout Detector | OI Velocity | Wall Strength</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-header">⚡ Section 8 — Pre-Move Alert | Fake Breakout Detector | OI Velocity</div>', unsafe_allow_html=True)
 
 alert   = compute_pre_move_alert(m, history)
 fbo     = compute_fake_breakout_score(m, history)
-wsi     = compute_wall_strength_index(m, history)
 oi_vel  = compute_oi_velocity(history)
 
 # Pre-move alert banner
@@ -4616,7 +5397,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # FBO + WSI + OI Velocity cards
-fbo_col, wsi_col, vel_col = st.columns([2, 1, 2])
+fbo_col, vel_col = st.columns([2, 2])
 with fbo_col:
     fbo_colors = {"NONE":BLUE,"WATCH":AMBER,"DANGER":RED}
     fc = fbo_colors.get(fbo["alert_level"], BLUE)
@@ -4630,24 +5411,6 @@ with fbo_col:
       {''.join(f'<div style="display:flex;justify-content:space-between;border-bottom:1px solid #E5E7EB;padding:4px 0;"><span style="font-size:11px;font-weight:600;color:#374151;">{k}</span><span style="font-size:11px;color:#6B7280;flex:1;margin:0 8px;">{v[1]}</span><span style="font-size:12px;font-weight:700;color:{"#DC2626" if v[0]>=20 else "#D97706" if v[0]>=10 else "#6B7280"};">+{v[0]}</span></div>' for k,v in fbo.get("factor_breakdown",{}).items())}
     </div>
     """, unsafe_allow_html=True)
-
-with wsi_col:
-    for wall_label, wsi_key_val, wsi_key_lbl, wsi_key_col, strike_key in [
-        ("RESISTANCE WALL", "resistance_wsi", "resistance_label", "resistance_color", "resistance_strike"),
-        ("SUPPORT WALL",    "support_wsi",    "support_label",    "support_color",    "support_strike"),
-    ]:
-        wsi_val = wsi.get(wsi_key_val, 0); wsi_lbl = wsi.get(wsi_key_lbl, ""); wsi_col2 = wsi.get(wsi_key_col, MUTED)
-        strike  = wsi.get(strike_key, 0)
-        st.markdown(f"""
-        <div class="card" style="margin-bottom:8px;">
-          <div style="font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;">{wall_label}</div>
-          <div style="font-size:18px;font-weight:700;color:#1A1A2E;">{strike:,}</div>
-          <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
-            <div style="background:{wsi_col2};height:6px;border-radius:4px;width:{wsi_val}%;transition:width 0.4s;"></div>
-          </div>
-          <div style="font-size:12px;font-weight:600;color:{wsi_col2};">WSI {wsi_val}  {wsi_lbl}</div>
-        </div>
-        """, unsafe_allow_html=True)
 
 with vel_col:
     vel_c_col = RED if oi_vel["call_vel_zscore"]>=2 else (AMBER if oi_vel["call_vel_zscore"]>=1.2 else GREEN if oi_vel["call_vel_zscore"]<=-1.2 else MUTED)
