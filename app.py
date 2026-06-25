@@ -1373,31 +1373,60 @@ def compute_section34_bias(df_band_records, m, spot, roll_discount=1.0):
 
     s3 = max(-20.0, min(20.0, s3a + s3b + s3c))
 
-    # ── Signal 4: OTM IV Skew (±12 pts) ──────────────────────────────────────
-    # Use ONLY OTM options (not ATM, not ITM) for clean skew reading
+    # ── Signal 4: Normalised IV Skew — ±9 pts level + ±3 pts intraday = ±12 total ─
+    # FIX (v4.1): Raw skew is always positive in normal Nifty sessions, causing a
+    # persistent ~5–7 pt bearish drag even in calm markets.
+    #
+    # Solution (Option 1 — ATM IV normalisation):
+    #   norm_skew = (put_OTM_IV − call_OTM_IV) / ATM_IV × 100
+    # Normal Nifty range ≈ 20–40% (baseline ~30%). Signal fires only on EXCESS above
+    # that baseline, removing the spurious chronic bearish tilt.
+    #
+    # The remaining ±3 pts (intraday momentum, Option 2) are added by the caller
+    # using session_state to anchor against the opening norm_skew each session.
     otm_call_mask = df["strike"] > (spot + atm_band)
     otm_put_mask  = df["strike"] < (spot - atm_band)
+    atm_mask      = df["strike"].between(spot - atm_band, spot + atm_band)
+
     valid_civ = df.loc[otm_call_mask, "call_iv"][df.loc[otm_call_mask, "call_iv"] > 0.5]
     valid_piv = df.loc[otm_put_mask,  "put_iv" ][df.loc[otm_put_mask,  "put_iv" ] > 0.5]
-    if len(valid_civ) > 0 and len(valid_piv) > 0:
-        skew = valid_piv.mean() - valid_civ.mean()   # positive = put fear premium
-        # 10 IV-point skew → full ±12 score; scale linearly, cap at 10 pts
-        s4 = max(-12.0, min(12.0, -(skew / 10.0) * 12.0))
-    else:
-        s4 = 0.0
 
-    # ── Signal 5: PCR Contrarian (±8 pts) ────────────────────────────────────
-    total_c_oi = df["call_oi"].sum()
-    total_p_oi = df["put_oi"].sum()
-    if total_c_oi > 0:
-        pcr = total_p_oi / total_c_oi
-        if   pcr >= 1.5: s5 =  8.0    # extreme fear → contrarian bullish
-        elif pcr >= 1.3: s5 =  4.0
-        elif pcr >= 0.9: s5 =  0.0    # normal range → neutral
-        elif pcr >= 0.7: s5 = -4.0
-        else:            s5 = -8.0    # extreme complacency → contrarian bearish
+    # ATM IV: regime baseline — average of ATM calls + puts (both sides for robustness)
+    atm_c = df.loc[atm_mask, "call_iv"][df.loc[atm_mask, "call_iv"] > 0.5]
+    atm_p = df.loc[atm_mask, "put_iv" ][df.loc[atm_mask, "put_iv" ] > 0.5]
+    atm_iv_level = (
+        pd.concat([atm_c, atm_p]).mean()
+        if (len(atm_c) + len(atm_p)) > 0 else 15.0
+    )
+
+    if len(valid_civ) > 0 and len(valid_piv) > 0 and atm_iv_level > 1.0:
+        raw_skew  = valid_piv.mean() - valid_civ.mean()   # positive = put fear premium
+        norm_skew = (raw_skew / atm_iv_level) * 100.0     # as % of ATM IV
+
+        # Normal Nifty norm_skew ≈ 20–40%; midpoint baseline = 30%.
+        # Signal fires only for excess beyond this neutral zone.
+        # Calibrate NORMAL_SKEW_BASELINE after observing a few calm sessions.
+        NORMAL_SKEW_BASELINE = 30.0
+        excess = norm_skew - NORMAL_SKEW_BASELINE
+        # 20 pct-pt excess maps to full ±9 level score
+        s4 = max(-9.0, min(9.0, -(excess / 20.0) * 9.0))
     else:
-        s5 = 0.0
+        raw_skew  = 0.0
+        norm_skew = 30.0   # assume neutral when IV data unavailable
+        s4        = 0.0
+
+    # ── Signal 5: IV Term Structure (±8 pts) — placeholder, injected by caller ──
+    # REPLACED from PCR Contrarian (v4.1) to eliminate the S1/S5 OI-data redundancy.
+    # Both S1 and PCR derive from put_OI / call_OI quantities — information is
+    # double-counted at effectively ±43 pts on the same underlying measure.
+    #
+    # The IV Term Structure signal uses front vs back expiry ATM IV (not OI at all),
+    # making it genuinely orthogonal to S1. Normal contango (back IV > front IV)
+    # signals calm market. Backwardation (front IV > back IV) signals acute near-term
+    # fear. Scored via the existing compute_term_structure_signal() ts_score field,
+    # with an automatic DTE confidence weight applied by the caller to suppress the
+    # signal when front-expiry DTE ≤ 2 days (IV noise-dominated near expiry).
+    s5 = 0.0   # always 0 here; real value injected in main flow after _ts_data available
 
     # ── Aggregate ─────────────────────────────────────────────────────────────
     bias_score = max(-100.0, min(100.0, round(s1 + s2 + s3 + s4 + s5, 1)))
@@ -1424,12 +1453,14 @@ def compute_section34_bias(df_band_records, m, spot, roll_discount=1.0):
         "quality_strikes_count":  _qcount,
         "roll_discount_applied":  round(roll_discount, 2),
         "roll_window_active":     is_roll_window(),
+        # v4.1: norm_skew returned so caller can anchor intraday delta (Option 2)
+        "norm_skew":   round(norm_skew, 2),
         "signal_breakdown": {
             "S1 Net OI":     round(s1, 1),
             "S2 Momentum":   round(s2, 1),   # already roll-discounted
             "S3 Key Levels": round(s3, 1),
-            "S4 IV Skew":    round(s4, 1),
-            "S5 PCR":        round(s5, 1),
+            "S4 IV Skew":    round(s4, 1),   # level component only (±9 pts)
+            "S5 Term Str":   round(s5, 1),   # 0.0 here; real value injected by caller
             "S6 Velocity":   0.0,   # populated by caller with bias_history
         },
     }
@@ -2249,7 +2280,7 @@ def fetch_back_expiry_oi_band(back_expiry: str):
 def is_roll_window() -> bool:
     """
     True during the mechanical weekly roll window:
-    Tuesday 14:00 IST → Wednesday 15:30 IST (before Thursday expiry).
+    Tuesday 14:00 IST → Wednesday 15:30 IST (Nifty expiry is Tuesday).
     During this window institutional desks systematically roll front-week
     positions to the next expiry, making OI momentum signals unreliable.
     """
@@ -2354,22 +2385,35 @@ def detect_roll_activity(front_df, back_df, spot: float) -> dict:
     }
 
 
-def compute_term_structure_signal(front_atm_iv: float, back_atm_iv):
+def compute_term_structure_signal(front_atm_iv: float, back_atm_iv, front_expiry: str = None):
     """
     Compute term structure slope and derive a bias signal.
     front_atm_iv: ATM IV of nearest expiry (already in main metrics)
     back_atm_iv:  ATM IV of second expiry from fetch_back_expiry_atm_iv()
+    front_expiry: ISO date string of front expiry (YYYY-MM-DD) from Dhan API.
+                  Used to detect expiry day dynamically — no weekday hardcoding.
 
     Normal contango  (front < back): market calm, range bias confirmed.
     Flat term structure (|slope| < 1): transitional.
     Backwardation (front > back): near-term event risk, directional move likely.
 
-    NOTE: On NIFTY weekly expiry day (Thursday) the front expiry IV collapses
-    to near-zero, making the slope unreliable. Signal is suppressed on Thursdays.
+    NOTE: On expiry day the front IV collapses to near-zero, making the slope
+    unreliable. Signal is suppressed when DTE ≤ 0 (i.e., today IS expiry day).
+    Previously hardcoded to Thursday; now dynamically derived from front_expiry
+    so it works correctly for Tuesday expiry (and any future schedule changes).
     """
-    # Expiry-day guard: suppress on Thursday (NIFTY weekly expiry)
     from datetime import date as _date
-    if _date.today().weekday() == 3:  # 3 = Thursday
+    # Expiry-day guard: suppress when today is the actual front expiry date.
+    # DTE is computed from the real expiry string — no day-of-week assumption.
+    _suppress = False
+    if front_expiry:
+        try:
+            _dte = (_date.fromisoformat(front_expiry) - _date.today()).days
+            if _dte <= 0:
+                _suppress = True
+        except Exception:
+            pass   # bad date string — don't suppress, degrade gracefully
+    if _suppress:
         return {
             "available":   False,
             "front_iv":    round(front_atm_iv, 2) if front_atm_iv else 0.0,
@@ -4207,6 +4251,34 @@ _s34_bias = compute_section34_bias(
 _s34_score = _s34_bias["bias_score"]
 _s34_breakdown = _s34_bias.get("signal_breakdown", {})
 
+# ── v4.1 S4 FIX: Option 2 — Intraday Skew Momentum Anchor (±3 pts) ──────────
+# The ATM-normalised skew (Option 1, inside compute_section34_bias) removes the
+# chronic bearish baseline. This block adds the intraday DIRECTIONAL component:
+# has fear been building or easing SINCE THE SESSION OPEN?
+#
+# session_state.opening_norm_skew is set on the first refresh each session and
+# held fixed. Each subsequent refresh measures the change from that anchor.
+# A rising norm_skew intraday = fear building = bearish contribution (up to −3 pts).
+# A falling norm_skew intraday = fear easing  = bullish contribution (up to +3 pts).
+#
+# This naturally resets at the start of each new session (Streamlit restarts) and
+# requires zero stored history beyond the current session.
+_current_norm_skew = _s34_bias.get("norm_skew", 30.0)
+if "opening_norm_skew" not in st.session_state or st.session_state.opening_norm_skew is None:
+    st.session_state.opening_norm_skew = _current_norm_skew
+_delta_skew = _current_norm_skew - st.session_state.opening_norm_skew
+# 15 pct-point intraday change → full ±3 pts; sign: rising skew = bearish (negative)
+_s4_intra = max(-3.0, min(3.0, -(_delta_skew / 15.0) * 3.0))
+# Merge into bias score and breakdown (S4 now reflects level + intraday momentum)
+_s34_bias["bias_score"] = max(-100.0, min(100.0, _s34_bias["bias_score"] + _s4_intra))
+_s34_bias["signal_breakdown"]["S4 IV Skew"] = round(
+    _s34_bias["signal_breakdown"].get("S4 IV Skew", 0.0) + _s4_intra, 1
+)
+# Refresh local aliases so all downstream code sees the updated values
+_s34_score     = _s34_bias["bias_score"]
+_s34_breakdown = _s34_bias.get("signal_breakdown", {})
+# ── end S4 intraday anchor ────────────────────────────────────────────────────
+
 # ── Early IV smile call for the Combined Bias panel (Chapter 17 & 18) ────
 # Uses df_band already loaded above; relies on smile session history if available.
 _early_smile_hist = st.session_state.get("iv_smile_history", [])
@@ -4225,8 +4297,41 @@ _vwap_or_data      = compute_vwap_opening_range(_intraday_candles)
 _back_expiry       = _expiry_list[1] if len(_expiry_list) > 1 else None
 _back_atm_iv       = fetch_back_expiry_atm_iv(_back_expiry) if _back_expiry else None
 _ts_data           = compute_term_structure_signal(
-    safe_num(m.get("atm_iv", 0)), _back_atm_iv
+    safe_num(m.get("atm_iv", 0)), _back_atm_iv,
+    front_expiry=_expiry_list[0] if _expiry_list else None,   # v4.1: dynamic expiry-day suppression
 )
+
+# ── v4.1 S5 REPLACEMENT: IV Term Structure Injection (±8 pts) ────────────────
+# compute_section34_bias() leaves s5 = 0.0 (placeholder). We inject the real
+# value here because _ts_data is not available inside that function.
+#
+# DTE confidence weight: the term structure comparison becomes noise-dominated
+# when the front expiry has very few days left (IV collapses erratically).
+# Weight tapers from 1.0 (≥4 days, Monday) → 0.75 (3 days) → 0.50 (2 days, Wed)
+# → 0.0 (1 day). Expiry day itself is already suppressed to ts_score=0
+# inside compute_term_structure_signal() itself — no additional guard needed.
+#
+# This replaces PCR Contrarian (S5) which was correlated with S1 (both use
+# put_OI / call_OI). IV term structure uses a completely different data source.
+from datetime import date as _dte_date_cls
+try:
+    _dte_front = max(1, (_dte_date_cls.fromisoformat(_expiry_list[0]) - _dte_date_cls.today()).days) \
+                 if _expiry_list else 4
+except Exception:
+    _dte_front = 4   # safe fallback: assume normal Monday-like DTE
+
+if   _dte_front >= 4: _s5_dte_weight = 1.00   # Mon / any day with ≥4 days left
+elif _dte_front == 3: _s5_dte_weight = 0.75   # Tuesday — mild suppression
+elif _dte_front == 2: _s5_dte_weight = 0.50   # Wednesday — moderate suppression
+else:                 _s5_dte_weight = 0.00   # 1 day left: fully suppress
+
+_s5_ts = round(_ts_data.get("ts_score", 0.0) * _s5_dte_weight, 1)
+# Inject into the running bias score and breakdown
+_s34_bias["bias_score"] = max(-100.0, min(100.0, _s34_bias["bias_score"] + _s5_ts))
+_s34_bias["signal_breakdown"]["S5 Term Str"] = _s5_ts
+_s34_score     = _s34_bias["bias_score"]
+_s34_breakdown = _s34_bias.get("signal_breakdown", {})
+# ── end S5 term structure injection ──────────────────────────────────────────
 
 # Module C: India VIX
 _vix_raw           = fetch_india_vix_ltp()
@@ -4404,7 +4509,7 @@ if _payload_fetch_ts != _last_bh_fetch_ts:
         "s2":        _s34_breakdown.get("S2 Momentum",   0.0),
         "s3":        _s34_breakdown.get("S3 Key Levels", 0.0),
         "s4":        _s34_breakdown.get("S4 IV Skew",    0.0),
-        "s5":        _s34_breakdown.get("S5 PCR",        0.0),
+        "s5":        _s34_breakdown.get("S5 Term Str",   0.0),
         "s6":        _s34_breakdown.get("S6 Velocity",   0.0),
     })
     st.session_state.bias_history = _bh_tmp[-60:]   # ~5 hrs at data-refresh cadence
@@ -4952,7 +5057,7 @@ if len(_bh_data) >= 2:
         for _sk in ("s1","s2","s3","s4","s5","s6"):
             if _sk in r:
                 _label = {"s1":"S1 Net OI","s2":"S2 Mom","s3":"S3 Levels",
-                          "s4":"S4 Skew","s5":"S5 PCR","s6":"S6 Vel"}.get(_sk, _sk)
+                          "s4":"S4 Skew","s5":"S5 TS","s6":"S6 Vel"}.get(_sk, _sk)
                 _hlines.append(f"{_label}: {r[_sk]:+.0f}")
         _bh_hover.append("<br>".join(_hlines))
 
@@ -5056,6 +5161,269 @@ if len(_bh_data) >= 2:
 elif len(_bh_data) == 1:
     st.caption("⏳ Chart will appear after the second 5-minute snapshot is recorded.")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# GAMMA DATA SECTION — Option C: OI×Gamma Directional Balance
+#                    — Sub-D:   Gamma Blast Proximity Detector
+# All data sourced from the already-loaded option chain (_early_df_band).
+# No new API calls. Gamma is computed during the main chain fetch (BS Greeks).
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown(
+    '<div class="section-header">⚡ Gamma Data — OI×Gamma Balance · Blast Proximity Detector</div>',
+    unsafe_allow_html=True,
+)
+
+_gd_src = _early_df_band.copy() if _early_df_band is not None and not _early_df_band.empty else None
+
+if _gd_src is not None:
+    # ── Coerce numeric columns ────────────────────────────────────────────────
+    for _gc in ["strike", "call_oi", "put_oi", "call_gamma", "put_gamma"]:
+        if _gc in _gd_src.columns:
+            _gd_src[_gc] = pd.to_numeric(_gd_src[_gc], errors="coerce").fillna(0.0)
+
+    _gd_src = _gd_src.sort_values("strike").reset_index(drop=True)
+
+    # ── Core Option C columns ────────────────────────────────────────────────
+    _gd_src["call_gex"] = _gd_src["call_oi"] * _gd_src["call_gamma"]   # ceiling pressure per strike
+    _gd_src["put_gex"]  = _gd_src["put_oi"]  * _gd_src["put_gamma"]    # floor pressure per strike
+    _gd_src["net_gex"]  = _gd_src["put_gex"] - _gd_src["call_gex"]     # +ve = put-side dominant (bullish)
+
+    _gd_atm_band = spot * 0.003
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CHART 1 — Option C: OI×Gamma Balance per Strike
+    # Shows WHERE gamma-weighted pressure is concentrated across the band.
+    # Green bars = put floor capacity weighted by gamma impact.
+    # Red bars   = call ceiling capacity weighted by gamma impact.
+    # Purple line = net balance (positive = more floor than ceiling = bullish).
+    # This is the theoretically superior version of Signal 1 — same directionality
+    # but using gamma (dynamic hedging flow) instead of delta (static hedge ratio).
+    # ─────────────────────────────────────────────────────────────────────────
+    _gc1_fig = go.Figure()
+
+    _gc1_fig.add_trace(go.Bar(
+        x=_gd_src["strike"],
+        y=_gd_src["put_gex"],
+        name="Put OI×Γ — Floor",
+        marker_color="#22C55E",
+        opacity=0.75,
+        hovertemplate="Strike %{x:,.0f}<br>Put OI×Γ: %{y:.5f}<extra>Floor</extra>",
+    ))
+    _gc1_fig.add_trace(go.Bar(
+        x=_gd_src["strike"],
+        y=-_gd_src["call_gex"],
+        name="Call OI×Γ — Ceiling",
+        marker_color="#EF4444",
+        opacity=0.75,
+        hovertemplate="Strike %{x:,.0f}<br>Call OI×Γ: %{y:.5f}<extra>Ceiling</extra>",
+    ))
+    _gc1_fig.add_trace(go.Scatter(
+        x=_gd_src["strike"],
+        y=_gd_src["net_gex"],
+        name="Net Gamma Balance",
+        mode="lines+markers",
+        line=dict(color="#7C3AED", width=2.2),
+        marker=dict(size=5, color="#7C3AED"),
+        hovertemplate="Strike %{x:,.0f}<br>Net: %{y:.5f}<extra>Net</extra>",
+    ))
+    _gc1_fig.add_vline(
+        x=spot, line_dash="dash", line_color="#F59E0B", line_width=2,
+        annotation_text=f"Spot {spot:,.0f}",
+        annotation_font=dict(size=10, color="#F59E0B"),
+        annotation_position="top right",
+    )
+    _gc1_fig.update_layout(
+        title=dict(
+            text="Option C — OI×Gamma Directional Balance  "
+                 "<span style='font-size:11px;color:#6B7280'>"
+                 "Green=Floor Pressure · Red=Ceiling Pressure · Purple=Net</span>",
+            font=dict(size=13),
+        ),
+        barmode="overlay",
+        height=295,
+        paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=55, r=20, t=50, b=30),
+        legend=dict(orientation="h", y=1.18, font=dict(size=10)),
+        yaxis=dict(
+            title="OI × Gamma",
+            gridcolor="#F3F4F6",
+            zeroline=True, zerolinecolor="#9CA3AF", zerolinewidth=1.2,
+            tickfont=dict(size=9),
+        ),
+        xaxis=dict(title="Strike", tickfont=dict(size=9)),
+        font=dict(color="#1A1A2E", size=11),
+    )
+    st.plotly_chart(_gc1_fig, use_container_width=True, config={"displayModeBar": False})
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CHART 2 + ALERT CARD — Sub-D: Gamma Blast Proximity Detector
+    # Identifies the nearest high-gamma OI concentration above and below spot.
+    # A large OI×Gamma strike within ±2 strikes of spot = gamma spring loaded.
+    # When spot moves through such a strike, the dealer hedging cascade begins.
+    # ─────────────────────────────────────────────────────────────────────────
+    # Partition: OTM calls above spot, OTM puts below spot (pure directional walls)
+    _gd_above = _gd_src[_gd_src["strike"] > (spot + _gd_atm_band)].copy()
+    _gd_below = _gd_src[_gd_src["strike"] < (spot - _gd_atm_band)].copy()
+
+    # Focus on ±5 strikes for proximity assessment
+    _gd_near_above = _gd_above[_gd_above["strike"] <= spot + 5 * NIFTY_STEP]
+    _gd_near_below = _gd_below[_gd_below["strike"] >= spot - 5 * NIFTY_STEP]
+
+    # Nearest significant call wall (highest call_gex within 5 strikes above)
+    _gd_call_wall_k = None; _gd_call_wall_gex = 0.0; _gd_call_wall_dist = None
+    _gd_put_wall_k  = None; _gd_put_wall_gex  = 0.0; _gd_put_wall_dist  = None
+
+    if not _gd_near_above.empty:
+        _cw = _gd_near_above.loc[_gd_near_above["call_gex"].idxmax()]
+        _gd_call_wall_k   = float(_cw["strike"])
+        _gd_call_wall_gex = float(_cw["call_gex"])
+        _gd_call_wall_dist = _gd_call_wall_k - spot
+
+    if not _gd_near_below.empty:
+        _pw = _gd_near_below.loc[_gd_near_below["put_gex"].idxmax()]
+        _gd_put_wall_k   = float(_pw["strike"])
+        _gd_put_wall_gex = float(_pw["put_gex"])
+        _gd_put_wall_dist = spot - _gd_put_wall_k
+
+    # Blast readiness threshold: top-50th percentile of band OI×Gamma
+    _gd_all_gex = pd.concat([_gd_src["call_gex"], _gd_src["put_gex"]])
+    _gd_gex_p50 = float(_gd_all_gex.quantile(0.50)) if len(_gd_all_gex) > 4 else 0.0
+
+    _gd_call_blast = (
+        _gd_call_wall_dist is not None
+        and _gd_call_wall_dist <= 2 * NIFTY_STEP
+        and _gd_call_wall_gex >= _gd_gex_p50
+    )
+    _gd_put_blast = (
+        _gd_put_wall_dist is not None
+        and _gd_put_wall_dist <= 2 * NIFTY_STEP
+        and _gd_put_wall_gex >= _gd_gex_p50
+    )
+
+    # Alert label
+    if _gd_call_blast and _gd_put_blast:
+        _gd_blast_color = "#7C3AED"
+        _gd_blast_icon  = "⚡⚡"
+        _gd_blast_label = "BILATERAL GAMMA SPRING"
+        _gd_blast_sub   = "Large walls ≤ 2 strikes on both sides"
+    elif _gd_call_blast:
+        _gd_blast_color = "#DC2626"
+        _gd_blast_icon  = "⚡"
+        _gd_blast_label = "UPSIDE BLAST RISK"
+        _gd_blast_sub   = f"Call wall at {_gd_call_wall_k:,.0f} — {_gd_call_wall_dist:.0f} pts away"
+    elif _gd_put_blast:
+        _gd_blast_color = "#16A34A"
+        _gd_blast_icon  = "⚡"
+        _gd_blast_label = "DOWNSIDE BLAST RISK"
+        _gd_blast_sub   = f"Put wall at {_gd_put_wall_k:,.0f} — {_gd_put_wall_dist:.0f} pts away"
+    else:
+        _gd_blast_color = "#6B7280"
+        _gd_blast_icon  = "—"
+        _gd_blast_label = "CALM"
+        _gd_blast_sub   = "No high-gamma wall within 2 strikes"
+
+    _gd_col1, _gd_col2 = st.columns([3, 1])
+
+    with _gd_col1:
+        # Horizontal proximity bar chart — shows gamma walls around spot
+        # Call walls plotted rightward (+x), put walls leftward (-x), spot at centre
+        _gc2_fig = go.Figure()
+
+        if not _gd_above.empty:
+            _gc2_fig.add_trace(go.Bar(
+                x=_gd_above["call_gex"],
+                y=[f"{int(k):,}" for k in _gd_above["strike"]],
+                orientation="h",
+                name="Call OI×Γ (above spot)",
+                marker_color=[
+                    "#DC2626" if (_gd_call_wall_k and abs(k - _gd_call_wall_k) < 1) else "#FCA5A5"
+                    for k in _gd_above["strike"]
+                ],
+                opacity=0.9,
+                hovertemplate="Strike %{y}<br>Call OI×Γ: %{x:.5f}<extra>Call Wall</extra>",
+            ))
+
+        if not _gd_below.empty:
+            _gc2_fig.add_trace(go.Bar(
+                x=-_gd_below["put_gex"],
+                y=[f"{int(k):,}" for k in _gd_below["strike"]],
+                orientation="h",
+                name="Put OI×Γ (below spot)",
+                marker_color=[
+                    "#15803D" if (_gd_put_wall_k and abs(k - _gd_put_wall_k) < 1) else "#86EFAC"
+                    for k in _gd_below["strike"]
+                ],
+                opacity=0.9,
+                hovertemplate="Strike %{y}<br>Put OI×Γ: %{x:.5f}<extra>Put Wall</extra>",
+            ))
+
+        _gc2_fig.add_vline(x=0, line_color="#9CA3AF", line_width=1.2)
+        _gc2_fig.update_layout(
+            title=dict(
+                text="Sub-D — Blast Proximity  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "← Put Gamma Pressure | Call Gamma Pressure →  "
+                     f"Highlighted = nearest wall | Spot {spot:,.0f}</span>",
+                font=dict(size=13),
+            ),
+            barmode="overlay",
+            height=310,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=75, r=20, t=50, b=30),
+            legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+            yaxis=dict(
+                title="Strike",
+                gridcolor="#F3F4F6",
+                tickfont=dict(size=9),
+                autorange="reversed",   # highest strike at top = natural orientation
+            ),
+            xaxis=dict(
+                title="← Put OI×Γ  |  Call OI×Γ →",
+                gridcolor="#F3F4F6",
+                zeroline=True, zerolinecolor="#9CA3AF",
+                tickfont=dict(size=9),
+            ),
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_gc2_fig, use_container_width=True, config={"displayModeBar": False})
+
+    with _gd_col2:
+        # ── Blast alert card ─────────────────────────────────────────────────
+        _gd_cw_line1 = f"Strike: <b>{_gd_call_wall_k:,.0f}</b>" if _gd_call_wall_k else "No data"
+        _gd_cw_line2 = f"Dist: <b>+{_gd_call_wall_dist:.0f} pts</b>" if _gd_call_wall_dist else ""
+        _gd_cw_line3 = f"OI×Γ: {_gd_call_wall_gex:.5f}" if _gd_call_wall_gex else ""
+        _gd_pw_line1 = f"Strike: <b>{_gd_put_wall_k:,.0f}</b>"  if _gd_put_wall_k  else "No data"
+        _gd_pw_line2 = f"Dist: <b>-{_gd_put_wall_dist:.0f} pts</b>"  if _gd_put_wall_dist  else ""
+        _gd_pw_line3 = f"OI×Γ: {_gd_put_wall_gex:.5f}"  if _gd_put_wall_gex  else ""
+
+        st.markdown(f"""
+        <div style="background:#fff;border:2.5px solid {_gd_blast_color};border-radius:12px;
+                    padding:14px 16px;margin-top:10px;">
+          <div style="text-align:center;font-size:22px;margin-bottom:2px;">{_gd_blast_icon}</div>
+          <div style="text-align:center;font-size:13px;font-weight:700;
+                      color:{_gd_blast_color};margin-bottom:4px;">{_gd_blast_label}</div>
+          <div style="text-align:center;font-size:10px;color:#6B7280;
+                      margin-bottom:12px;">{_gd_blast_sub}</div>
+          <hr style="border:none;border-top:1px solid #F3F4F6;margin:10px 0;">
+          <div style="font-size:11px;color:#374151;line-height:2.0;">
+            <span style="color:#EF4444;font-weight:600;">▲ Nearest Call Wall</span><br>
+            {_gd_cw_line1}<br>
+            {_gd_cw_line2}<br>
+            {_gd_cw_line3}
+          </div>
+          <hr style="border:none;border-top:1px solid #F3F4F6;margin:10px 0;">
+          <div style="font-size:11px;color:#374151;line-height:2.0;">
+            <span style="color:#22C55E;font-weight:600;">▼ Nearest Put Wall</span><br>
+            {_gd_pw_line1}<br>
+            {_gd_pw_line2}<br>
+            {_gd_pw_line3}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+else:
+    st.info("⏳ Gamma data unavailable — waiting for option chain.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3: KEY PRICE LEVELS
 # ─────────────────────────────────────────────────────────────────────────────
 
