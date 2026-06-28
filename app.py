@@ -6608,7 +6608,7 @@ if not _sv_df.empty:
                 return ""
 
             st.dataframe(
-                _endm_df.style.applymap(_endm_style, subset=["Enhanced NDM", "Raw NDM"]),
+                _endm_df.style.map(_endm_style, subset=["Enhanced NDM", "Raw NDM"]),
                 use_container_width=True,
                 hide_index=True
             )
