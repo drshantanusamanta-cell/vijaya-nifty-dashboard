@@ -4811,6 +4811,7 @@ hist_entry    = build_history_entry(
 # Multiple visitors refreshing against the same cached server snapshot must
 # produce exactly ONE history entry — not one per visitor per refresh.
 hist_entry["_fetch_ts"] = _payload_fetch_ts
+hist_entry["_df_band_records"] = df_band_records  # Enhanced NDM: store per-strike LTP for prev-tick comparison
 # Only append if this is a genuinely new Dhan data fetch (fetch_ts changed)
 if not history or history[-1].get("_fetch_ts", 0) != _payload_fetch_ts:
     history.append(hist_entry)
@@ -6464,6 +6465,154 @@ if not _sv_df.empty:
           <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">
             Golden Rule: when divergent, NDM overrides ND</div>
         </div>""", unsafe_allow_html=True)
+
+
+    # ── Enhanced NDM — Buyer/Writer Adjusted (Shantanu Framework Upgrade) ──────
+    st.markdown(
+        '<div style="font-size:16px;font-weight:900;color:#7C3AED;letter-spacing:0.4px;'
+        'padding:14px 0 6px 0;border-top:2px solid #E5E7EB;margin-top:16px;margin-bottom:8px;">'
+        '🔬 Enhanced NDM — Buyer / Writer Adjusted</div>',
+        unsafe_allow_html=True
+    )
+    st.caption(
+        "Raw NDM assumes ALL OI addition is buyer-driven. "
+        "Enhanced NDM corrects this: when premium FALLS as OI rises, a WRITER is adding — "
+        "the MM takes the opposite side, reversing the hedge direction. "
+        "If Enhanced NDM diverges from Raw NDM, the raw signal is unreliable."
+    )
+
+    # Build Enhanced NDM per strike using call_ltp / put_ltp direction
+    # Prev-tick LTP: look up history[-2] if available, else fall back to current (no change)
+    _prev_band_map = {}
+    if len(history) >= 2:
+        _prev_band_records = history[-2].get("_df_band_records", [])
+        for _pb in _prev_band_records:
+            _prev_band_map[_pb.get("strike")] = _pb
+
+    _endm_rows = []
+    for _r in df_band_records:
+        _strike     = _r.get("strike", 0)
+        _c_oi_chg   = float(_r.get("call_oi_chg", 0) or 0)
+        _p_oi_chg   = float(_r.get("put_oi_chg",  0) or 0)
+        _c_delta    = abs(float(_r.get("call_delta", 0) or 0))
+        _p_delta    = abs(float(_r.get("put_delta",  0) or 0))
+        _c_ltp      = float(_r.get("call_ltp", 0) or 0)
+        _p_ltp      = float(_r.get("put_ltp",  0) or 0)
+
+        # Prev LTP — fallback to current if no history (= no change, prem_dir = +1)
+        _prev       = _prev_band_map.get(_strike, {})
+        _c_ltp_prev = float(_prev.get("call_ltp", _c_ltp) or _c_ltp)
+        _p_ltp_prev = float(_prev.get("put_ltp",  _p_ltp) or _p_ltp)
+
+        # +1 = premium rising (buyer aggressor), -1 = premium falling (writer aggressor)
+        _c_prem_dir = 1 if _c_ltp >= _c_ltp_prev else -1
+        _p_prem_dir = 1 if _p_ltp >= _p_ltp_prev else -1
+
+        # Call: buyer aggressor → MM short call → buys futures → +delta
+        # Call: writer aggressor → MM long call  → sells futures → -delta
+        _c_contrib  = _c_oi_chg * _c_delta * _c_prem_dir
+
+        # Put: buyer aggressor → MM short put → sells futures → -delta  (prem_dir=+1 → negative)
+        # Put: writer aggressor → MM long put  → buys futures → +delta  (prem_dir=-1 → positive)
+        _p_contrib  = _p_oi_chg * _p_delta * (-_p_prem_dir)
+
+        _endm_val   = _c_contrib + _p_contrib
+        _raw_ndm_v  = (_c_oi_chg * _c_delta) - (_p_oi_chg * _p_delta)
+
+        _endm_rows.append({
+            "Strike":        int(_strike),
+            "C OI Chg":      int(_c_oi_chg),
+            "C Prem Dir":    "↑ Buyer" if _c_prem_dir == 1 else "↓ Writer",
+            "P OI Chg":      int(_p_oi_chg),
+            "P Prem Dir":    "↑ Buyer" if _p_prem_dir == 1 else "↓ Writer",
+            "Enhanced NDM":  round(_endm_val),
+            "Raw NDM":       round(_raw_ndm_v),
+        })
+
+    _endm_df        = pd.DataFrame(_endm_rows).sort_values("Strike", ascending=False)
+    _endm_total_e   = int(_endm_df["Enhanced NDM"].sum())
+    _endm_total_r   = int(_endm_df["Raw NDM"].sum())
+
+    # Signal classification
+    if _endm_total_e > 0 and _endm_total_r > 0:
+        _endm_signal = "✅ CONFIRMED BULLISH — Buyer-driven call pressure. MM hedge = buy futures."
+        _endm_sc     = "#059669"; _endm_sbg = "#D1FAE5"
+    elif _endm_total_e < 0 and _endm_total_r < 0:
+        _endm_signal = "✅ CONFIRMED BEARISH — Buyer-driven put pressure. MM hedge = sell futures."
+        _endm_sc     = "#DC2626"; _endm_sbg = "#FEE2E2"
+    elif _endm_total_e > 0 and _endm_total_r < 0:
+        _endm_signal = "⚠️ DIVERGENCE — Writer puts reversing raw signal → Lean BULLISH. Verify VIX + PCR."
+        _endm_sc     = "#D97706"; _endm_sbg = "#FFFBEB"
+    elif _endm_total_e < 0 and _endm_total_r > 0:
+        _endm_signal = "⚠️ DIVERGENCE — Writer calls reversing raw signal → Lean BEARISH. Verify VIX + PCR."
+        _endm_sc     = "#D97706"; _endm_sbg = "#FFFBEB"
+    else:
+        _endm_signal = "➖ NEUTRAL / MIXED — No dominant aggressor side."
+        _endm_sc     = "#6B7280"; _endm_sbg = "#F9FAFB"
+
+    _endm_rc = "#059669" if _endm_total_r > 0 else "#DC2626" if _endm_total_r < 0 else "#6B7280"
+
+    # Suppress note during first 15 min of session
+    _now_ist_sv = now_ist()
+    _endm_suppress = (_now_ist_sv.hour == 9 and _now_ist_sv.minute < 30)
+    if _endm_suppress:
+        st.warning(
+            "⚠️ Enhanced NDM suppressed during 09:15–09:30: gap-open premium spikes make "
+            "buyer/writer classification unreliable. Signal activates after 09:30."
+        )
+    else:
+        _ec1, _ec2, _ec3 = st.columns([1, 1, 2])
+        with _ec1:
+            st.markdown(f"""
+            <div style="background:#F8F7FF;border:1.5px solid #7C3AED;border-radius:10px;
+                        padding:14px 16px;text-align:center;">
+              <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
+                          letter-spacing:0.5px;margin-bottom:4px;">Enhanced NDM</div>
+              <div style="font-size:24px;font-weight:900;color:{_endm_sc};">{_endm_total_e:+,}</div>
+              <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Buyer/Writer Adjusted</div>
+            </div>""", unsafe_allow_html=True)
+        with _ec2:
+            st.markdown(f"""
+            <div style="background:#F9FAFB;border:1.5px solid #E5E7EB;border-radius:10px;
+                        padding:14px 16px;text-align:center;">
+              <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
+                          letter-spacing:0.5px;margin-bottom:4px;">Raw NDM</div>
+              <div style="font-size:24px;font-weight:900;color:{_endm_rc};">{_endm_total_r:+,}</div>
+              <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Standard Formula</div>
+            </div>""", unsafe_allow_html=True)
+        with _ec3:
+            st.markdown(f"""
+            <div style="background:{_endm_sbg};border:1.5px solid {_endm_sc};border-radius:10px;
+                        padding:14px 16px;">
+              <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
+                          letter-spacing:0.5px;margin-bottom:6px;">Signal Interpretation</div>
+              <div style="font-size:13px;font-weight:800;color:{_endm_sc};line-height:1.5;">
+                {_endm_signal}</div>
+              <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">
+                Divergence = Raw NDM unreliable. Trust Enhanced NDM + cross-check VIX &amp; PCR.</div>
+            </div>""", unsafe_allow_html=True)
+
+        with st.expander("📊 Strike-by-Strike Enhanced NDM Breakdown", expanded=False):
+            st.caption(
+                "↑ Buyer = OI added with rising premium (MM hedges WITH the move). "
+                "↓ Writer = OI added with falling premium (MM hedges AGAINST the move, flipping sign). "
+                "Enhanced NDM corrects raw NDM for writer-dominated strikes."
+            )
+
+            def _endm_style(val):
+                if isinstance(val, (int, float)):
+                    if val > 0:
+                        return "color:#059669;font-weight:700"
+                    elif val < 0:
+                        return "color:#DC2626;font-weight:700"
+                return ""
+
+            st.dataframe(
+                _endm_df.style.applymap(_endm_style, subset=["Enhanced NDM", "Raw NDM"]),
+                use_container_width=True,
+                hide_index=True
+            )
+    # ── End Enhanced NDM ──────────────────────────────────────────────────────
 
 else:
     st.info("⏳ Shantanu's View: Waiting for option chain data to initialise.")
