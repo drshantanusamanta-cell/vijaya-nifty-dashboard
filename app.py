@@ -6144,23 +6144,33 @@ if _gd_src is not None:
             hovertemplate="%{x}<br>Vega Diff: <b>%{y:,.2f}</b><extra>Band Vega Diff</extra>",
         ))
         # Zero line on right axis (vega parity)
+        # NOTE: annotation_position omitted — Plotly's _mean() crashes on string
+        # x-axis (categorical timestamps). Annotation added separately instead.
         _vd_fig.add_hline(
             y=0, yref="y2",
             line_dash="dot", line_color="#C4B5FD", line_width=1.5,
-            annotation_text="Vega Parity",
-            annotation_font=dict(size=9, color="#7C3AED"),
-            annotation_position="right",
+        )
+        _vd_fig.add_annotation(
+            x=1, y=0, xref="paper", yref="y2",
+            text="Vega Parity",
+            font=dict(size=9, color="#7C3AED"),
+            showarrow=False, xanchor="left",
         )
         # Mark ATM strike changes as vertical lines
+        # NOTE: annotation_position in add_vline also calls _mean() on string
+        # x-axis and crashes. Draw the line and label separately.
         _prev_atm = None
         for _ti, _ak in zip(_vd_times, _vd_atm_k):
             if _ak and _ak != _prev_atm and _prev_atm is not None:
                 _vd_fig.add_vline(
                     x=_ti, line_dash="dash", line_color="#6B7280",
                     line_width=1, opacity=0.5,
-                    annotation_text=f"ATM→{_ak:,}",
-                    annotation_font=dict(size=8, color="#6B7280"),
-                    annotation_position="top left",
+                )
+                _vd_fig.add_annotation(
+                    x=_ti, y=0.95, xref="x", yref="paper",
+                    text=f"ATM→{_ak:,}",
+                    font=dict(size=8, color="#6B7280"),
+                    showarrow=False, xanchor="left",
                 )
             _prev_atm = _ak
         _vd_fig.update_layout(
