@@ -4615,6 +4615,10 @@ if "iv_smile_history" not in st.session_state:
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = 0.0
 
+# Fix 7: Regime persistence — track consecutive-tick count per regime tag
+if "gex_regime_state" not in st.session_state:
+    st.session_state.gex_regime_state = {"tag": "", "count": 0}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS
@@ -6547,12 +6551,28 @@ if _gd_src is not None:
             f"<div style='margin:4px 0;font-size:13px;color:#1A1A2E'>{a}</div>" for a in _action_lines
         )
 
+        # Fix 7: Regime persistence — track consecutive ticks in same regime
+        _rs = st.session_state.gex_regime_state
+        if _rs["tag"] == _regime_tag:
+            _rs["count"] += 1
+        else:
+            _rs["tag"]   = _regime_tag
+            _rs["count"] = 1
+        st.session_state.gex_regime_state = _rs
+        _persist_badge = (
+            f"<span style='float:right;font-size:10px;font-weight:700;padding:2px 8px;"
+            f"border-radius:10px;background:{'#D1FAE5' if _rs['count'] >= 2 else '#FEF3C7'};"
+            f"color:{'#059669' if _rs['count'] >= 2 else '#D97706'};'>"
+            f"{'✅ CONFIRMED' if _rs['count'] >= 2 else '🔄 NEW — CONFIRMING'} ({_rs['count']} tick{'s' if _rs['count']>1 else ''})"
+            f"</span>"
+        )
+
         st.markdown(
             f"""<div style='background:{_regime_bg};border:2px solid {_regime_color};
                 border-radius:12px;padding:16px 20px;margin:14px 0'>
               <div style='font-size:11px;font-weight:700;color:#6B7280;
                 text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px'>
-                ⚡ GEX + Vega Live Interpretation</div>
+                ⚡ GEX + Vega Live Interpretation {_persist_badge}</div>
               <div style='font-size:15px;font-weight:800;color:{_regime_color};
                 margin-bottom:10px'>{_regime_tag}</div>
               <div style='font-size:13px;color:#374151;line-height:1.7;
@@ -6895,6 +6915,35 @@ if not _sv_df.empty:
     total_nd     = float(_sv_df["_nd"].sum())
     total_ndm    = float(_sv_df["_ndm"].sum())
 
+    # Fix 1: Dynamic ATM NDM threshold — 0.5% of ATM OI (self-calibrates per expiry thickness)
+    _sv_atm_oi_total = float(_sv_atm_r["call_oi"].sum() + _sv_atm_r["put_oi"].sum())
+    _atm_ndm_thr = max(200.0, _sv_atm_oi_total * 0.005)
+
+    # Fix 6: ATM proximity weighting — inverse-distance weight by |call_Δ| + |put_Δ|
+    # Strikes near ATM with live delta carry more weight than deep OTM positions
+    _sv_df["_prox_w"]   = (abs(_sv_df["call_delta"]) + abs(_sv_df["put_delta"])).clip(lower=0.01)
+    _total_ndm_wtd      = float((_sv_df["_ndm"] * _sv_df["_prox_w"]).sum())
+    _total_prox_w       = float(_sv_df["_prox_w"].sum())
+    _ndm_wtd_norm       = _total_ndm_wtd / _total_prox_w if _total_prox_w > 0 else 0.0
+
+    # Fix 2: Session-range NDM percentile (uses today_history's call_dw_flow - put_dw_flow as NDM proxy)
+    _sv_hist_ndm = [
+        safe_num(h.get("call_dw_flow", 0)) - safe_num(h.get("put_dw_flow", 0))
+        for h in today_history
+    ]
+    if len(_sv_hist_ndm) >= 3:
+        _sv_ndm_min  = min(_sv_hist_ndm)
+        _sv_ndm_max  = _sv_hist_ndm[-1]   # current tick is last appended
+        _sv_ndm_rng  = max(_sv_ndm_max, max(_sv_hist_ndm)) - _sv_ndm_min
+        _sv_ndm_pct  = int(((total_ndm - _sv_ndm_min) / _sv_ndm_rng * 100)) if _sv_ndm_rng > 1 else 50
+        _sv_ndm_pct  = max(0, min(100, _sv_ndm_pct))
+        if _sv_ndm_pct >= 80:   _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th — TOP RANGE 🔝"
+        elif _sv_ndm_pct <= 20: _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th — BOTTOM RANGE 🔻"
+        else:                    _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th percentile"
+    else:
+        _sv_ndm_pct     = None
+        _sv_ndm_pct_lbl = "< 3 ticks — building"
+
     _sv_df["_gex"] = (
         (_sv_df["call_oi"] * _sv_df["call_gamma"]) -
         (_sv_df["put_oi"]  * _sv_df["put_gamma"])
@@ -6957,19 +7006,20 @@ if not _sv_df.empty:
         _sv_criteria.append(("➖", "OTM Put: Mixed / Flat",
             "No clear directional signal from OTM put zone", "neutral", 0))
 
-    # Criterion 3: ATM NDM (Golden Rule)
-    if atm_ndm > 500:
+    # Criterion 3: ATM NDM (Golden Rule) — Fix 1: threshold is now session-relative
+    # _atm_ndm_thr = max(200, 0.5% of ATM OI) — auto-calibrates per expiry thickness
+    if atm_ndm > _atm_ndm_thr:
         _sv_bull_pts += 1.5
         _sv_criteria.append(("✅", f"ATM NDM ⊕  ({atm_ndm:+,.0f})",
-            "Fresh bullish flow at ATM — maximum gamma zone; most aggressive dealer buying",
+            f"Fresh bullish flow at ATM — max gamma zone; dealer buying (thr: {_atm_ndm_thr:,.0f})",
             "bull", 1.5))
-    elif atm_ndm < -500:
+    elif atm_ndm < -_atm_ndm_thr:
         _sv_bear_pts += 1.5
         _sv_criteria.append(("❌", f"ATM NDM ⊖  ({atm_ndm:+,.0f})",
-            "Fresh bearish flow at ATM — maximum gamma zone; most aggressive dealer selling",
+            f"Fresh bearish flow at ATM — max gamma zone; dealer selling (thr: {_atm_ndm_thr:,.0f})",
             "bear", 1.5))
     else:
-        _sv_criteria.append(("➖", f"ATM NDM Flat  ({atm_ndm:+,.0f})",
+        _sv_criteria.append(("➖", f"ATM NDM Flat  ({atm_ndm:+,.0f}  |  thr ±{_atm_ndm_thr:,.0f})",
             "No fresh conviction at ATM — await confirmation candle", "neutral", 0))
 
     # Criterion 4: NDM at highest-GEX strike
@@ -7013,8 +7063,8 @@ if not _sv_df.empty:
         _sv_criteria.append(("➖", "VIX Unavailable",
             "India VIX feed not connected — cannot cross-confirm NDM", "neutral", 0))
 
-    # Criterion 6: Near expiry + NDM spike
-    if _sv_near_expiry and abs(total_ndm) > 500:
+    # Criterion 6: Near expiry + NDM spike (Fix 1: use dynamic threshold)
+    if _sv_near_expiry and abs(total_ndm) > _atm_ndm_thr:
         _sv_criteria.append(("⚡", f"Near Expiry ({_sv_dte}d) + NDM Spike ({total_ndm:+,.0f})",
             "MAXIMUM IMPACT — gamma at peak; treat all signals with urgency", "amplify", 0))
 
@@ -7054,6 +7104,32 @@ if not _sv_df.empty:
     else:
         _sv_cf="LOW";    _sv_cc="#DC2626"; _sv_cp=28
 
+    # Fix 3: Signal agreement meta-score across 5 independent sub-signals
+    def _sig(v): return 1 if v > 0 else (-1 if v < 0 else 0)
+    _sa_signals = {
+        "Raw NDM":      _sig(total_ndm),
+        "Δ-Wtd NDM":   _sig(_ndm_wtd_norm),
+        "OTM Calls":   _sig(otm_call_ndm),
+        "OTM Puts":    -_sig(otm_put_ndm),   # negative put NDM = bullish
+        "VIX+NDM":     (1 if (_sv_vix_down and total_ndm > 0) else
+                        -1 if (_sv_vix_up  and total_ndm < 0) else 0),
+    }
+    _sa_active  = {k: v for k, v in _sa_signals.items() if v != 0}
+    _sa_agree   = sum(_sa_active.values())
+    _sa_n       = len(_sa_active)
+    _sa_pct     = int(abs(_sa_agree) / _sa_n * 100) if _sa_n > 0 else 0
+    if _sa_agree > 0:
+        _sa_dir = "BULL"; _sa_dc = "#059669"; _sa_dbg = "#D1FAE5"
+    elif _sa_agree < 0:
+        _sa_dir = "BEAR"; _sa_dc = "#DC2626"; _sa_dbg = "#FEE2E2"
+    else:
+        _sa_dir = "SPLIT"; _sa_dc = "#D97706"; _sa_dbg = "#FFFBEB"
+    _sa_badge_parts = " · ".join(
+        f"<span style='color:{'#059669' if v>0 else '#DC2626' if v<0 else '#9CA3AF'}'>"
+        f"{'⊕' if v>0 else '⊖' if v<0 else '–'} {k}</span>"
+        for k, v in _sa_signals.items()
+    )
+
     # Render criteria cards (4 per row)
     for _sv_r0 in range(0, len(_sv_criteria), 4):
         _sv_row  = _sv_criteria[_sv_r0: _sv_r0 + 4]
@@ -7087,7 +7163,7 @@ if not _sv_df.empty:
     _sv_atxt = "✅ Aligned" if _sv_agree else "⚠️ Diverging — Trust NDM"
     _sv_acol = "#059669"   if _sv_agree else "#DC2626"
 
-    _vc1, _vc2, _vc3 = st.columns([3, 2, 2])
+    _vc1, _vc2, _vc3, _vc4 = st.columns([3, 2, 2, 2])
     with _vc1:
         st.markdown(f"""
         <div style="background:{_sv_dbg};border:2px solid {_sv_dc};border-radius:10px;
@@ -7109,6 +7185,9 @@ if not _sv_df.empty:
             Bull criteria: {_sv_bc} · Bear criteria: {_sv_berc}</div>
         </div>""", unsafe_allow_html=True)
     with _vc3:
+        # Fix 2 + Fix 6: ND/NDM card now shows session percentile and Δ-weighted NDM
+        _wtd_lbl  = "⊕" if _ndm_wtd_norm > 0 else ("⊖" if _ndm_wtd_norm < 0 else "~")
+        _wtd_col  = "#059669" if _ndm_wtd_norm > 0 else ("#DC2626" if _ndm_wtd_norm < 0 else "#6B7280")
         st.markdown(f"""
         <div class="card" style="padding:14px;">
           <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
@@ -7119,9 +7198,27 @@ if not _sv_df.empty:
           <div style="font-size:12px;font-weight:700;color:#1A1A2E;margin-top:4px;">Total NDM:&nbsp;
             <span style="color:{'#059669' if total_ndm>0 else '#DC2626'};">
               {_sv_nlbl} ({total_ndm:+,.0f})</span></div>
-          <div style="font-size:11px;font-weight:800;color:{_sv_acol};margin-top:8px;">{_sv_atxt}</div>
+          <div style="font-size:11px;color:#6B7280;margin-top:5px;">
+            Δ-Wtd NDM: <span style="font-weight:800;color:{_wtd_col};">{_wtd_lbl} {_ndm_wtd_norm:+.1f}</span>
+            &nbsp;·&nbsp;Session: <span style="font-weight:700;color:#374151;">{_sv_ndm_pct_lbl}</span>
+          </div>
+          <div style="font-size:11px;font-weight:800;color:{_sv_acol};margin-top:6px;">{_sv_atxt}</div>
           <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">
             Golden Rule: when divergent, NDM overrides ND</div>
+        </div>""", unsafe_allow_html=True)
+    with _vc4:
+        # Fix 3: Signal agreement meta-score
+        st.markdown(f"""
+        <div class="card" style="padding:14px;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
+                      margin-bottom:6px;">Signal Agreement</div>
+          <div style="font-size:20px;font-weight:900;color:{_sa_dc};text-align:center;
+                      margin-bottom:4px;">{_sa_dir} {_sa_pct}%</div>
+          <div style="background:#E5E7EB;border-radius:4px;height:5px;margin:4px 0 6px 0;">
+            <div style="background:{_sa_dc};height:5px;border-radius:4px;width:{_sa_pct}%;"></div></div>
+          <div style="font-size:10.5px;line-height:1.6;">{_sa_badge_parts}</div>
+          <div style="font-size:9.5px;color:#9CA3AF;margin-top:5px;">
+            {_sa_n}/5 signals active · shared OI data — use as amplifier</div>
         </div>""", unsafe_allow_html=True)
 
 
@@ -7162,12 +7259,38 @@ if not _sv_df.empty:
         _c_ltp_prev = float(_prev.get("call_ltp", _c_ltp) or _c_ltp)
         _p_ltp_prev = float(_prev.get("put_ltp",  _p_ltp) or _p_ltp)
 
-        # +1 = premium rising (buyer aggressor), -1 = premium falling (writer aggressor)
-        _c_prem_dir = 1 if _c_ltp >= _c_ltp_prev else -1
-        _p_prem_dir = 1 if _p_ltp >= _p_ltp_prev else -1
+        # Fix 5: Noise floor — ignore premium moves < 0.50 Rs (bid-ask bounce)
+        # Direction set to 0 (ambiguous) when move is sub-floor; those strikes
+        # still contribute raw NDM but don't influence Enhanced NDM.
+        _PREM_FLOOR = 0.50
+        _c_prem_move = abs(_c_ltp - _c_ltp_prev)
+        _p_prem_move = abs(_p_ltp - _p_ltp_prev)
+        if _c_prem_move < _PREM_FLOOR:
+            _c_prem_dir = 0   # ambiguous — treat as neutral
+        else:
+            _c_prem_dir = 1 if _c_ltp >= _c_ltp_prev else -1
+        if _p_prem_move < _PREM_FLOOR:
+            _p_prem_dir = 0   # ambiguous — treat as neutral
+        else:
+            _p_prem_dir = 1 if _p_ltp >= _p_ltp_prev else -1
+
+        # If both sides are sub-floor (pure noise tick), skip this strike entirely
+        if _c_prem_dir == 0 and _p_prem_dir == 0:
+            _raw_ndm_v = (_c_oi_chg * _c_delta) - (_p_oi_chg * _p_delta)
+            _endm_rows.append({
+                "Strike":        int(_strike),
+                "C OI Chg":      int(_c_oi_chg),
+                "C Prem Dir":    "~ Noise",
+                "P OI Chg":      int(_p_oi_chg),
+                "P Prem Dir":    "~ Noise",
+                "Enhanced NDM":  0,
+                "Raw NDM":       round(_raw_ndm_v),
+            })
+            continue
 
         # Call: buyer aggressor → MM short call → buys futures → +delta
         # Call: writer aggressor → MM long call  → sells futures → -delta
+        # prem_dir=0 → ambiguous; zero contribution for that leg
         _c_contrib  = _c_oi_chg * _c_delta * _c_prem_dir
 
         # Put: buyer aggressor → MM short put → sells futures → -delta  (prem_dir=+1 → negative)
@@ -7180,9 +7303,9 @@ if not _sv_df.empty:
         _endm_rows.append({
             "Strike":        int(_strike),
             "C OI Chg":      int(_c_oi_chg),
-            "C Prem Dir":    "↑ Buyer" if _c_prem_dir == 1 else "↓ Writer",
+            "C Prem Dir":    "↑ Buyer" if _c_prem_dir == 1 else ("↓ Writer" if _c_prem_dir == -1 else "~ Noise"),
             "P OI Chg":      int(_p_oi_chg),
-            "P Prem Dir":    "↑ Buyer" if _p_prem_dir == 1 else "↓ Writer",
+            "P Prem Dir":    "↑ Buyer" if _p_prem_dir == 1 else ("↓ Writer" if _p_prem_dir == -1 else "~ Noise"),
             "Enhanced NDM":  round(_endm_val),
             "Raw NDM":       round(_raw_ndm_v),
         })
