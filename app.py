@@ -6187,16 +6187,14 @@ if _gd_src is not None:
             margin=dict(l=65, r=65, t=50, b=30),
             legend=dict(orientation="h", y=1.20, font=dict(size=10)),
             yaxis=dict(
-                title="Nifty Spot",
-                titlefont=dict(color="#F59E0B"),
+                title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
                 tickfont=dict(color="#F59E0B", size=9),
                 gridcolor="#F3F4F6",
                 autorange=True,
                 showgrid=True,
             ),
             yaxis2=dict(
-                title=f"Band Vega Diff  (±{_vd_band_n}×50 pts)",
-                titlefont=dict(color="#7C3AED"),
+                title=dict(text=f"Band Vega Diff  (±{_vd_band_n}×50 pts)", font=dict(color="#7C3AED")),
                 tickfont=dict(color="#7C3AED", size=9),
                 overlaying="y", side="right",
                 zeroline=True, zerolinecolor="#C4B5FD", zerolinewidth=1.2,
