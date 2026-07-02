@@ -440,6 +440,55 @@ def compute_true_gex(df, spot):
     return total_gex, gex_series, gamma_flip
 
 
+def compute_gamma_flip_true(df, spot, T, r=RISK_FREE_RATE, band_pct=0.20, n_pts=60):
+    """Zero-gamma / flip level — price-domain method (Perfiliev / SpotGamma).
+
+    The flip returned by compute_true_gex() above is a STRIKE-domain cumulative-
+    GEX crossing computed at today's spot; it is not the same quantity as the
+    "gamma flip" / "zero gamma" reported by SpotGamma and most vendors. That
+    flip is a PRICE-domain quantity: recompute every option's gamma via
+    Black-Scholes at a grid of hypothetical spot levels (today's IV smile held
+    fixed per strike), sum GEX at each level, and find where the total changes
+    sign. Parameters (±20% band, 60 points, first sign crossing scanning up
+    from the bottom of the range) match the reference implementation cited in
+    compute_true_gex's own docstring.
+
+    Returns None if no sign crossing is found within the scanned band (caller
+    should fall back to the strike-domain flip in that case).
+    """
+    if df is None or df.empty or spot <= 0 or T <= 0:
+        return None
+    lo = max(spot * (1 - band_pct), float(df["strike"].min()))
+    hi = min(spot * (1 + band_pct), float(df["strike"].max()))
+    if hi <= lo:
+        return None
+    levels = np.linspace(lo, hi, n_pts)
+
+    strikes = df["strike"].values
+    iv_c = df["call_iv"].values / 100.0
+    iv_p = df["put_iv"].values / 100.0
+    call_oi = df["call_oi"].values
+    put_oi = df["put_oi"].values
+
+    total_gamma = np.empty(n_pts)
+    for i, S in enumerate(levels):
+        cg = np.array([_bs_greeks(S, K, T, r, s, "CE")[1] for K, s in zip(strikes, iv_c)])
+        pg = np.array([_bs_greeks(S, K, T, r, s, "PE")[1] for K, s in zip(strikes, iv_p)])
+        call_gex = (call_oi * cg * NIFTY_LOT_SIZE * (S ** 2) * 0.01).sum()
+        put_gex  = (put_oi  * pg * NIFTY_LOT_SIZE * (S ** 2) * 0.01).sum()
+        total_gamma[i] = call_gex - put_gex
+
+    cross = np.where(np.diff(np.sign(total_gamma)))[0]
+    if len(cross) == 0:
+        return None
+    i = cross[0]
+    x0, y0 = levels[i], total_gamma[i]
+    x1, y1 = levels[i + 1], total_gamma[i + 1]
+    if y1 == y0:
+        return float(x0)
+    return float(x1 - (x1 - x0) * y1 / (y1 - y0))
+
+
 def compute_iv_rank(df, atm):
     """Cross-sectional IV rank within the current smile.
 
@@ -1065,8 +1114,25 @@ def compute_metrics(df, spot, expiry=None, history=None):
     vega_skew  = sum_vega_c / sum_vega_p if sum_vega_p > 0 else 1.0
 
     w = wide_df.copy()
-    true_gex, _gex_series, gamma_flip = compute_true_gex(w, spot)
+    true_gex, _gex_series, _gamma_flip_naive = compute_true_gex(w, spot)
     gex = true_gex
+
+    # Gamma flip: use the price-domain zero-gamma method (see
+    # compute_gamma_flip_true docstring) instead of the strike-domain
+    # cumulative-GEX crossing. Falls back to the naive flip if the scanned
+    # spot band contains no sign crossing (e.g. too few strikes returned).
+    _T_flip = 7 / 365
+    if expiry:
+        for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+            try:
+                _exp_dt = datetime.strptime(str(expiry), _fmt).date()
+                _T_flip = max(1 / 365, (_exp_dt - date.today()).days / 365)
+                break
+            except ValueError:
+                continue
+    gamma_flip = compute_gamma_flip_true(w, spot, _T_flip)
+    if gamma_flip is None:
+        gamma_flip = _gamma_flip_naive
     iv_rank, iv_pct = compute_iv_rank(w, atm)
     gt_ratio = abs(net_gamma) / max(abs(net_theta), 1e-6)
     total_coi = float(w["call_oi"].sum())
@@ -1132,9 +1198,11 @@ def compute_metrics(df, spot, expiry=None, history=None):
     _vb_hi = atm + _vega_band_n * NIFTY_STEP
     _vb_df = w[w["strike"].between(_vb_lo, _vb_hi)].copy()
     if not _vb_df.empty and "call_vega" in _vb_df.columns and "put_vega" in _vb_df.columns:
-        _atm_cv = float((_vb_df["call_oi"] * _vb_df["call_vega"]).sum())
-        _atm_pv = float((_vb_df["put_oi"]  * _vb_df["put_vega"]).sum())
-    # _atm_cv / _atm_pv remain 0.0 if band is empty or columns missing
+        _atm_cv     = float((_vb_df["call_oi"] * _vb_df["call_vega"]).sum())  # OI-weighted
+        _atm_pv     = float((_vb_df["put_oi"]  * _vb_df["put_vega"]).sum())   # OI-weighted
+        _atm_cv_raw = float(_vb_df["call_vega"].sum())   # raw Σcall_vega (no OI weighting)
+        _atm_pv_raw = float(_vb_df["put_vega"].sum())    # raw Σput_vega  (no OI weighting)
+    # _atm_cv / _atm_pv / _atm_cv_raw / _atm_pv_raw remain 0.0 if band is empty or columns missing
 
     # ── CI #2 fix: override cross-sectional iv_rank with TEMPORAL iv_rank
     # when sufficient history is available. The cross-sectional value is a
@@ -1200,9 +1268,11 @@ def compute_metrics(df, spot, expiry=None, history=None):
         "vega_skew": round(vega_skew, 3),
         "pcr": round(pcr, 2),
         "atm_iv":         round(atm_iv, 2),
-        "atm_call_vega":  round(_atm_cv, 4),   # OI-weighted ΣCall(OI×Vega) across ATM band
-        "atm_put_vega":   round(_atm_pv, 4),   # OI-weighted ΣPut(OI×Vega) across ATM band
-        "vega_band_strikes": _vega_band_n,       # band half-width used this tick
+        "atm_call_vega":      round(_atm_cv, 4),      # OI-weighted ΣCall(OI×Vega) across ATM band
+        "atm_put_vega":       round(_atm_pv, 4),      # OI-weighted ΣPut(OI×Vega) across ATM band
+        "atm_call_vega_raw":  round(_atm_cv_raw, 6),  # raw Σcall_vega (no OI weighting)
+        "atm_put_vega_raw":   round(_atm_pv_raw, 6),  # raw Σput_vega  (no OI weighting)
+        "vega_band_strikes": _vega_band_n,             # band half-width used this tick
         "atm": float(atm),
         "support": support,
         "resistance": resistance,
@@ -3657,8 +3727,10 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
         # Zero-vega guard: store None (not 0.0) when both sides are zero so the
         # Vega Diff chart filter (`if _cv is not None and _pv is not None`) drops
         # the tick cleanly rather than plotting a meaningless zero flatline.
-        "atm_call_vega":   m.get("atm_call_vega") if safe_num(m.get("atm_call_vega", 0)) > 0 else None,
-        "atm_put_vega":    m.get("atm_put_vega")  if safe_num(m.get("atm_put_vega",  0)) > 0 else None,
+        "atm_call_vega":      m.get("atm_call_vega")     if safe_num(m.get("atm_call_vega",     0)) > 0 else None,
+        "atm_put_vega":       m.get("atm_put_vega")      if safe_num(m.get("atm_put_vega",      0)) > 0 else None,
+        "atm_call_vega_raw":  m.get("atm_call_vega_raw") if safe_num(m.get("atm_call_vega_raw", 0)) > 0 else None,
+        "atm_put_vega_raw":   m.get("atm_put_vega_raw")  if safe_num(m.get("atm_put_vega_raw",  0)) > 0 else None,
         "net_delta":    m.get("net_delta", 0),
         "oi_net_delta": m.get("momentum", 0),
         "momentum":     m.get("momentum", 0),
@@ -5934,13 +6006,14 @@ if _gd_src is not None:
     _gd_src["put_gex"]  = _gd_src["put_oi"]  * _gd_src["put_gamma"]  * NIFTY_LOT_SIZE * _spot2 * 0.01
     _gd_src["net_gex"]  = _gd_src["call_gex"] - _gd_src["put_gex"]   # +ve = net long gamma (pinning), -ve = net short gamma (trending)
 
-    # Chart-level gamma flip: cumsum of unweighted net_gex → zero-crossing.
-    # This matches the bars shown on the chart (same formula), so the flip
-    # annotation will visually align with where the purple line crosses zero.
-    _chart_cumgex   = _gd_src.sort_values("strike")["net_gex"].cumsum().values
-    _chart_strikes  = _gd_src.sort_values("strike")["strike"].values
-    _chart_flip_cands = _chart_strikes[_chart_cumgex <= 0]
-    _chart_gamma_flip = float(_chart_flip_cands[-1]) if len(_chart_flip_cands) > 0 else None
+    # Chart-level gamma flip: reconciled to use the same corrected, price-domain
+    # zero-gamma metric (m["gamma_flip"], from compute_gamma_flip_true) that the
+    # rest of the app (Combined Decision, bias engine, headline tiles) reads,
+    # instead of an independent strike-domain cumsum recompute off this chart's
+    # own bars. That local recompute is the same STRIKE-domain proxy flagged as
+    # non-standard in compute_true_gex's docstring, and could silently disagree
+    # with the corrected flip shown everywhere else in the app.
+    _chart_gamma_flip = m.get("gamma_flip")
 
     _gd_atm_band = spot * 0.003
 
@@ -5950,7 +6023,8 @@ if _gd_src is not None:
     # Red bars   = Call GEX (dealers long gamma → buy dips/sell rallies → PINNING)
     # Green bars = Put GEX shown as negative (dealers short gamma → amplify moves → TRENDING)
     # Purple line = Net GEX: +ve = long-gamma/pinning regime, -ve = short-gamma/trending
-    # Gamma Flip level = zero-crossing of cumulative Net GEX (computed in compute_true_gex).
+    # Gamma Flip level = m["gamma_flip"], the price-domain zero-gamma level from
+    # compute_gamma_flip_true (not a zero-crossing of this chart's own bars).
     # ─────────────────────────────────────────────────────────────────────────
     # ── Net Vega per Strike ───────────────────────────────────────────────────
     # Net Vega = (Call OI × Call Vega) - (Put OI × Put Vega)
@@ -5999,8 +6073,8 @@ if _gd_src is not None:
             annotation_font=dict(size=10, color="#F59E0B"),
             annotation_position="top right",
         )
-        # Chart-level gamma flip — computed from the same unweighted bars shown here,
-        # so the annotation always aligns with where the purple Net GEX line crosses zero.
+        # Gamma flip annotation — reconciled to the app-wide corrected metric
+        # (m["gamma_flip"]); see comment where _chart_gamma_flip is set above.
         if _chart_gamma_flip is not None:
             _gc1_fig.add_vline(
                 x=_chart_gamma_flip, line_dash="dot", line_color="#10B981", line_width=1.8,
@@ -6116,107 +6190,159 @@ if _gd_src is not None:
         if _hh.get("vega_band_strikes") is not None:
             _vd_band_n = int(_hh["vega_band_strikes"])
             break
-    _vd_times, _vd_spot, _vd_vdiff, _vd_atm_k = [], [], [], []
+    # Build time-series arrays — one for raw ratio, one for OI-weighted ratio
+    _vd_times, _vd_spot, _vd_atm_k = [], [], []
+    _vd_raw_ratio, _vd_oiw_ratio   = [], []
     for _h in today_history:
-        _cv = _h.get("atm_call_vega")
-        _pv = _h.get("atm_put_vega")
-        if _cv is not None and _pv is not None and _h.get("spot"):
-            _vd_times.append(_h["ts"][11:19])        # HH:MM:SS from ISO timestamp
+        _cv_raw = _h.get("atm_call_vega_raw")
+        _pv_raw = _h.get("atm_put_vega_raw")
+        _cv_oiw = _h.get("atm_call_vega")
+        _pv_oiw = _h.get("atm_put_vega")
+        if (
+            _cv_raw is not None and _pv_raw is not None and float(_pv_raw) != 0 and
+            _cv_oiw is not None and _pv_oiw is not None and float(_pv_oiw) != 0 and
+            _h.get("spot")
+        ):
+            _vd_times.append(_h["ts"][11:19])
             _vd_spot.append(float(_h["spot"]))
-            _vd_vdiff.append(round(float(_cv) - float(_pv), 6))
+            _vd_raw_ratio.append(round(float(_cv_raw) / float(_pv_raw), 4))
+            _vd_oiw_ratio.append(round(float(_cv_oiw) / float(_pv_oiw), 4))
             _vd_atm_k.append(int(_h.get("atm", 0)))
 
+    def _add_atm_change_annotations(fig, times, atm_ks):
+        """Helper: draw grey dashed vlines + ATM-shift labels (avoids _mean() crash on string x-axis)."""
+        _prev = None
+        for _ti, _ak in zip(times, atm_ks):
+            if _ak and _ak != _prev and _prev is not None:
+                fig.add_vline(x=_ti, line_dash="dash", line_color="#6B7280",
+                              line_width=1, opacity=0.5)
+                fig.add_annotation(x=_ti, y=0.95, xref="x", yref="paper",
+                                   text=f"ATM→{_ak:,}", font=dict(size=8, color="#6B7280"),
+                                   showarrow=False, xanchor="left")
+            _prev = _ak
+
     if len(_vd_times) >= 2:
-        _vd_fig = go.Figure()
-        # Left axis — Nifty Spot
-        _vd_fig.add_trace(go.Scatter(
-            x=_vd_times, y=_vd_spot,
-            name="Nifty Spot",
-            mode="lines",
-            line=dict(color="#F59E0B", width=2.5),
-            yaxis="y1",
-            hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
-        ))
-        # Right axis — Band Vega Exposure Diff (Call − Put)
-        _vd_fig.add_trace(go.Scatter(
-            x=_vd_times, y=_vd_vdiff,
-            name=f"Band Vega Diff (Call−Put, ±{_vd_band_n} strikes)",
-            mode="lines+markers",
-            line=dict(color="#7C3AED", width=2.0),
-            marker=dict(size=4, color="#7C3AED"),
-            yaxis="y2",
-            hovertemplate="%{x}<br>Vega Diff: <b>%{y:,.2f}</b><extra>Band Vega Diff</extra>",
-        ))
-        # Zero line on right axis (vega parity)
-        # NOTE: annotation_position omitted — Plotly's _mean() crashes on string
-        # x-axis (categorical timestamps). Annotation added separately instead.
-        _vd_fig.add_hline(
-            y=0, yref="y2",
-            line_dash="dot", line_color="#C4B5FD", line_width=1.5,
-        )
-        _vd_fig.add_annotation(
-            x=1, y=0, xref="paper", yref="y2",
-            text="Vega Parity",
-            font=dict(size=9, color="#7C3AED"),
-            showarrow=False, xanchor="left",
-        )
-        # Mark ATM strike changes as vertical lines
-        # NOTE: annotation_position in add_vline also calls _mean() on string
-        # x-axis and crashes. Draw the line and label separately.
-        _prev_atm = None
-        for _ti, _ak in zip(_vd_times, _vd_atm_k):
-            if _ak and _ak != _prev_atm and _prev_atm is not None:
-                _vd_fig.add_vline(
-                    x=_ti, line_dash="dash", line_color="#6B7280",
-                    line_width=1, opacity=0.5,
-                )
-                _vd_fig.add_annotation(
-                    x=_ti, y=0.95, xref="x", yref="paper",
-                    text=f"ATM→{_ak:,}",
-                    font=dict(size=8, color="#6B7280"),
-                    showarrow=False, xanchor="left",
-                )
-            _prev_atm = _ak
-        _vd_fig.update_layout(
-            title=dict(
-                text=f"ATM Band Vega Diff (±{_vd_band_n} strikes, ΣOI×Vega: Call−Put) vs Nifty Spot  "
-                     "<span style='font-size:11px;color:#6B7280'>"
-                     "Amber=Spot (left) · Purple=ΣCall Vega Exp − ΣPut Vega Exp (right) · "
-                     "+ve=Call-side dominant · −ve=Put-side / hedge demand · "
-                     "Grey dash=ATM strike change</span>",
-                font=dict(size=13),
-            ),
-            height=250,
-            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-            margin=dict(l=65, r=65, t=50, b=30),
-            legend=dict(orientation="h", y=1.20, font=dict(size=10)),
-            yaxis=dict(
-                title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
-                tickfont=dict(color="#F59E0B", size=9),
-                gridcolor="#F3F4F6",
-                autorange=True,
-                showgrid=True,
-            ),
-            yaxis2=dict(
-                title=dict(text=f"Band Vega Diff  (±{_vd_band_n}×50 pts)", font=dict(color="#7C3AED")),
-                tickfont=dict(color="#7C3AED", size=9),
-                overlaying="y", side="right",
-                zeroline=True, zerolinecolor="#C4B5FD", zerolinewidth=1.2,
-                autorange=True,
-                showgrid=False,
-            ),
-            xaxis=dict(
-                tickfont=dict(size=9),
-                title="Time (IST)",
-                showgrid=True, gridcolor="#F3F4F6",
-            ),
-            hovermode="x unified",
-            font=dict(color="#1A1A2E", size=11),
-        )
-        st.plotly_chart(_vd_fig, use_container_width=True,
-                        config={"displayModeBar": False})
+        _vd_col1, _vd_col2 = st.columns(2)
+
+        # ── Chart A: Raw Vega Ratio  (Σcall_vega / Σput_vega, no OI weighting) ──
+        with _vd_col1:
+            _vr_fig = go.Figure()
+            _vr_fig.add_trace(go.Scatter(
+                x=_vd_times, y=_vd_spot,
+                name="Nifty Spot",
+                mode="lines",
+                line=dict(color="#F59E0B", width=2.5),
+                yaxis="y1",
+                hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+            ))
+            _vr_fig.add_trace(go.Scatter(
+                x=_vd_times, y=_vd_raw_ratio,
+                name=f"Raw Vega Ratio (±{_vd_band_n} strikes)",
+                mode="lines+markers",
+                line=dict(color="#7C3AED", width=2.0),
+                marker=dict(size=4, color="#7C3AED"),
+                yaxis="y2",
+                hovertemplate="%{x}<br>Raw Vega Ratio: <b>%{y:.4f}</b><extra>Σcall_vega / Σput_vega</extra>",
+            ))
+            # Parity line at 1.0 (call vega = put vega)
+            _vr_fig.add_hline(y=1.0, yref="y2", line_dash="dot",
+                               line_color="#C4B5FD", line_width=1.5)
+            _vr_fig.add_annotation(x=1, y=1.0, xref="paper", yref="y2",
+                                   text="Parity (1.0)", font=dict(size=9, color="#7C3AED"),
+                                   showarrow=False, xanchor="left")
+            _add_atm_change_annotations(_vr_fig, _vd_times, _vd_atm_k)
+            _vr_fig.update_layout(
+                title=dict(
+                    text=f"Raw Vega Ratio — Σcall_vega / Σput_vega  (±{_vd_band_n} strikes)  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Amber=Spot (left) · Purple=Ratio (right) · "
+                         "&gt;1 = Call vega dominant · &lt;1 = Put vega dominant · "
+                         "Grey dash=ATM shift</span>",
+                    font=dict(size=13),
+                ),
+                height=270,
+                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=65, r=65, t=55, b=30),
+                legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                yaxis=dict(
+                    title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                    tickfont=dict(color="#F59E0B", size=9),
+                    gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                ),
+                yaxis2=dict(
+                    title=dict(text="Raw Vega Ratio  (Σcall / Σput)", font=dict(color="#7C3AED")),
+                    tickfont=dict(color="#7C3AED", size=9),
+                    overlaying="y", side="right",
+                    zeroline=False, autorange=True, showgrid=False,
+                ),
+                xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                           showgrid=True, gridcolor="#F3F4F6"),
+                hovermode="x unified",
+                font=dict(color="#1A1A2E", size=11),
+            )
+            st.plotly_chart(_vr_fig, use_container_width=True,
+                            config={"displayModeBar": False})
+
+        # ── Chart B: OI-Weighted Vega Ratio  (ΣOI×call_vega / ΣOI×put_vega) ────
+        with _vd_col2:
+            _vo_fig = go.Figure()
+            _vo_fig.add_trace(go.Scatter(
+                x=_vd_times, y=_vd_spot,
+                name="Nifty Spot",
+                mode="lines",
+                line=dict(color="#F59E0B", width=2.5),
+                yaxis="y1",
+                hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+            ))
+            _vo_fig.add_trace(go.Scatter(
+                x=_vd_times, y=_vd_oiw_ratio,
+                name=f"OI-Wtd Vega Ratio (±{_vd_band_n} strikes)",
+                mode="lines+markers",
+                line=dict(color="#0891B2", width=2.0),
+                marker=dict(size=4, color="#0891B2"),
+                yaxis="y2",
+                hovertemplate="%{x}<br>OI-Wtd Vega Ratio: <b>%{y:.4f}</b><extra>ΣOI×call_vega / ΣOI×put_vega</extra>",
+            ))
+            # Parity line at 1.0
+            _vo_fig.add_hline(y=1.0, yref="y2", line_dash="dot",
+                               line_color="#A5F3FC", line_width=1.5)
+            _vo_fig.add_annotation(x=1, y=1.0, xref="paper", yref="y2",
+                                   text="Parity (1.0)", font=dict(size=9, color="#0891B2"),
+                                   showarrow=False, xanchor="left")
+            _add_atm_change_annotations(_vo_fig, _vd_times, _vd_atm_k)
+            _vo_fig.update_layout(
+                title=dict(
+                    text=f"OI-Weighted Vega Ratio — ΣOI×call_vega / ΣOI×put_vega  (±{_vd_band_n} strikes)  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Amber=Spot (left) · Cyan=Ratio (right) · "
+                         "&gt;1 = Call exposure dominant · &lt;1 = Put / hedge demand · "
+                         "Grey dash=ATM shift</span>",
+                    font=dict(size=13),
+                ),
+                height=270,
+                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=65, r=65, t=55, b=30),
+                legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                yaxis=dict(
+                    title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                    tickfont=dict(color="#F59E0B", size=9),
+                    gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                ),
+                yaxis2=dict(
+                    title=dict(text="OI-Wtd Vega Ratio  (ΣOI×call / ΣOI×put)", font=dict(color="#0891B2")),
+                    tickfont=dict(color="#0891B2", size=9),
+                    overlaying="y", side="right",
+                    zeroline=False, autorange=True, showgrid=False,
+                ),
+                xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                           showgrid=True, gridcolor="#F3F4F6"),
+                hovermode="x unified",
+                font=dict(color="#1A1A2E", size=11),
+            )
+            st.plotly_chart(_vo_fig, use_container_width=True,
+                            config={"displayModeBar": False})
     else:
-        st.info("⏳ ATM Band Vega Diff chart — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
+        st.info("⏳ ATM Band Vega Ratio charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
 
     # ═════════════════════════════════════════════════════════════════════════
     # LIVE GEX + VEGA INTERPRETATION ENGINE  (v3 — lot-size corrected GEX,
