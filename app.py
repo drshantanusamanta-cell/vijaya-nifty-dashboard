@@ -6193,6 +6193,7 @@ if _gd_src is not None:
     # Build time-series arrays — one for raw ratio, one for OI-weighted ratio
     _vd_times, _vd_spot, _vd_atm_k = [], [], []
     _vd_raw_ratio, _vd_oiw_ratio   = [], []
+    _vd_ts_full = []
     for _h in today_history:
         _cv_raw = _h.get("atm_call_vega_raw")
         _pv_raw = _h.get("atm_put_vega_raw")
@@ -6203,11 +6204,28 @@ if _gd_src is not None:
             _cv_oiw is not None and _pv_oiw is not None and float(_pv_oiw) != 0 and
             _h.get("spot")
         ):
+            _vd_ts_full.append(_h["ts"])
             _vd_times.append(_h["ts"][11:19])
             _vd_spot.append(float(_h["spot"]))
             _vd_raw_ratio.append(round(float(_cv_raw) / float(_pv_raw), 4))
             _vd_oiw_ratio.append(round(float(_cv_oiw) / float(_pv_oiw), 4))
             _vd_atm_k.append(int(_h.get("atm", 0)))
+
+    # ── Rolling Z-Score (last 15-min lookback) of the raw & OI-weighted ratios ──
+    _VD_LOOKBACK_MIN = 15
+    def _rolling_zscore(ts_list, val_list, lookback_min=_VD_LOOKBACK_MIN):
+        """Z-score of each point vs its trailing `lookback_min`-minute window (incl. itself)."""
+        if len(val_list) < 2:
+            return [0.0] * len(val_list)
+        _s = pd.Series(val_list, index=pd.to_datetime(ts_list))
+        _roll = _s.rolling(f"{lookback_min}min", min_periods=2)
+        _mean = _roll.mean()
+        _std  = _roll.std(ddof=0)
+        _z = (_s - _mean) / _std.replace(0, np.nan)
+        return _z.fillna(0.0).round(3).tolist()
+
+    _vd_raw_z = _rolling_zscore(_vd_ts_full, _vd_raw_ratio)
+    _vd_oiw_z = _rolling_zscore(_vd_ts_full, _vd_oiw_ratio)
 
     def _add_atm_change_annotations(fig, times, atm_ks):
         """Helper: draw grey dashed vlines + ATM-shift labels (avoids _mean() crash on string x-axis)."""
@@ -6236,27 +6254,36 @@ if _gd_src is not None:
                 hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
             ))
             _vr_fig.add_trace(go.Scatter(
-                x=_vd_times, y=_vd_raw_ratio,
-                name=f"Raw Vega Ratio (±{_vd_band_n} strikes)",
+                x=_vd_times, y=_vd_raw_z,
+                name=f"Raw Vega Ratio Z-Score ({_VD_LOOKBACK_MIN}m, ±{_vd_band_n} strikes)",
                 mode="lines+markers",
                 line=dict(color="#7C3AED", width=2.0),
                 marker=dict(size=4, color="#7C3AED"),
                 yaxis="y2",
-                hovertemplate="%{x}<br>Raw Vega Ratio: <b>%{y:.4f}</b><extra>Σcall_vega / Σput_vega</extra>",
+                customdata=_vd_raw_ratio,
+                hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Raw Ratio: %{customdata:.4f}"
+                              "<extra>Σcall_vega / Σput_vega</extra>",
             ))
-            # Parity line at 1.0 (call vega = put vega)
-            _vr_fig.add_hline(y=1.0, yref="y2", line_dash="dot",
+            # Mean (0σ) line + ±1σ / ±2σ level markers
+            _vr_fig.add_hline(y=0, yref="y2", line_dash="dot",
                                line_color="#C4B5FD", line_width=1.5)
-            _vr_fig.add_annotation(x=1, y=1.0, xref="paper", yref="y2",
-                                   text="Parity (1.0)", font=dict(size=9, color="#7C3AED"),
+            _vr_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                                   text="Mean (0σ)", font=dict(size=9, color="#7C3AED"),
                                    showarrow=False, xanchor="left")
+            for _zlvl, _zcol, _zdash in [(1, "#A78BFA", "dash"), (-1, "#A78BFA", "dash"),
+                                          (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+                _vr_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                                   line_color=_zcol, line_width=1)
+                _vr_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                       text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                       showarrow=False, xanchor="left")
             _add_atm_change_annotations(_vr_fig, _vd_times, _vd_atm_k)
             _vr_fig.update_layout(
                 title=dict(
-                    text=f"Raw Vega Ratio — Σcall_vega / Σput_vega  (±{_vd_band_n} strikes)  "
+                    text=f"Raw Vega Ratio Z-Score — {_VD_LOOKBACK_MIN}-min lookback  (±{_vd_band_n} strikes)  "
                          "<span style='font-size:11px;color:#6B7280'>"
-                         "Amber=Spot (left) · Purple=Ratio (right) · "
-                         "&gt;1 = Call vega dominant · &lt;1 = Put vega dominant · "
+                         "Amber=Spot (left) · Purple=Z-Score (right) · "
+                         "&gt;+1σ/+2σ = Call vega dominant · &lt;−1σ/−2σ = Put vega dominant · "
                          "Grey dash=ATM shift</span>",
                     font=dict(size=13),
                 ),
@@ -6270,7 +6297,7 @@ if _gd_src is not None:
                     gridcolor="#F3F4F6", autorange=True, showgrid=True,
                 ),
                 yaxis2=dict(
-                    title=dict(text="Raw Vega Ratio  (Σcall / Σput)", font=dict(color="#7C3AED")),
+                    title=dict(text=f"Raw Vega Ratio Z-Score ({_VD_LOOKBACK_MIN}m lookback)", font=dict(color="#7C3AED")),
                     tickfont=dict(color="#7C3AED", size=9),
                     overlaying="y", side="right",
                     zeroline=False, autorange=True, showgrid=False,
@@ -6295,27 +6322,36 @@ if _gd_src is not None:
                 hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
             ))
             _vo_fig.add_trace(go.Scatter(
-                x=_vd_times, y=_vd_oiw_ratio,
-                name=f"OI-Wtd Vega Ratio (±{_vd_band_n} strikes)",
+                x=_vd_times, y=_vd_oiw_z,
+                name=f"OI-Wtd Vega Ratio Z-Score ({_VD_LOOKBACK_MIN}m, ±{_vd_band_n} strikes)",
                 mode="lines+markers",
                 line=dict(color="#0891B2", width=2.0),
                 marker=dict(size=4, color="#0891B2"),
                 yaxis="y2",
-                hovertemplate="%{x}<br>OI-Wtd Vega Ratio: <b>%{y:.4f}</b><extra>ΣOI×call_vega / ΣOI×put_vega</extra>",
+                customdata=_vd_oiw_ratio,
+                hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>OI-Wtd Ratio: %{customdata:.4f}"
+                              "<extra>ΣOI×call_vega / ΣOI×put_vega</extra>",
             ))
-            # Parity line at 1.0
-            _vo_fig.add_hline(y=1.0, yref="y2", line_dash="dot",
+            # Mean (0σ) line + ±1σ / ±2σ level markers
+            _vo_fig.add_hline(y=0, yref="y2", line_dash="dot",
                                line_color="#A5F3FC", line_width=1.5)
-            _vo_fig.add_annotation(x=1, y=1.0, xref="paper", yref="y2",
-                                   text="Parity (1.0)", font=dict(size=9, color="#0891B2"),
+            _vo_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                                   text="Mean (0σ)", font=dict(size=9, color="#0891B2"),
                                    showarrow=False, xanchor="left")
+            for _zlvl, _zcol, _zdash in [(1, "#67E8F9", "dash"), (-1, "#67E8F9", "dash"),
+                                          (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+                _vo_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                                   line_color=_zcol, line_width=1)
+                _vo_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                       text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                       showarrow=False, xanchor="left")
             _add_atm_change_annotations(_vo_fig, _vd_times, _vd_atm_k)
             _vo_fig.update_layout(
                 title=dict(
-                    text=f"OI-Weighted Vega Ratio — ΣOI×call_vega / ΣOI×put_vega  (±{_vd_band_n} strikes)  "
+                    text=f"OI-Weighted Vega Ratio Z-Score — {_VD_LOOKBACK_MIN}-min lookback  (±{_vd_band_n} strikes)  "
                          "<span style='font-size:11px;color:#6B7280'>"
-                         "Amber=Spot (left) · Cyan=Ratio (right) · "
-                         "&gt;1 = Call exposure dominant · &lt;1 = Put / hedge demand · "
+                         "Amber=Spot (left) · Cyan=Z-Score (right) · "
+                         "&gt;+1σ/+2σ = Call exposure dominant · &lt;−1σ/−2σ = Put / hedge demand · "
                          "Grey dash=ATM shift</span>",
                     font=dict(size=13),
                 ),
@@ -6329,7 +6365,7 @@ if _gd_src is not None:
                     gridcolor="#F3F4F6", autorange=True, showgrid=True,
                 ),
                 yaxis2=dict(
-                    title=dict(text="OI-Wtd Vega Ratio  (ΣOI×call / ΣOI×put)", font=dict(color="#0891B2")),
+                    title=dict(text=f"OI-Wtd Vega Ratio Z-Score ({_VD_LOOKBACK_MIN}m lookback)", font=dict(color="#0891B2")),
                     tickfont=dict(color="#0891B2", size=9),
                     overlaying="y", side="right",
                     zeroline=False, autorange=True, showgrid=False,
