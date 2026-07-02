@@ -1093,6 +1093,14 @@ def compute_metrics(df, spot, expiry=None, history=None):
     ev_sum_p = float(t["ev_p"].sum())
     ev_ratio = ev_sum_c / ev_sum_p if ev_sum_p > 0 else 1.0
 
+    # Strike-wise Call/Put Extrinsic-Value ratio across ATM ±SIGNAL_BAND (±5) strikes,
+    # averaged PER-STRIKE (distinct from ev_ratio above, which is a ratio-of-sums).
+    _ev_ratio_per_strike = t["ev_c"] / t["ev_p"].replace(0, np.nan)
+    ev_ratio_avg_strikewise = (
+        float(_ev_ratio_per_strike.mean(skipna=True))
+        if _ev_ratio_per_strike.notna().any() else 1.0
+    )
+
     net_delta = float((t["call_oi"] * t["call_delta"]).sum() + (t["put_oi"] * t["put_delta"]).sum())
     net_gamma = float((t["call_oi"] * t["call_gamma"]).sum() + (t["put_oi"] * t["put_gamma"]).sum())
     net_theta = float((t["call_oi"] * t["call_theta"]).sum() + (t["put_oi"] * t["put_theta"]).sum())
@@ -1252,6 +1260,7 @@ def compute_metrics(df, spot, expiry=None, history=None):
 
     return {
         "ev_ratio": round(ev_ratio, 3),
+        "ev_ratio_avg_strikewise": round(ev_ratio_avg_strikewise, 4),  # avg of per-strike CE/PE EV ratio, ATM±5
         "net_delta": round(net_delta, 0),
         "net_gamma": round(net_gamma, 6),
         "net_theta": round(net_theta, 0),
@@ -3731,6 +3740,8 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
         "atm_put_vega":       m.get("atm_put_vega")      if safe_num(m.get("atm_put_vega",      0)) > 0 else None,
         "atm_call_vega_raw":  m.get("atm_call_vega_raw") if safe_num(m.get("atm_call_vega_raw", 0)) > 0 else None,
         "atm_put_vega_raw":   m.get("atm_put_vega_raw")  if safe_num(m.get("atm_put_vega_raw",  0)) > 0 else None,
+        # Strike-wise CE/PE Extrinsic-Value ratio, ATM±5 strikes, averaged per-strike
+        "ev_ratio_avg_strikewise": m.get("ev_ratio_avg_strikewise") if safe_num(m.get("ev_ratio_avg_strikewise", 0)) > 0 else None,
         "net_delta":    m.get("net_delta", 0),
         "oi_net_delta": m.get("momentum", 0),
         "momentum":     m.get("momentum", 0),
@@ -6379,6 +6390,95 @@ if _gd_src is not None:
                             config={"displayModeBar": False})
     else:
         st.info("⏳ ATM Band Vega Ratio charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ATM ±5 STRIKE-WISE CE/PE EXTRINSIC-VALUE RATIO — Z-SCORE (15-min lookback)
+    # Uses ev_ratio_avg_strikewise saved in history: per tick, this is the
+    # strike-by-strike average of (call_ev / put_ev) across ATM ±5 (SIGNAL_BAND)
+    # strikes — distinct from the "EV Ratio" headline metric, which is a
+    # ratio-of-pooled-sums (Σev_c / Σev_p) rather than an average of per-strike
+    # ratios. Same 15-min rolling-Z engine as the Vega Ratio charts above.
+    # ─────────────────────────────────────────────────────────────────────────
+    _evz_ts_full, _evz_times, _evz_spot, _evz_atm_k, _evz_ratio = [], [], [], [], []
+    for _h in today_history:
+        _evr = _h.get("ev_ratio_avg_strikewise")
+        if _evr is not None and _h.get("spot"):
+            _evz_ts_full.append(_h["ts"])
+            _evz_times.append(_h["ts"][11:19])
+            _evz_spot.append(float(_h["spot"]))
+            _evz_ratio.append(float(_evr))
+            _evz_atm_k.append(int(_h.get("atm", 0)))
+
+    if len(_evz_times) >= 2:
+        _evz_z = _rolling_zscore(_evz_ts_full, _evz_ratio)
+
+        _ev_fig = go.Figure()
+        _ev_fig.add_trace(go.Scatter(
+            x=_evz_times, y=_evz_spot,
+            name="Nifty Spot",
+            mode="lines",
+            line=dict(color="#F59E0B", width=2.5),
+            yaxis="y1",
+            hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+        ))
+        _ev_fig.add_trace(go.Scatter(
+            x=_evz_times, y=_evz_z,
+            name=f"CE/PE EV Ratio Z-Score ({_VD_LOOKBACK_MIN}m, ATM±5 strikes)",
+            mode="lines+markers",
+            line=dict(color="#059669", width=2.0),
+            marker=dict(size=4, color="#059669"),
+            yaxis="y2",
+            customdata=_evz_ratio,
+            hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Avg CE/PE EV Ratio: %{customdata:.4f}"
+                          "<extra>strike-wise avg, ATM±5</extra>",
+        ))
+        # Mean (0σ) line + ±1σ / ±2σ level markers
+        _ev_fig.add_hline(y=0, yref="y2", line_dash="dot",
+                           line_color="#A7F3D0", line_width=1.5)
+        _ev_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                               text="Mean (0σ)", font=dict(size=9, color="#059669"),
+                               showarrow=False, xanchor="left")
+        for _zlvl, _zcol, _zdash in [(1, "#6EE7B7", "dash"), (-1, "#6EE7B7", "dash"),
+                                      (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+            _ev_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                               line_color=_zcol, line_width=1)
+            _ev_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                   text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                   showarrow=False, xanchor="left")
+        _add_atm_change_annotations(_ev_fig, _evz_times, _evz_atm_k)
+        _ev_fig.update_layout(
+            title=dict(
+                text=f"Strike-wise CE/PE Extrinsic-Value Ratio Z-Score — {_VD_LOOKBACK_MIN}-min lookback  (ATM ±5 strikes)  "
+                     "<span style='font-size:11px;color:#6B7280'>"
+                     "Amber=Spot (left) · Green=Z-Score (right) · "
+                     "&gt;+1σ/+2σ = Call premium relatively rich · &lt;−1σ/−2σ = Put premium relatively rich · "
+                     "Grey dash=ATM shift</span>",
+                font=dict(size=13),
+            ),
+            height=270,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=65, r=65, t=55, b=30),
+            legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+            yaxis=dict(
+                title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                tickfont=dict(color="#F59E0B", size=9),
+                gridcolor="#F3F4F6", autorange=True, showgrid=True,
+            ),
+            yaxis2=dict(
+                title=dict(text=f"CE/PE EV Ratio Z-Score ({_VD_LOOKBACK_MIN}m lookback)", font=dict(color="#059669")),
+                tickfont=dict(color="#059669", size=9),
+                overlaying="y", side="right",
+                zeroline=False, autorange=True, showgrid=False,
+            ),
+            xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                       showgrid=True, gridcolor="#F3F4F6"),
+            hovermode="x unified",
+            font=dict(color="#1A1A2E", size=11),
+        )
+        st.plotly_chart(_ev_fig, use_container_width=True,
+                        config={"displayModeBar": False})
+    else:
+        st.info("⏳ CE/PE EV Ratio Z-Score chart — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
 
     # ═════════════════════════════════════════════════════════════════════════
     # LIVE GEX + VEGA INTERPRETATION ENGINE  (v3 — lot-size corrected GEX,
