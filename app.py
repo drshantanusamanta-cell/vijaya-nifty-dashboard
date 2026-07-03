@@ -262,6 +262,36 @@ def _render_owner_sidebar(expiry_list):
 
             st.divider()
 
+            # Z-Score chart plotting mode — Vega Ratio / OI-Wtd Vega Ratio /
+            # CE-PE Extrinsic-Value Ratio Z-Score charts only. Display-only:
+            # does NOT touch how ticks are collected or stored in history.
+            _ZS_MODE_OPTIONS = {
+                "Live tick · 15-min rolling (current)": "tick_rolling_15m",
+                "15-min TF · 6-bucket lookback (90 min)": "bucket15_x6",
+            }
+            _saved_zs_mode = _cur_settings.get("zscore_chart_mode", "tick_rolling_15m")
+            _zs_label = next((k for k, v in _ZS_MODE_OPTIONS.items() if v == _saved_zs_mode),
+                             "Live tick · 15-min rolling (current)")
+            _chosen_zs = st.selectbox(
+                "📊 Z-Score chart timeframe",
+                list(_ZS_MODE_OPTIONS.keys()),
+                index=list(_ZS_MODE_OPTIONS.keys()).index(_zs_label),
+                key="zscore_mode_selector",
+                help="Applies to the Vega Ratio, OI-Wtd Vega Ratio and CE/PE "
+                     "Extrinsic-Value Ratio Z-Score charts only. 'Live tick' "
+                     "recalculates a 15-min rolling Z-score on every tick. "
+                     "'15-min TF' resamples ticks into 15-min bars first, then "
+                     "runs the Z-score over the trailing 6 bars (90 min). The "
+                     "in-progress bar updates every refresh and locks once its "
+                     "15-min window closes. Does not affect data collection.",
+            )
+            _new_zs_mode = _ZS_MODE_OPTIONS[_chosen_zs]
+            if _new_zs_mode != _saved_zs_mode:
+                _cur_settings["zscore_chart_mode"] = _new_zs_mode
+                _save_owner_settings(_cur_settings)
+
+            st.divider()
+
             # Manual refresh  — OWNER ONLY
             if st.button("⟳ Refresh Now", width='stretch',
                          type="primary", key="owner_refresh_btn"):
@@ -597,110 +627,6 @@ def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamm
     else:
         return "TRANSITION",           vol_regime, near_flip
 
-
-
-def classify_gex_vega_matrix(spot, gdsrc, metrics, nifty_step=NIFTY_STEP):
-    """Return a structured NIFTY GEX + Vega matrix classification for UI rendering."""
-    out = {
-        "matrix_bucket": "MIXED_LOW_CONFIDENCE",
-        "matrix_state": "Neutral / unclear",
-        "bias": "Neutral",
-        "confidence": 35,
-        "summary": "GEX and Vega are not aligned strongly enough for a high-conviction call.",
-        "actions": ["Wait for clearer alignment."],
-        "below_zone_lbl": "Neutral below spot",
-        "above_zone_lbl": "Neutral above spot",
-        "levels": {},
-        "meta": {},
-    }
-    if gdsrc is None or getattr(gdsrc, "empty", True) or not metrics:
-        return out
-    d = gdsrc.copy()
-    for c in ["strike", "netgex", "net_gex", "netvega", "net_vega", "callgex", "call_gex", "putgex", "put_gex"]:
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
-    if "netgex" not in d.columns and "net_gex" in d.columns:
-        d["netgex"] = d["net_gex"]
-    if "netvega" not in d.columns and "net_vega" in d.columns:
-        d["netvega"] = d["net_vega"]
-    if "callgex" not in d.columns and "call_gex" in d.columns:
-        d["callgex"] = d["call_gex"]
-    if "putgex" not in d.columns and "put_gex" in d.columns:
-        d["putgex"] = d["put_gex"]
-    if "strike" not in d.columns or "netgex" not in d.columns:
-        return out
-    gamma_flip = metrics.get("gamma_flip") or metrics.get("gammaflip")
-    gex_total = float(d["netgex"].sum())
-    net_vega_total = float(d["netvega"].sum()) if "netvega" in d.columns else 0.0
-    atm_strike = int(round(float(spot) / nifty_step) * nifty_step)
-    atm_mask = (d["strike"] - spot).abs() <= 3 * nifty_step
-    above_mask = d["strike"] > spot
-    below_mask = d["strike"] < spot
-    gex_peak = float(d["netgex"].abs().max()) if len(d) else 1.0
-    vega_abs_max = max(abs(net_vega_total), 1.0)
-    is_pos_gex = gex_total > 0
-    is_high_pos_gex = is_pos_gex and gex_total > 0.30 * max(gex_peak, 1.0)
-    near_flip = gamma_flip is not None and abs(spot - gamma_flip) <= 2 * nifty_step
-    above_flip = gamma_flip is not None and spot > gamma_flip
-    net_vega_atm = float(d.loc[atm_mask, "netvega"].sum()) if "netvega" in d.columns else 0.0
-    iv_suppressed = net_vega_atm < 0
-    iv_expanding = net_vega_atm > 0
-    high_long_vega = net_vega_atm > 0.25 * vega_abs_max
-    max_netgex_idx = d["netgex"].abs().idxmax() if len(d) else None
-    max_gex_strike = int(d.loc[max_netgex_idx, "strike"]) if max_netgex_idx is not None else atm_strike
-    max_gex_is_atm = abs(max_gex_strike - atm_strike) <= nifty_step
-    atm_maxgex_vega = float(d.loc[(d["strike"] - max_gex_strike).abs() <= nifty_step, "netvega"].sum()) if "netvega" in d.columns else 0.0
-    vega_neutral_atm = abs(atm_maxgex_vega) <= 0.08 * vega_abs_max
-    flip_vega = 0.0
-    if gamma_flip is not None and "netvega" in d.columns:
-        flip_mask = (d["strike"] - gamma_flip).abs() <= nifty_step
-        flip_vega = float(d.loc[flip_mask, "netvega"].sum())
-    flip_vega_spiking = abs(flip_vega) > 0.15 * vega_abs_max
-    call_wall_k = 0
-    put_wall_k = 0
-    if above_mask.any() and "callgex" in d.columns and d.loc[above_mask, "callgex"].notna().any():
-        call_wall_k = int(d.loc[d.loc[above_mask, "callgex"].idxmax(), "strike"])
-    if below_mask.any() and "putgex" in d.columns and d.loc[below_mask, "putgex"].notna().any():
-        put_wall_k = int(d.loc[d.loc[below_mask, "putgex"].idxmax(), "strike"])
-    below_netgex = float(d.loc[below_mask, "netgex"].sum())
-    below_netvega = float(d.loc[below_mask, "netvega"].sum()) if "netvega" in d.columns else 0.0
-    above_netgex = float(d.loc[above_mask, "netgex"].sum())
-    above_netvega = float(d.loc[above_mask, "netvega"].sum()) if "netvega" in d.columns else 0.0
-    if below_netgex > 0 and below_netvega < 0:
-        below_zone_lbl = "Soft floor — put writers defending, IV suppressed below spot"
-    elif below_netgex <= 0 and below_netvega < 0:
-        below_zone_lbl = "Weak floor — low GEX support, floor can break quickly"
-    elif below_netvega > 0:
-        below_zone_lbl = "No floor — IV buyers below spot, downside being priced"
-    else:
-        below_zone_lbl = "Neutral below spot"
-    if above_netgex > 0 and above_netvega > 0:
-        above_zone_lbl = "Hard ceiling — dealer wall + IV kindling above spot"
-    elif above_netgex > 0 and above_netvega < 0:
-        above_zone_lbl = "Soft ceiling — GEX resistance, muted IV above"
-    elif above_netgex <= 0 and above_netvega > 0:
-        above_zone_lbl = "No ceiling — upside move being priced"
-    else:
-        above_zone_lbl = "Neutral above spot"
-    if max_gex_is_atm and vega_neutral_atm and is_pos_gex:
-        out.update({"matrix_bucket":"EXPIRY_MAGNET","matrix_state":"Expiry magnet / classic pinning","bias":"Range-bound","confidence":88,"summary":f"ATM has the strongest GEX at {max_gex_strike} and net vega there is neutral. NIFTY is likely to pin around ATM unless that magnet breaks.","actions":[f"Prefer short ATM premium / iron condor around {max_gex_strike}.","Avoid large directional bets unless spot cleanly escapes the magnet.","Treat a sustained move beyond ±2 strikes as magnet failure."]})
-    elif near_flip and flip_vega_spiking:
-        out.update({"matrix_bucket":"FLIP_UNSTABLE_VEGA_SPIKE","matrix_state":"Flip zone + vega spike","bias":"Breakout risk","confidence":90,"summary":f"Spot is near the gamma flip ({gamma_flip:.0f}) and net vega is spiking at that level. This is the highest-risk transition state.","actions":["Avoid short straddles / strangles.","Reduce short premium exposure until spot resolves away from the flip.","Use breakout confirmation before taking direction."]})
-    elif near_flip and not flip_vega_spiking:
-        out.update({"matrix_bucket":"FLIP_UNSTABLE_LOW_VEGA","matrix_state":"Flip zone / unstable","bias":"Neutral to breakout-watch","confidence":72,"summary":f"Spot is near the gamma flip ({gamma_flip:.0f}) but vega is not yet spiking. Regime change is close, but not fully ignited.","actions":["Reduce size.","Avoid fresh short premium near spot.","Use the flip as the binary trigger."]})
-    elif (not is_pos_gex) and high_long_vega:
-        out.update({"matrix_bucket":"SHORT_GAMMA_EXPLOSIVE","matrix_state":"Short gamma + high long vega","bias":"Directional / explosive","confidence":86,"summary":"Negative GEX means hedging can amplify moves, and elevated ATM long vega says the market is also pricing a larger swing.","actions":["Avoid naked short options.","Prefer debit spreads or long vol structures.","Expect acceleration if spot clears nearby walls."]})
-    elif (not is_pos_gex) and iv_expanding:
-        out.update({"matrix_bucket":"SHORT_GAMMA_TRENDING","matrix_state":"Trending / IV expanding","bias":"Directional","confidence":77,"summary":"Negative GEX with positive ATM net vega supports directional continuation rather than mean reversion.","actions":["Prefer momentum setups over fades.","Debit spreads are safer than naked shorts.","Respect continuation once walls give way."]})
-    elif is_pos_gex and above_flip and iv_suppressed:
-        out.update({"matrix_bucket":"PIN_RANGE_LOW_IV","matrix_state":"Strong pinning / IV suppressed","bias":"Range-bound","confidence":82,"summary":"Positive GEX plus suppressed ATM vega is a classic low-range NIFTY pinning condition.","actions":["Premium selling is favored over momentum chasing.",f"Use {put_wall_k} to {call_wall_k} as the working range.","Respect regime break if spot loses flip or closes through wall."]})
-    elif (is_pos_gex or is_high_pos_gex) and (above_flip or gamma_flip is None) and iv_expanding:
-        out.update({"matrix_bucket":"PIN_RANGE_BREAKOUT_RISK","matrix_state":"Pinned but IV building","bias":"Range for now / breakout watch","confidence":74,"summary":"Positive GEX still supports pinning, but rising ATM vega suggests the market is starting to price a breakout attempt.","actions":["Reduce aggressive short-vol exposure.","Watch the nearest call / put wall for a trigger.","Bias shifts only after clean acceptance beyond the wall."]})
-    out["below_zone_lbl"] = below_zone_lbl
-    out["above_zone_lbl"] = above_zone_lbl
-    out["levels"] = {"call_wall": call_wall_k, "put_wall": put_wall_k, "gamma_flip": gamma_flip, "atm_max_gex": max_gex_strike}
-    out["meta"] = {"is_pos_gex": is_pos_gex, "iv_suppressed": iv_suppressed, "iv_expanding": iv_expanding, "high_long_vega": high_long_vega, "near_flip": near_flip, "flip_vega_spiking": flip_vega_spiking}
-    return out
 
 # ─── Data fetchers ────────────────────────────────────────────────────────────
 # H1+H2+H3 fix: shared Dhan HTTP helper. Centralizes:
@@ -6024,9 +5950,6 @@ if _gd_src is not None:
     _gd_src["put_vega_exp"]  = _gd_src["put_oi"]  * _gd_src["put_vega"]    # put vega exposure
     _gd_src["net_vega"]      = _gd_src["call_vega_exp"] - _gd_src["put_vega_exp"]  # +ve = net long vega
 
-    # ── Explicit NIFTY GEX-Vega matrix classifier for dashboard rendering ──
-    _gex_vega_matrix = classify_gex_vega_matrix(spot=spot, gdsrc=_gd_src, metrics=m)
-
     # ── 2-column layout: GEX chart | Net Vega chart ──────────────────────────
     _gc_col1, _gc_col2 = st.columns(2)
 
@@ -6095,23 +6018,6 @@ if _gd_src is not None:
             font=dict(color="#1A1A2E", size=11),
         )
         st.plotly_chart(_gc1_fig, use_container_width=True, config={"displayModeBar": False})
-
-    _mx_bias = _gex_vega_matrix.get("bias", "Neutral")
-    _mx_conf = int(_gex_vega_matrix.get("confidence", 35))
-    _mx_bucket = _gex_vega_matrix.get("matrix_bucket", "MIXED_LOW_CONFIDENCE")
-    st.markdown(f"""
-    <div style="display:flex; gap:10px; flex-wrap:wrap; margin:8px 0 12px 0;">
-      <div style="background:#EEF2FF; border-radius:8px; padding:8px 12px; font-size:12px;">
-        <span style="font-weight:700; color:#6B7280; font-size:10px; text-transform:uppercase;">Matrix Bucket</span><br>{_mx_bucket}
-      </div>
-      <div style="background:#F8FAFC; border-radius:8px; padding:8px 12px; font-size:12px;">
-        <span style="font-weight:700; color:#6B7280; font-size:10px; text-transform:uppercase;">Bias</span><br>{_mx_bias}
-      </div>
-      <div style="background:#F0FDF4; border-radius:8px; padding:8px 12px; font-size:12px;">
-        <span style="font-weight:700; color:#6B7280; font-size:10px; text-transform:uppercase;">Confidence</span><br>{_mx_conf}/100
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
 
     with _gc_col2:
         # ─────────────────────────────────────────────────────────────────────
@@ -6218,8 +6124,20 @@ if _gd_src is not None:
             _vd_oiw_ratio.append(round(float(_cv_oiw) / float(_pv_oiw), 4))
             _vd_atm_k.append(int(_h.get("atm", 0)))
 
-    # ── Rolling Z-Score (last 15-min lookback) of the raw & OI-weighted ratios ──
-    _VD_LOOKBACK_MIN = 15
+    # ── Z-Score engine: two owner-selectable plotting modes ────────────────────
+    # Mode "tick_rolling_15m" (current/default): rolling 15-min TIME window
+    #   computed directly on every raw history tick — unchanged from before.
+    # Mode "bucket15_x6": ticks are first resampled into 15-min bars (last
+    #   value per bar — the in-progress bar therefore updates live every
+    #   rerun and freezes once the next bar begins), then the Z-score uses a
+    #   6-bar rolling window (6 × 15-min = 90-min lookback).
+    # NOTE: this only changes how the charts are PLOTTED — today_history and
+    # the underlying tick collection/storage are untouched in either mode.
+    _VD_LOOKBACK_MIN    = 15   # tick-mode: rolling time window (minutes)
+    _ZS_BUCKET_MIN       = 15   # bucket-mode: bar width (minutes)
+    _ZS_BUCKET_LOOKBACK  = 6    # bucket-mode: rolling window in # of bars
+    _zs_mode = _load_owner_settings().get("zscore_chart_mode", "tick_rolling_15m")
+
     def _rolling_zscore(ts_list, val_list, lookback_min=_VD_LOOKBACK_MIN):
         """Z-score of each point vs its trailing `lookback_min`-minute window (incl. itself)."""
         if len(val_list) < 2:
@@ -6231,8 +6149,40 @@ if _gd_src is not None:
         _z = (_s - _mean) / _std.replace(0, np.nan)
         return _z.fillna(0.0).round(3).tolist()
 
-    _vd_raw_z = _rolling_zscore(_vd_ts_full, _vd_raw_ratio)
-    _vd_oiw_z = _rolling_zscore(_vd_ts_full, _vd_oiw_ratio)
+    def _make_15min_buckets(ts_list, cols, freq_min=_ZS_BUCKET_MIN):
+        """Floor ticks into `freq_min`-min bars, keep the LAST value per bar.
+        The most recent (in-progress) bar reflects the latest tick and updates
+        every rerun; once a new bar starts, the prior one is frozen for good."""
+        _idx = pd.to_datetime(ts_list)
+        _df = pd.DataFrame(cols)
+        _df["bucket"] = _idx.floor(f"{freq_min}min")
+        return _df.groupby("bucket", as_index=True).last().sort_index()
+
+    def _bucket_zscore(series, window_buckets=_ZS_BUCKET_LOOKBACK):
+        """Z-score on an already-bucketed series using an N-bar rolling window."""
+        _roll = series.rolling(window_buckets, min_periods=2)
+        _mean = _roll.mean()
+        _std  = _roll.std(ddof=0)
+        _z = (series - _mean) / _std.replace(0, np.nan)
+        return _z.fillna(0.0).round(3)
+
+    if _zs_mode == "bucket15_x6" and len(_vd_ts_full) >= 2:
+        _vd_bkt = _make_15min_buckets(
+            _vd_ts_full,
+            {"spot": _vd_spot, "atm": _vd_atm_k, "raw_ratio": _vd_raw_ratio, "oiw_ratio": _vd_oiw_ratio},
+        )
+        _vd_times     = _vd_bkt.index.strftime("%H:%M").tolist()
+        _vd_spot      = _vd_bkt["spot"].tolist()
+        _vd_atm_k     = _vd_bkt["atm"].astype(int).tolist()
+        _vd_raw_ratio = _vd_bkt["raw_ratio"].tolist()
+        _vd_oiw_ratio = _vd_bkt["oiw_ratio"].tolist()
+        _vd_raw_z     = _bucket_zscore(_vd_bkt["raw_ratio"]).tolist()
+        _vd_oiw_z     = _bucket_zscore(_vd_bkt["oiw_ratio"]).tolist()
+        _vd_lookback_label = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
+    else:
+        _vd_raw_z = _rolling_zscore(_vd_ts_full, _vd_raw_ratio)
+        _vd_oiw_z = _rolling_zscore(_vd_ts_full, _vd_oiw_ratio)
+        _vd_lookback_label = f"{_VD_LOOKBACK_MIN}-min lookback"
 
     def _add_atm_change_annotations(fig, times, atm_ks):
         """Helper: draw grey dashed vlines + ATM-shift labels (avoids _mean() crash on string x-axis)."""
@@ -6262,7 +6212,7 @@ if _gd_src is not None:
             ))
             _vr_fig.add_trace(go.Scatter(
                 x=_vd_times, y=_vd_raw_z,
-                name=f"Raw Vega Ratio Z-Score ({_VD_LOOKBACK_MIN}m, ±{_vd_band_n} strikes)",
+                name=f"Raw Vega Ratio Z-Score ({_vd_lookback_label}, ±{_vd_band_n} strikes)",
                 mode="lines+markers",
                 line=dict(color="#7C3AED", width=2.0),
                 marker=dict(size=4, color="#7C3AED"),
@@ -6287,7 +6237,7 @@ if _gd_src is not None:
             _add_atm_change_annotations(_vr_fig, _vd_times, _vd_atm_k)
             _vr_fig.update_layout(
                 title=dict(
-                    text=f"Raw Vega Ratio Z-Score — {_VD_LOOKBACK_MIN}-min lookback  (±{_vd_band_n} strikes)  "
+                    text=f"Raw Vega Ratio Z-Score — {_vd_lookback_label}  (±{_vd_band_n} strikes)  "
                          "<span style='font-size:11px;color:#6B7280'>"
                          "Amber=Spot (left) · Purple=Z-Score (right) · "
                          "&gt;+1σ/+2σ = Call vega dominant · &lt;−1σ/−2σ = Put vega dominant · "
@@ -6304,7 +6254,7 @@ if _gd_src is not None:
                     gridcolor="#F3F4F6", autorange=True, showgrid=True,
                 ),
                 yaxis2=dict(
-                    title=dict(text=f"Raw Vega Ratio Z-Score ({_VD_LOOKBACK_MIN}m lookback)", font=dict(color="#7C3AED")),
+                    title=dict(text=f"Raw Vega Ratio Z-Score ({_vd_lookback_label})", font=dict(color="#7C3AED")),
                     tickfont=dict(color="#7C3AED", size=9),
                     overlaying="y", side="right",
                     zeroline=False, autorange=True, showgrid=False,
@@ -6330,7 +6280,7 @@ if _gd_src is not None:
             ))
             _vo_fig.add_trace(go.Scatter(
                 x=_vd_times, y=_vd_oiw_z,
-                name=f"OI-Wtd Vega Ratio Z-Score ({_VD_LOOKBACK_MIN}m, ±{_vd_band_n} strikes)",
+                name=f"OI-Wtd Vega Ratio Z-Score ({_vd_lookback_label}, ±{_vd_band_n} strikes)",
                 mode="lines+markers",
                 line=dict(color="#0891B2", width=2.0),
                 marker=dict(size=4, color="#0891B2"),
@@ -6355,7 +6305,7 @@ if _gd_src is not None:
             _add_atm_change_annotations(_vo_fig, _vd_times, _vd_atm_k)
             _vo_fig.update_layout(
                 title=dict(
-                    text=f"OI-Weighted Vega Ratio Z-Score — {_VD_LOOKBACK_MIN}-min lookback  (±{_vd_band_n} strikes)  "
+                    text=f"OI-Weighted Vega Ratio Z-Score — {_vd_lookback_label}  (±{_vd_band_n} strikes)  "
                          "<span style='font-size:11px;color:#6B7280'>"
                          "Amber=Spot (left) · Cyan=Z-Score (right) · "
                          "&gt;+1σ/+2σ = Call exposure dominant · &lt;−1σ/−2σ = Put / hedge demand · "
@@ -6372,7 +6322,7 @@ if _gd_src is not None:
                     gridcolor="#F3F4F6", autorange=True, showgrid=True,
                 ),
                 yaxis2=dict(
-                    title=dict(text=f"OI-Wtd Vega Ratio Z-Score ({_VD_LOOKBACK_MIN}m lookback)", font=dict(color="#0891B2")),
+                    title=dict(text=f"OI-Wtd Vega Ratio Z-Score ({_vd_lookback_label})", font=dict(color="#0891B2")),
                     tickfont=dict(color="#0891B2", size=9),
                     overlaying="y", side="right",
                     zeroline=False, autorange=True, showgrid=False,
@@ -6405,9 +6355,24 @@ if _gd_src is not None:
             _evz_ratio.append(float(_evr))
             _evz_atm_k.append(int(_h.get("atm", 0)))
 
-    if len(_evz_times) >= 2:
+    # Same owner-selectable Z-Score engine as the Vega Ratio charts above
+    # (tick-mode rolling 15-min window, or bucket-mode 6×15-min bars).
+    if _zs_mode == "bucket15_x6" and len(_evz_ts_full) >= 2:
+        _evz_bkt = _make_15min_buckets(
+            _evz_ts_full,
+            {"spot": _evz_spot, "atm": _evz_atm_k, "ev_ratio": _evz_ratio},
+        )
+        _evz_times = _evz_bkt.index.strftime("%H:%M").tolist()
+        _evz_spot  = _evz_bkt["spot"].tolist()
+        _evz_atm_k = _evz_bkt["atm"].astype(int).tolist()
+        _evz_ratio = _evz_bkt["ev_ratio"].tolist()
+        _evz_z     = _bucket_zscore(_evz_bkt["ev_ratio"]).tolist()
+        _evz_lookback_label = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
+    else:
         _evz_z = _rolling_zscore(_evz_ts_full, _evz_ratio)
+        _evz_lookback_label = f"{_VD_LOOKBACK_MIN}-min lookback"
 
+    if len(_evz_times) >= 2:
         _ev_fig = go.Figure()
         _ev_fig.add_trace(go.Scatter(
             x=_evz_times, y=_evz_spot,
@@ -6419,7 +6384,7 @@ if _gd_src is not None:
         ))
         _ev_fig.add_trace(go.Scatter(
             x=_evz_times, y=_evz_z,
-            name=f"CE/PE EV Ratio Z-Score ({_VD_LOOKBACK_MIN}m, ATM±5 strikes)",
+            name=f"CE/PE EV Ratio Z-Score ({_evz_lookback_label}, ATM±5 strikes)",
             mode="lines+markers",
             line=dict(color="#059669", width=2.0),
             marker=dict(size=4, color="#059669"),
@@ -6444,7 +6409,7 @@ if _gd_src is not None:
         _add_atm_change_annotations(_ev_fig, _evz_times, _evz_atm_k)
         _ev_fig.update_layout(
             title=dict(
-                text=f"Strike-wise CE/PE Extrinsic-Value Ratio Z-Score — {_VD_LOOKBACK_MIN}-min lookback  (ATM ±5 strikes)  "
+                text=f"Strike-wise CE/PE Extrinsic-Value Ratio Z-Score — {_evz_lookback_label}  (ATM ±5 strikes)  "
                      "<span style='font-size:11px;color:#6B7280'>"
                      "Amber=Spot (left) · Green=Z-Score (right) · "
                      "&gt;+1σ/+2σ = Call premium relatively rich · &lt;−1σ/−2σ = Put premium relatively rich · "
@@ -6461,7 +6426,7 @@ if _gd_src is not None:
                 gridcolor="#F3F4F6", autorange=True, showgrid=True,
             ),
             yaxis2=dict(
-                title=dict(text=f"CE/PE EV Ratio Z-Score ({_VD_LOOKBACK_MIN}m lookback)", font=dict(color="#059669")),
+                title=dict(text=f"CE/PE EV Ratio Z-Score ({_evz_lookback_label})", font=dict(color="#059669")),
                 tickfont=dict(color="#059669", size=9),
                 overlaying="y", side="right",
                 zeroline=False, autorange=True, showgrid=False,
