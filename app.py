@@ -237,7 +237,10 @@ def _render_owner_sidebar(expiry_list):
 
             # Vega band width selector
             # Controls how many strikes either side of ATM are included in the
-            # OI-weighted band vega sum (ATM Vega Diff chart + Net Vega per Strike).
+            # OI-weighted band vega sum (ATM Vega Diff chart + Net Vega per Strike),
+            # AND the strike-wise averaging band for the CE/PE EV Ratio charts —
+            # one control now governs the strike width for all 4 Z-Score charts
+            # (Raw & OI-Wtd Vega Ratio, Raw & OI-Wtd CE/PE EV Ratio).
             # ±1 = tight (expiry-day); ±2 = default; ±3/4 = monthlies with wide smile.
             _VEGA_BAND_OPTIONS = {"±1 strike  (50 pts)": 1,
                                   "±2 strikes (100 pts) — default": 2,
@@ -251,8 +254,11 @@ def _render_owner_sidebar(expiry_list):
                 list(_VEGA_BAND_OPTIONS.keys()),
                 index=list(_VEGA_BAND_OPTIONS.keys()).index(_vb_label),
                 key="vega_band_selector",
-                help="Number of strikes either side of ATM used for the OI-weighted "
-                     "Vega Diff chart. Wider = smoother but includes more OTM noise.",
+                help="Number of strikes either side of ATM. Governs all 4 Z-Score "
+                     "charts: the OI-weighted band vega sum (Raw & OI-Wtd Vega "
+                     "Ratio charts) and the strike-wise averaging band (Raw & "
+                     "OI-Wtd CE/PE EV Ratio charts). Wider = smoother but includes "
+                     "more OTM noise.",
             )
             _new_vb = _VEGA_BAND_OPTIONS[_chosen_vb]
             if _new_vb != _saved_vb:
@@ -262,32 +268,53 @@ def _render_owner_sidebar(expiry_list):
 
             st.divider()
 
-            # Z-Score chart plotting mode — Vega Ratio / OI-Wtd Vega Ratio /
-            # CE-PE Extrinsic-Value Ratio Z-Score charts only. Display-only:
-            # does NOT touch how ticks are collected or stored in history.
-            _ZS_MODE_OPTIONS = {
-                "Live tick · 15-min rolling (current)": "tick_rolling_15m",
-                "15-min TF · 6-bucket lookback (90 min)": "bucket15_x6",
+            # Z-Score chart plotting settings — govern all 4 Z-score charts:
+            # Raw Vega Ratio, OI-Wtd Vega Ratio, Raw CE/PE EV Ratio, OI-Wtd CE/PE
+            # EV Ratio. Display-only: does NOT touch how ticks are collected or
+            # stored in history. Two independently configurable settings:
+            #   A. TF / time bucket — bar width ticks are resampled into
+            #   B. Look-back period — how many bars the rolling Z-score spans
+            _ZS_TF_OPTIONS = {
+                "5 min":  5,
+                "15 min (default)": 15,
+                "30 min": 30,
+                "60 min": 60,
             }
-            _saved_zs_mode = _cur_settings.get("zscore_chart_mode", "tick_rolling_15m")
-            _zs_label = next((k for k, v in _ZS_MODE_OPTIONS.items() if v == _saved_zs_mode),
-                             "Live tick · 15-min rolling (current)")
-            _chosen_zs = st.selectbox(
-                "📊 Z-Score chart timeframe",
-                list(_ZS_MODE_OPTIONS.keys()),
-                index=list(_ZS_MODE_OPTIONS.keys()).index(_zs_label),
-                key="zscore_mode_selector",
-                help="Applies to the Vega Ratio, OI-Wtd Vega Ratio and CE/PE "
-                     "Extrinsic-Value Ratio Z-Score charts only. 'Live tick' "
-                     "recalculates a 15-min rolling Z-score on every tick. "
-                     "'15-min TF' resamples ticks into 15-min bars first, then "
-                     "runs the Z-score over the trailing 6 bars (90 min). The "
-                     "in-progress bar updates every refresh and locks once its "
-                     "15-min window closes. Does not affect data collection.",
+            _saved_zs_tf = _cur_settings.get("zscore_tf_minutes", 15)
+            _zs_tf_label = next((k for k, v in _ZS_TF_OPTIONS.items() if v == _saved_zs_tf),
+                                "15 min (default)")
+            _chosen_zs_tf = st.selectbox(
+                "📊 Z-Score chart TF (time bucket)",
+                list(_ZS_TF_OPTIONS.keys()),
+                index=list(_ZS_TF_OPTIONS.keys()).index(_zs_tf_label),
+                key="zscore_tf_selector",
+                help="Applies to all 4 Z-Score charts (Raw & OI-Wtd Vega Ratio, "
+                     "Raw & OI-Wtd CE/PE EV Ratio). Ticks are resampled into bars "
+                     "of this width (last value per bar); the in-progress bar "
+                     "updates every refresh and locks once its window closes. "
+                     "Does not affect data collection.",
             )
-            _new_zs_mode = _ZS_MODE_OPTIONS[_chosen_zs]
-            if _new_zs_mode != _saved_zs_mode:
-                _cur_settings["zscore_chart_mode"] = _new_zs_mode
+            _new_zs_tf = _ZS_TF_OPTIONS[_chosen_zs_tf]
+            if _new_zs_tf != _saved_zs_tf:
+                _cur_settings["zscore_tf_minutes"] = _new_zs_tf
+                _save_owner_settings(_cur_settings)
+
+            _ZS_LOOKBACK_OPTIONS = {f"{n} bars": n for n in range(5, 11)}
+            _saved_zs_lb = _cur_settings.get("zscore_lookback_buckets", 6)
+            _zs_lb_label = next((k for k, v in _ZS_LOOKBACK_OPTIONS.items() if v == _saved_zs_lb),
+                                "6 bars")
+            _chosen_zs_lb = st.selectbox(
+                "📊 Z-Score look-back period",
+                list(_ZS_LOOKBACK_OPTIONS.keys()),
+                index=list(_ZS_LOOKBACK_OPTIONS.keys()).index(_zs_lb_label),
+                key="zscore_lookback_selector",
+                help="Number of TF bars the rolling Z-score window spans (5-10), "
+                     "e.g. 6 bars × 15-min TF = 90-min lookback. Applies to all "
+                     "4 Z-Score charts alongside the TF setting above.",
+            )
+            _new_zs_lb = _ZS_LOOKBACK_OPTIONS[_chosen_zs_lb]
+            if _new_zs_lb != _saved_zs_lb:
+                _cur_settings["zscore_lookback_buckets"] = _new_zs_lb
                 _save_owner_settings(_cur_settings)
 
             st.divider()
@@ -1123,12 +1150,37 @@ def compute_metrics(df, spot, expiry=None, history=None):
     ev_sum_p = float(t["ev_p"].sum())
     ev_ratio = ev_sum_c / ev_sum_p if ev_sum_p > 0 else 1.0
 
-    # Strike-wise Call/Put Extrinsic-Value ratio across ATM ±SIGNAL_BAND (±5) strikes,
-    # averaged PER-STRIKE (distinct from ev_ratio above, which is a ratio-of-sums).
-    _ev_ratio_per_strike = t["ev_c"] / t["ev_p"].replace(0, np.nan)
+    # Strike-wise Call/Put Extrinsic-Value ratio, averaged PER-STRIKE (distinct
+    # from ev_ratio above, which is a ratio-of-sums over the full ATM±SIGNAL_BAND
+    # tight_df). The per-strike average feeds the owner-facing Z-Score charts,
+    # so its band width is shared with the "ATM Vega band width" owner setting
+    # (vega_band_strikes) — the SAME control now governs the strike width for
+    # all 4 Z-Score charts (Raw & OI-Wtd Vega Ratio, Raw & OI-Wtd CE/PE EV
+    # Ratio). Loaded here (pre-backfill) since only band membership is needed,
+    # not vega values themselves — those are captured separately below.
+    try:
+        _zband_n = int(_load_owner_settings().get("vega_band_strikes", 2))
+    except Exception:
+        _zband_n = 2
+    _zband_lo = atm - _zband_n * NIFTY_STEP
+    _zband_hi = atm + _zband_n * NIFTY_STEP
+    t_band = t[t["strike"].between(_zband_lo, _zband_hi)]
+
+    _ev_ratio_per_strike = t_band["ev_c"] / t_band["ev_p"].replace(0, np.nan)
     ev_ratio_avg_strikewise = (
         float(_ev_ratio_per_strike.mean(skipna=True))
         if _ev_ratio_per_strike.notna().any() else 1.0
+    )
+
+    # OI-weighted strike-wise CE/PE EV ratio, same shared band: per strike,
+    # ratio = (Call EV × Call OI) / (Put EV × Put OI), then averaged per-strike
+    # (mirrors ev_ratio_avg_strikewise above but weights each strike's EV by its OI).
+    _ev_oiw_c = t_band["ev_c"] * t_band["call_oi"]
+    _ev_oiw_p = t_band["ev_p"] * t_band["put_oi"]
+    _ev_ratio_oiw_per_strike = _ev_oiw_c / _ev_oiw_p.replace(0, np.nan)
+    ev_ratio_oiw_avg_strikewise = (
+        float(_ev_ratio_oiw_per_strike.mean(skipna=True))
+        if _ev_ratio_oiw_per_strike.notna().any() else 1.0
     )
 
     net_delta = float((t["call_oi"] * t["call_delta"]).sum() + (t["put_oi"] * t["put_delta"]).sum())
@@ -1290,7 +1342,8 @@ def compute_metrics(df, spot, expiry=None, history=None):
 
     return {
         "ev_ratio": round(ev_ratio, 3),
-        "ev_ratio_avg_strikewise": round(ev_ratio_avg_strikewise, 4),  # avg of per-strike CE/PE EV ratio, ATM±5
+        "ev_ratio_avg_strikewise": round(ev_ratio_avg_strikewise, 4),  # avg of per-strike CE/PE EV ratio, ATM±vega_band_strikes
+        "ev_ratio_oiw_avg_strikewise": round(ev_ratio_oiw_avg_strikewise, 4),  # avg of per-strike OI-weighted CE/PE EV ratio, ATM±vega_band_strikes
         "net_delta": round(net_delta, 0),
         "net_gamma": round(net_gamma, 6),
         "net_theta": round(net_theta, 0),
@@ -3770,8 +3823,10 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
         "atm_put_vega":       m.get("atm_put_vega")      if safe_num(m.get("atm_put_vega",      0)) > 0 else None,
         "atm_call_vega_raw":  m.get("atm_call_vega_raw") if safe_num(m.get("atm_call_vega_raw", 0)) > 0 else None,
         "atm_put_vega_raw":   m.get("atm_put_vega_raw")  if safe_num(m.get("atm_put_vega_raw",  0)) > 0 else None,
-        # Strike-wise CE/PE Extrinsic-Value ratio, ATM±5 strikes, averaged per-strike
+        # Strike-wise CE/PE Extrinsic-Value ratio, ATM±vega_band_strikes, averaged per-strike
         "ev_ratio_avg_strikewise": m.get("ev_ratio_avg_strikewise") if safe_num(m.get("ev_ratio_avg_strikewise", 0)) > 0 else None,
+        # Same, but OI-weighted per strike (Call EV×Call OI / Put EV×Put OI)
+        "ev_ratio_oiw_avg_strikewise": m.get("ev_ratio_oiw_avg_strikewise") if safe_num(m.get("ev_ratio_oiw_avg_strikewise", 0)) > 0 else None,
         "net_delta":    m.get("net_delta", 0),
         "oi_net_delta": m.get("momentum", 0),
         "momentum":     m.get("momentum", 0),
@@ -6124,32 +6179,20 @@ if _gd_src is not None:
             _vd_oiw_ratio.append(round(float(_cv_oiw) / float(_pv_oiw), 4))
             _vd_atm_k.append(int(_h.get("atm", 0)))
 
-    # ── Z-Score engine: two owner-selectable plotting modes ────────────────────
-    # Mode "tick_rolling_15m" (current/default): rolling 15-min TIME window
-    #   computed directly on every raw history tick — unchanged from before.
-    # Mode "bucket15_x6": ticks are first resampled into 15-min bars (last
-    #   value per bar — the in-progress bar therefore updates live every
-    #   rerun and freezes once the next bar begins), then the Z-score uses a
-    #   6-bar rolling window (6 × 15-min = 90-min lookback).
+    # ── Z-Score engine: owner-configurable TF (time bucket) + look-back period ──
+    # Ticks are resampled into TF-minute bars (last value per bar — the
+    # in-progress bar therefore updates live every rerun and freezes once the
+    # next bar begins), then the Z-score uses an N-bar rolling window
+    # (N × TF minutes lookback). Both TF and look-back are set together in the
+    # owner sidebar and govern all 4 Z-Score charts (Raw & OI-Wtd Vega Ratio,
+    # Raw & OI-Wtd CE/PE EV Ratio).
     # NOTE: this only changes how the charts are PLOTTED — today_history and
-    # the underlying tick collection/storage are untouched in either mode.
-    _VD_LOOKBACK_MIN    = 15   # tick-mode: rolling time window (minutes)
-    _ZS_BUCKET_MIN       = 15   # bucket-mode: bar width (minutes)
-    _ZS_BUCKET_LOOKBACK  = 6    # bucket-mode: rolling window in # of bars
-    _zs_mode = _load_owner_settings().get("zscore_chart_mode", "tick_rolling_15m")
+    # the underlying tick collection/storage are untouched.
+    _zs_settings         = _load_owner_settings()
+    _ZS_BUCKET_MIN       = int(_zs_settings.get("zscore_tf_minutes", 15))       # bar width (minutes)
+    _ZS_BUCKET_LOOKBACK  = int(_zs_settings.get("zscore_lookback_buckets", 6))  # rolling window in # of bars
 
-    def _rolling_zscore(ts_list, val_list, lookback_min=_VD_LOOKBACK_MIN):
-        """Z-score of each point vs its trailing `lookback_min`-minute window (incl. itself)."""
-        if len(val_list) < 2:
-            return [0.0] * len(val_list)
-        _s = pd.Series(val_list, index=pd.to_datetime(ts_list))
-        _roll = _s.rolling(f"{lookback_min}min", min_periods=2)
-        _mean = _roll.mean()
-        _std  = _roll.std(ddof=0)
-        _z = (_s - _mean) / _std.replace(0, np.nan)
-        return _z.fillna(0.0).round(3).tolist()
-
-    def _make_15min_buckets(ts_list, cols, freq_min=_ZS_BUCKET_MIN):
+    def _make_tf_buckets(ts_list, cols, freq_min=_ZS_BUCKET_MIN):
         """Floor ticks into `freq_min`-min bars, keep the LAST value per bar.
         The most recent (in-progress) bar reflects the latest tick and updates
         every rerun; once a new bar starts, the prior one is frozen for good."""
@@ -6166,8 +6209,8 @@ if _gd_src is not None:
         _z = (series - _mean) / _std.replace(0, np.nan)
         return _z.fillna(0.0).round(3)
 
-    if _zs_mode == "bucket15_x6" and len(_vd_ts_full) >= 2:
-        _vd_bkt = _make_15min_buckets(
+    if len(_vd_ts_full) >= 2:
+        _vd_bkt = _make_tf_buckets(
             _vd_ts_full,
             {"spot": _vd_spot, "atm": _vd_atm_k, "raw_ratio": _vd_raw_ratio, "oiw_ratio": _vd_oiw_ratio},
         )
@@ -6178,11 +6221,7 @@ if _gd_src is not None:
         _vd_oiw_ratio = _vd_bkt["oiw_ratio"].tolist()
         _vd_raw_z     = _bucket_zscore(_vd_bkt["raw_ratio"]).tolist()
         _vd_oiw_z     = _bucket_zscore(_vd_bkt["oiw_ratio"]).tolist()
-        _vd_lookback_label = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
-    else:
-        _vd_raw_z = _rolling_zscore(_vd_ts_full, _vd_raw_ratio)
-        _vd_oiw_z = _rolling_zscore(_vd_ts_full, _vd_oiw_ratio)
-        _vd_lookback_label = f"{_VD_LOOKBACK_MIN}-min lookback"
+    _vd_lookback_label = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
 
     def _add_atm_change_annotations(fig, times, atm_ks):
         """Helper: draw grey dashed vlines + ATM-shift labels (avoids _mean() crash on string x-axis)."""
@@ -6338,108 +6377,186 @@ if _gd_src is not None:
         st.info("⏳ ATM Band Vega Ratio charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ATM ±5 STRIKE-WISE CE/PE EXTRINSIC-VALUE RATIO — Z-SCORE (15-min lookback)
-    # Uses ev_ratio_avg_strikewise saved in history: per tick, this is the
-    # strike-by-strike average of (call_ev / put_ev) across ATM ±5 (SIGNAL_BAND)
-    # strikes — distinct from the "EV Ratio" headline metric, which is a
-    # ratio-of-pooled-sums (Σev_c / Σev_p) rather than an average of per-strike
-    # ratios. Same 15-min rolling-Z engine as the Vega Ratio charts above.
+    # ATM ±N STRIKE-WISE CE/PE EXTRINSIC-VALUE RATIO — Z-SCORE (raw + OI-wtd)
+    # Uses ev_ratio_avg_strikewise / ev_ratio_oiw_avg_strikewise saved in
+    # history: per tick, these are the strike-by-strike average of
+    # (call_ev / put_ev) — raw — and (call_ev×call_oi / put_ev×put_oi) — OI-
+    # weighted — across the SAME owner-configurable ATM band width as the
+    # Vega Ratio charts (vega_band_strikes / "ATM Vega band width" setting —
+    # one control now governs the strike width for all 4 Z-Score charts).
+    # Distinct from the "EV Ratio" headline metric, which is a
+    # ratio-of-pooled-sums (Σev_c / Σev_p) over the fixed ATM±SIGNAL_BAND
+    # rather than an average of per-strike ratios. Same owner-configurable
+    # TF + look-back Z-score engine as the Vega Ratio charts above.
     # ─────────────────────────────────────────────────────────────────────────
-    _evz_ts_full, _evz_times, _evz_spot, _evz_atm_k, _evz_ratio = [], [], [], [], []
+    _evz_ts_full, _evz_times, _evz_spot, _evz_atm_k = [], [], [], []
+    _evz_raw_ratio, _evz_oiw_ratio = [], []
     for _h in today_history:
-        _evr = _h.get("ev_ratio_avg_strikewise")
-        if _evr is not None and _h.get("spot"):
+        _evr     = _h.get("ev_ratio_avg_strikewise")
+        _evr_oiw = _h.get("ev_ratio_oiw_avg_strikewise")
+        if _evr is not None and _evr_oiw is not None and _h.get("spot"):
             _evz_ts_full.append(_h["ts"])
             _evz_times.append(_h["ts"][11:19])
             _evz_spot.append(float(_h["spot"]))
-            _evz_ratio.append(float(_evr))
+            _evz_raw_ratio.append(float(_evr))
+            _evz_oiw_ratio.append(float(_evr_oiw))
             _evz_atm_k.append(int(_h.get("atm", 0)))
 
-    # Same owner-selectable Z-Score engine as the Vega Ratio charts above
-    # (tick-mode rolling 15-min window, or bucket-mode 6×15-min bars).
-    if _zs_mode == "bucket15_x6" and len(_evz_ts_full) >= 2:
-        _evz_bkt = _make_15min_buckets(
+    # Same owner-configurable TF + look-back Z-Score engine as the Vega Ratio charts above.
+    if len(_evz_ts_full) >= 2:
+        _evz_bkt = _make_tf_buckets(
             _evz_ts_full,
-            {"spot": _evz_spot, "atm": _evz_atm_k, "ev_ratio": _evz_ratio},
+            {"spot": _evz_spot, "atm": _evz_atm_k, "raw_ratio": _evz_raw_ratio, "oiw_ratio": _evz_oiw_ratio},
         )
-        _evz_times = _evz_bkt.index.strftime("%H:%M").tolist()
-        _evz_spot  = _evz_bkt["spot"].tolist()
-        _evz_atm_k = _evz_bkt["atm"].astype(int).tolist()
-        _evz_ratio = _evz_bkt["ev_ratio"].tolist()
-        _evz_z     = _bucket_zscore(_evz_bkt["ev_ratio"]).tolist()
-        _evz_lookback_label = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
-    else:
-        _evz_z = _rolling_zscore(_evz_ts_full, _evz_ratio)
-        _evz_lookback_label = f"{_VD_LOOKBACK_MIN}-min lookback"
+        _evz_times     = _evz_bkt.index.strftime("%H:%M").tolist()
+        _evz_spot      = _evz_bkt["spot"].tolist()
+        _evz_atm_k     = _evz_bkt["atm"].astype(int).tolist()
+        _evz_raw_ratio = _evz_bkt["raw_ratio"].tolist()
+        _evz_oiw_ratio = _evz_bkt["oiw_ratio"].tolist()
+        _evz_raw_z     = _bucket_zscore(_evz_bkt["raw_ratio"]).tolist()
+        _evz_oiw_z     = _bucket_zscore(_evz_bkt["oiw_ratio"]).tolist()
+    _evz_lookback_label = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
 
     if len(_evz_times) >= 2:
-        _ev_fig = go.Figure()
-        _ev_fig.add_trace(go.Scatter(
-            x=_evz_times, y=_evz_spot,
-            name="Nifty Spot",
-            mode="lines",
-            line=dict(color="#F59E0B", width=2.5),
-            yaxis="y1",
-            hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
-        ))
-        _ev_fig.add_trace(go.Scatter(
-            x=_evz_times, y=_evz_z,
-            name=f"CE/PE EV Ratio Z-Score ({_evz_lookback_label}, ATM±5 strikes)",
-            mode="lines+markers",
-            line=dict(color="#059669", width=2.0),
-            marker=dict(size=4, color="#059669"),
-            yaxis="y2",
-            customdata=_evz_ratio,
-            hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Avg CE/PE EV Ratio: %{customdata:.4f}"
-                          "<extra>strike-wise avg, ATM±5</extra>",
-        ))
-        # Mean (0σ) line + ±1σ / ±2σ level markers
-        _ev_fig.add_hline(y=0, yref="y2", line_dash="dot",
-                           line_color="#A7F3D0", line_width=1.5)
-        _ev_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
-                               text="Mean (0σ)", font=dict(size=9, color="#059669"),
-                               showarrow=False, xanchor="left")
-        for _zlvl, _zcol, _zdash in [(1, "#6EE7B7", "dash"), (-1, "#6EE7B7", "dash"),
-                                      (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
-            _ev_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
-                               line_color=_zcol, line_width=1)
-            _ev_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
-                                   text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+        _evz_col1, _evz_col2 = st.columns(2)
+
+        # ── Chart A: Raw CE/PE EV Ratio (strike-wise avg, no OI weighting) ──
+        with _evz_col1:
+            _ev_fig = go.Figure()
+            _ev_fig.add_trace(go.Scatter(
+                x=_evz_times, y=_evz_spot,
+                name="Nifty Spot",
+                mode="lines",
+                line=dict(color="#F59E0B", width=2.5),
+                yaxis="y1",
+                hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+            ))
+            _ev_fig.add_trace(go.Scatter(
+                x=_evz_times, y=_evz_raw_z,
+                name=f"Raw CE/PE EV Ratio Z-Score ({_evz_lookback_label}, ±{_vd_band_n} strikes)",
+                mode="lines+markers",
+                line=dict(color="#059669", width=2.0),
+                marker=dict(size=4, color="#059669"),
+                yaxis="y2",
+                customdata=_evz_raw_ratio,
+                hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Avg CE/PE EV Ratio: %{customdata:.4f}"
+                              f"<extra>strike-wise avg, ±{_vd_band_n}</extra>",
+            ))
+            # Mean (0σ) line + ±1σ / ±2σ level markers
+            _ev_fig.add_hline(y=0, yref="y2", line_dash="dot",
+                               line_color="#A7F3D0", line_width=1.5)
+            _ev_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                                   text="Mean (0σ)", font=dict(size=9, color="#059669"),
                                    showarrow=False, xanchor="left")
-        _add_atm_change_annotations(_ev_fig, _evz_times, _evz_atm_k)
-        _ev_fig.update_layout(
-            title=dict(
-                text=f"Strike-wise CE/PE Extrinsic-Value Ratio Z-Score — {_evz_lookback_label}  (ATM ±5 strikes)  "
-                     "<span style='font-size:11px;color:#6B7280'>"
-                     "Amber=Spot (left) · Green=Z-Score (right) · "
-                     "&gt;+1σ/+2σ = Call premium relatively rich · &lt;−1σ/−2σ = Put premium relatively rich · "
-                     "Grey dash=ATM shift</span>",
-                font=dict(size=13),
-            ),
-            height=270,
-            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-            margin=dict(l=65, r=65, t=55, b=30),
-            legend=dict(orientation="h", y=1.22, font=dict(size=10)),
-            yaxis=dict(
-                title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
-                tickfont=dict(color="#F59E0B", size=9),
-                gridcolor="#F3F4F6", autorange=True, showgrid=True,
-            ),
-            yaxis2=dict(
-                title=dict(text=f"CE/PE EV Ratio Z-Score ({_evz_lookback_label})", font=dict(color="#059669")),
-                tickfont=dict(color="#059669", size=9),
-                overlaying="y", side="right",
-                zeroline=False, autorange=True, showgrid=False,
-            ),
-            xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
-                       showgrid=True, gridcolor="#F3F4F6"),
-            hovermode="x unified",
-            font=dict(color="#1A1A2E", size=11),
-        )
-        st.plotly_chart(_ev_fig, use_container_width=True,
-                        config={"displayModeBar": False})
+            for _zlvl, _zcol, _zdash in [(1, "#6EE7B7", "dash"), (-1, "#6EE7B7", "dash"),
+                                          (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+                _ev_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                                   line_color=_zcol, line_width=1)
+                _ev_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                       text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                       showarrow=False, xanchor="left")
+            _add_atm_change_annotations(_ev_fig, _evz_times, _evz_atm_k)
+            _ev_fig.update_layout(
+                title=dict(
+                    text=f"Raw CE/PE EV Ratio Z-Score — {_evz_lookback_label}  (±{_vd_band_n} strikes)  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Amber=Spot (left) · Green=Z-Score (right) · "
+                         "&gt;+1σ/+2σ = Call premium relatively rich · &lt;−1σ/−2σ = Put premium relatively rich · "
+                         "Grey dash=ATM shift</span>",
+                    font=dict(size=13),
+                ),
+                height=270,
+                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=65, r=65, t=55, b=30),
+                legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                yaxis=dict(
+                    title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                    tickfont=dict(color="#F59E0B", size=9),
+                    gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                ),
+                yaxis2=dict(
+                    title=dict(text=f"Raw CE/PE EV Ratio Z-Score ({_evz_lookback_label})", font=dict(color="#059669")),
+                    tickfont=dict(color="#059669", size=9),
+                    overlaying="y", side="right",
+                    zeroline=False, autorange=True, showgrid=False,
+                ),
+                xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                           showgrid=True, gridcolor="#F3F4F6"),
+                hovermode="x unified",
+                font=dict(color="#1A1A2E", size=11),
+            )
+            st.plotly_chart(_ev_fig, use_container_width=True,
+                            config={"displayModeBar": False})
+
+        # ── Chart B: OI-Weighted CE/PE EV Ratio (Call EV×OI / Put EV×OI) ────
+        with _evz_col2:
+            _evo_fig = go.Figure()
+            _evo_fig.add_trace(go.Scatter(
+                x=_evz_times, y=_evz_spot,
+                name="Nifty Spot",
+                mode="lines",
+                line=dict(color="#F59E0B", width=2.5),
+                yaxis="y1",
+                hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+            ))
+            _evo_fig.add_trace(go.Scatter(
+                x=_evz_times, y=_evz_oiw_z,
+                name=f"OI-Wtd CE/PE EV Ratio Z-Score ({_evz_lookback_label}, ±{_vd_band_n} strikes)",
+                mode="lines+markers",
+                line=dict(color="#DB2777", width=2.0),
+                marker=dict(size=4, color="#DB2777"),
+                yaxis="y2",
+                customdata=_evz_oiw_ratio,
+                hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>OI-Wtd CE/PE EV Ratio: %{customdata:.4f}"
+                              f"<extra>strike-wise, OI-weighted, ±{_vd_band_n}</extra>",
+            ))
+            # Mean (0σ) line + ±1σ / ±2σ level markers
+            _evo_fig.add_hline(y=0, yref="y2", line_dash="dot",
+                               line_color="#FBCFE8", line_width=1.5)
+            _evo_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                                   text="Mean (0σ)", font=dict(size=9, color="#DB2777"),
+                                   showarrow=False, xanchor="left")
+            for _zlvl, _zcol, _zdash in [(1, "#F9A8D4", "dash"), (-1, "#F9A8D4", "dash"),
+                                          (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+                _evo_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                                   line_color=_zcol, line_width=1)
+                _evo_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                       text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                       showarrow=False, xanchor="left")
+            _add_atm_change_annotations(_evo_fig, _evz_times, _evz_atm_k)
+            _evo_fig.update_layout(
+                title=dict(
+                    text=f"OI-Weighted CE/PE EV Ratio Z-Score — {_evz_lookback_label}  (±{_vd_band_n} strikes)  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Amber=Spot (left) · Pink=Z-Score (right) · "
+                         "&gt;+1σ/+2σ = Call premium×OI relatively rich · &lt;−1σ/−2σ = Put premium×OI relatively rich · "
+                         "Grey dash=ATM shift</span>",
+                    font=dict(size=13),
+                ),
+                height=270,
+                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=65, r=65, t=55, b=30),
+                legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                yaxis=dict(
+                    title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                    tickfont=dict(color="#F59E0B", size=9),
+                    gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                ),
+                yaxis2=dict(
+                    title=dict(text=f"OI-Wtd CE/PE EV Ratio Z-Score ({_evz_lookback_label})", font=dict(color="#DB2777")),
+                    tickfont=dict(color="#DB2777", size=9),
+                    overlaying="y", side="right",
+                    zeroline=False, autorange=True, showgrid=False,
+                ),
+                xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                           showgrid=True, gridcolor="#F3F4F6"),
+                hovermode="x unified",
+                font=dict(color="#1A1A2E", size=11),
+            )
+            st.plotly_chart(_evo_fig, use_container_width=True,
+                            config={"displayModeBar": False})
     else:
-        st.info("⏳ CE/PE EV Ratio Z-Score chart — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
+        st.info("⏳ CE/PE EV Ratio Z-Score charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
 
     # ═════════════════════════════════════════════════════════════════════════
     # LIVE GEX + VEGA INTERPRETATION ENGINE  (v3 — lot-size corrected GEX,
