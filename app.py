@@ -4237,7 +4237,14 @@ def _fetch_rollingoption_series(expiry_flag, expiry_code, offset, opt_side, inte
     strike/spot/timestamp lists, or None on failure (error_str explains why)."""
     sec = DHAN_SECURITY["NIFTY"]
     payload = {
-        "exchangeSegment": sec["seg"],
+        # H4 fix: Dhan's own /v2/charts/rollingoption example uses "NSE_FNO"
+        # here (the derivatives segment), NOT sec["seg"] ("IDX_I", the
+        # underlying index segment used by the option-chain family of
+        # endpoints). Sending "IDX_I" here is well-formed enough to get a
+        # 200/success envelope back, but Dhan just has nothing to match it
+        # to — so every strike/side silently comes back empty. This was the
+        # actual cause of "No data returned from Dhan for any strike".
+        "exchangeSegment": "NSE_FNO",
         "interval": str(interval),
         "securityId": sec["id"],
         "instrument": "OPTIDX",
@@ -4271,32 +4278,47 @@ def _bt_expiry_candidates(ref_date_str, weekly_count=6, monthly_count=3):
     derive the code, rather than guessing what a code means.
     Caveat: doesn't account for exchange holidays shifting an expiry a day
     earlier — cross-check the fetched spot path if a holiday fell near this date.
+
+    IMPORTANT constraint (root cause of "empty response for this strike/side"
+    on every strike): Dhan's rollingoption endpoint only has data for contracts
+    that have ALREADY EXPIRED as of today's real date — it's an archive of
+    settled contracts, not a live/forward-looking one. A weekly expiry that
+    hasn't happened yet (e.g. picking "this Thursday/Tuesday" while it's still
+    only Monday) returns a well-formed empty response for every single strike,
+    which looks identical to a real data-availability failure. So candidates
+    whose expiry date hasn't yet passed relative to today are filtered out
+    here — they would fail 100% of the time no matter what.
     """
     d = date.fromisoformat(ref_date_str)
+    _today = now_ist().date()
     days_ahead = (1 - d.weekday()) % 7  # Tuesday == weekday() 1
     first_tue = d + timedelta(days=days_ahead)
 
     out = []
     cur = first_tue
     for i in range(weekly_count):
-        out.append({
-            "date": cur.isoformat(), "flag": "WEEK", "code": i + 1,
-            "label": f"{cur.strftime('%d-%b-%Y')} (Tue) · Weekly, expiry #{i + 1}",
-        })
+        if cur < _today:   # only offer already-expired contracts
+            out.append({
+                "date": cur.isoformat(), "flag": "WEEK", "code": i + 1,
+                "label": f"{cur.strftime('%d-%b-%Y')} (Tue) · Weekly, expiry #{i + 1}",
+            })
         cur = cur + timedelta(days=7)
 
     probe_month_start = date(d.year, d.month, 1)
     added = 0
-    while added < monthly_count:
+    _month_guard = 0
+    while added < monthly_count and _month_guard < 24:
+        _month_guard += 1
         next_month = (date(probe_month_start.year + 1, 1, 1) if probe_month_start.month == 12
                       else date(probe_month_start.year, probe_month_start.month + 1, 1))
         last_day = next_month - timedelta(days=1)
         last_tue = last_day - timedelta(days=(last_day.weekday() - 1) % 7)
         if last_tue >= d:
-            out.append({
-                "date": last_tue.isoformat(), "flag": "MONTH", "code": added + 1,
-                "label": f"{last_tue.strftime('%d-%b-%Y')} (Tue) · Monthly, expiry #{added + 1}",
-            })
+            if last_tue < _today:   # only offer already-expired contracts
+                out.append({
+                    "date": last_tue.isoformat(), "flag": "MONTH", "code": added + 1,
+                    "label": f"{last_tue.strftime('%d-%b-%Y')} (Tue) · Monthly, expiry #{added + 1}",
+                })
             added += 1
         probe_month_start = next_month
 
@@ -4778,15 +4800,23 @@ if st.session_state.get("owner_unlocked"):
         _bt_date_str = _bt_date.isoformat()
         _bt_expiry_opts = _bt_expiry_candidates(_bt_date_str)
         with _bt_dcol3:
-            _bt_expiry_sel = st.selectbox(
-                "Expiry (for Dhan reconstruction)",
-                options=_bt_expiry_opts,
-                format_func=lambda c: c["label"],
-                key="bt_expiry_select",
-                help="Only used if this date needs Dhan reconstruction (no self-archive). "
-                     "Pick the real contract expiry you want — the app converts it to Dhan's "
-                     "internal expiryFlag/expiryCode automatically, no guessing needed.",
-            )
+            if _bt_expiry_opts:
+                _bt_expiry_sel = st.selectbox(
+                    "Expiry (for Dhan reconstruction)",
+                    options=_bt_expiry_opts,
+                    format_func=lambda c: c["label"],
+                    key="bt_expiry_select",
+                    help="Only used if this date needs Dhan reconstruction (no self-archive). "
+                         "Pick the real contract expiry you want — the app converts it to Dhan's "
+                         "internal expiryFlag/expiryCode automatically, no guessing needed.",
+                )
+            else:
+                _bt_expiry_sel = None
+                st.selectbox("Expiry (for Dhan reconstruction)", options=["— none available —"],
+                              disabled=True, key="bt_expiry_select_disabled")
+                st.caption("No already-expired contract exists for this date's cycle yet "
+                           "(Dhan's expired-options archive only covers contracts that have "
+                           "already settled) — see the note below.")
 
         if _bt_date_str in _bt_archived_dates:
             st.success(f"✅ Self-archived data available for {_bt_date_str}.")
@@ -4806,33 +4836,41 @@ if st.session_state.get("owner_unlocked"):
                 "NIFTY close before trusting anything else here.** The self-archived path above "
                 "has none of these issues since it replays this app's own live ticks."
             )
-            _bt_exp_flag = _bt_expiry_sel["flag"]
-            _bt_exp_code = _bt_expiry_sel["code"]
-            st.caption(f"Will reconstruct against the **{_bt_expiry_sel['date']}** expiry "
-                       f"({_bt_expiry_sel['flag'].title()} series).")
             _bt_day_ticks = []
-            if st.button(f"⬇️ Fetch {_bt_date_str} from Dhan", key="bt_fetch_btn"):
-                if not USE_DHAN:
-                    st.error("Dhan credentials not configured — cannot fetch historical data.")
-                else:
-                    _bt_prog = st.progress(0.0, text="Fetching strike-wise series from Dhan…")
-                    def _bt_progress_cb(done, total):
-                        _bt_prog.progress(min(1.0, done / max(total, 1)),
-                                           text=f"Fetching strike-wise series from Dhan… ({done}/{total})")
-                    _bt_ticks, _bt_err = _reconstruct_backtest_day_via_rollingoption(
-                        _bt_date_str, expiry_flag=_bt_exp_flag, expiry_code=_bt_exp_code,
-                        band_n=10, interval="1", progress_cb=_bt_progress_cb,
-                    )
-                    _bt_prog.empty()
-                    if _bt_ticks:
-                        for _t in _bt_ticks:
-                            _archive_tick_for_backtest(_t)   # cache so we don't re-fetch next time
-                        st.success(f"Reconstructed {len(_bt_ticks)} minute-ticks for {_bt_date_str} "
-                                   f"and cached them for future replays.")
-                        st.session_state["bt_day_ticks_cache"] = _bt_ticks
-                        st.rerun()
+            if _bt_expiry_sel is None:
+                st.warning(
+                    f"No fetch possible for {_bt_date_str} yet: the weekly (and monthly) "
+                    "expiries relevant to this date haven't actually expired as of today, and "
+                    "Dhan's expired-options archive only has data for settled contracts. Try an "
+                    "older backtest date, or come back after that expiry passes."
+                )
+            else:
+                _bt_exp_flag = _bt_expiry_sel["flag"]
+                _bt_exp_code = _bt_expiry_sel["code"]
+                st.caption(f"Will reconstruct against the **{_bt_expiry_sel['date']}** expiry "
+                           f"({_bt_expiry_sel['flag'].title()} series).")
+                if st.button(f"⬇️ Fetch {_bt_date_str} from Dhan", key="bt_fetch_btn"):
+                    if not USE_DHAN:
+                        st.error("Dhan credentials not configured — cannot fetch historical data.")
                     else:
-                        st.error(f"Could not reconstruct {_bt_date_str}: {_bt_err}")
+                        _bt_prog = st.progress(0.0, text="Fetching strike-wise series from Dhan…")
+                        def _bt_progress_cb(done, total):
+                            _bt_prog.progress(min(1.0, done / max(total, 1)),
+                                               text=f"Fetching strike-wise series from Dhan… ({done}/{total})")
+                        _bt_ticks, _bt_err = _reconstruct_backtest_day_via_rollingoption(
+                            _bt_date_str, expiry_flag=_bt_exp_flag, expiry_code=_bt_exp_code,
+                            band_n=10, interval="1", progress_cb=_bt_progress_cb,
+                        )
+                        _bt_prog.empty()
+                        if _bt_ticks:
+                            for _t in _bt_ticks:
+                                _archive_tick_for_backtest(_t)   # cache so we don't re-fetch next time
+                            st.success(f"Reconstructed {len(_bt_ticks)} minute-ticks for {_bt_date_str} "
+                                       f"and cached them for future replays.")
+                            st.session_state["bt_day_ticks_cache"] = _bt_ticks
+                            st.rerun()
+                        else:
+                            st.error(f"Could not reconstruct {_bt_date_str}: {_bt_err}")
             _bt_day_ticks = st.session_state.get("bt_day_ticks_cache", [])
             if _bt_day_ticks and _bt_day_ticks[0].get("ts", "")[:10] != _bt_date_str:
                 _bt_day_ticks = []   # stale cache from a different date
