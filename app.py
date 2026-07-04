@@ -6270,9 +6270,16 @@ if _gd_src is not None:
     # Zero-cross = vega exposure parity = transitional / balanced IV regime
     # Smoother than single-strike: ATM can drift ±N strikes before any jump occurs
     # ─────────────────────────────────────────────────────────────────────────
-    # Infer the band width used from the first available history entry today
-    _vd_band_n = 2   # default display label
-    for _hh in today_history:
+    # H7 fix: infer the band width from the MOST RECENT history entry, not the
+    # first. This label is shared by all 4 Z-Score chart titles (Vega Ratio +
+    # EV Ratio, raw & OI-wtd). Reading the first entry meant that changing the
+    # "ATM Vega band width" owner setting mid-session left every chart title
+    # permanently stuck on whatever band was active at the start of the day
+    # (e.g. still showing "±2 strikes" long after switching to ±5) — even
+    # though newer ticks were correctly computed with the new band. Walking
+    # backwards picks up the CURRENT effective setting instead.
+    _vd_band_n = 3   # default display label (matches the new selector default)
+    for _hh in reversed(today_history):
         if _hh.get("vega_band_strikes") is not None:
             _vd_band_n = int(_hh["vega_band_strikes"])
             break
