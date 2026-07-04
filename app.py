@@ -4788,198 +4788,218 @@ with st.container():
 #     (see _reconstruct_backtest_day_via_rollingoption above). Once fetched,
 #     the reconstruction is cached to the SAME per-day archive file so it
 #     isn't re-fetched from Dhan next time.
-if st.session_state.get("owner_unlocked"):
-    with st.expander("🕰️ Backtest Mode — Owner Only", expanded=False):
-        st.caption(
-            "Replay a past trading day. Self-recorded days (today onward) use this app's own "
-            "archived ticks. Older expired-contract dates are reconstructed on demand from "
-            "Dhan's historical option data — see the note below before trusting absolute levels."
-        )
-        _bt_archived_dates = _list_backtest_dates()
-        _bt_today_str = now_ist().date().isoformat()
+#
+# H8 fix: this whole block is wrapped in @st.fragment. Without it, the
+# `st_autorefresh(interval=60_000)` timer at the top of the script forces a
+# FULL script rerun every 60s — which tears down and rebuilds every widget
+# and chart on the page, including whatever the owner is mid-way through
+# reviewing here. Backtest Mode has zero dependency on any live-fetch
+# variable (m/spot/history/payload/df_band_records) — everything it touches
+# is a module-level function or stdlib import — so it's safe to isolate
+# completely. Wrapping it means it now only reruns in response to its OWN
+# widget interactions (date/time/expiry pickers, the fetch button), and is
+# fully immune to the live "Data refresh" cycle overwriting or resetting it.
+_st_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+if _st_fragment is None:
+    def _st_fragment(fn=None, **_kw):   # graceful degrade on old Streamlit — no isolation, same as before
+        return (fn if fn is not None else (lambda f: f))
 
-        _bt_dcol1, _bt_dcol2, _bt_dcol3 = st.columns([1, 1, 1.3])
-        with _bt_dcol1:
-            _bt_date = st.date_input(
-                "Backtest date", value=now_ist().date(),
-                min_value=date(2015, 1, 1), max_value=now_ist().date(),
-                key="bt_date_input",
-                help="Self-archived days are replayed instantly. Older dates trigger an "
-                     "on-demand Dhan historical reconstruction (takes a few seconds).",
+@_st_fragment
+def _render_backtest_mode():
+    if st.session_state.get("owner_unlocked"):
+        with st.expander("🕰️ Backtest Mode — Owner Only", expanded=False):
+            st.caption(
+                "Replay a past trading day. Self-recorded days (today onward) use this app's own "
+                "archived ticks. Older expired-contract dates are reconstructed on demand from "
+                "Dhan's historical option data — see the note below before trusting absolute levels."
             )
-        with _bt_dcol2:
-            _bt_time = st.time_input(
-                "As-of time (IST)", value=datetime.strptime("15:30", "%H:%M").time(),
-                key="bt_time_input",
-            )
-        _bt_date_str = _bt_date.isoformat()
-        _bt_expiry_opts = _bt_expiry_candidates(_bt_date_str)
-        with _bt_dcol3:
-            if _bt_expiry_opts:
-                _bt_expiry_sel = st.selectbox(
-                    "Expiry (for Dhan reconstruction)",
-                    options=_bt_expiry_opts,
-                    format_func=lambda c: c["label"],
-                    key="bt_expiry_select",
-                    help="Only used if this date needs Dhan reconstruction (no self-archive). "
-                         "Pick the real contract expiry you want — the app converts it to Dhan's "
-                         "internal expiryFlag/expiryCode automatically, no guessing needed.",
-                )
-            else:
-                _bt_expiry_sel = None
-                st.selectbox("Expiry (for Dhan reconstruction)", options=["— none available —"],
-                              disabled=True, key="bt_expiry_select_disabled")
-                st.caption("No already-expired contract exists for this date's cycle yet "
-                           "(Dhan's expired-options archive only covers contracts that have "
-                           "already settled) — see the note below.")
+            _bt_archived_dates = _list_backtest_dates()
+            _bt_today_str = now_ist().date().isoformat()
 
-        if _bt_date_str in _bt_archived_dates:
-            st.success(f"✅ Self-archived data available for {_bt_date_str}.")
-            _bt_day_ticks = _load_backtest_day(_bt_date_str)
-        elif _bt_date_str == _bt_today_str:
-            st.info("Today isn't archived yet (ticks are saved as the day progresses). "
-                    "Check back after a few refreshes.")
-            _bt_day_ticks = []
-        else:
-            st.error(
-                f"No self-archived data for {_bt_date_str}. Dhan's historical expired-options "
-                "endpoint can reconstruct it using the expiry you picked above, but treat it as "
-                "**experimental, not fully trustworthy yet** — per Dhan's own user community "
-                "(MadeForTrade forum, Nov 2025 to Jun 2026): at least one user reported "
-                "reconstructed ATM data was \"completely inaccurate... extremely wayoff\" vs "
-                "independent sources. **Cross-check the reconstructed spot path against a known "
-                "NIFTY close before trusting anything else here.** The self-archived path above "
-                "has none of these issues since it replays this app's own live ticks."
-            )
-            _bt_day_ticks = []
-            if _bt_expiry_sel is None:
-                st.warning(
-                    f"No fetch possible for {_bt_date_str} yet: the weekly (and monthly) "
-                    "expiries relevant to this date haven't actually expired as of today, and "
-                    "Dhan's expired-options archive only has data for settled contracts. Try an "
-                    "older backtest date, or come back after that expiry passes."
+            _bt_dcol1, _bt_dcol2, _bt_dcol3 = st.columns([1, 1, 1.3])
+            with _bt_dcol1:
+                _bt_date = st.date_input(
+                    "Backtest date", value=now_ist().date(),
+                    min_value=date(2015, 1, 1), max_value=now_ist().date(),
+                    key="bt_date_input",
+                    help="Self-archived days are replayed instantly. Older dates trigger an "
+                         "on-demand Dhan historical reconstruction (takes a few seconds).",
                 )
+            with _bt_dcol2:
+                _bt_time = st.time_input(
+                    "As-of time (IST)", value=datetime.strptime("15:30", "%H:%M").time(),
+                    key="bt_time_input",
+                )
+            _bt_date_str = _bt_date.isoformat()
+            _bt_expiry_opts = _bt_expiry_candidates(_bt_date_str)
+            with _bt_dcol3:
+                if _bt_expiry_opts:
+                    _bt_expiry_sel = st.selectbox(
+                        "Expiry (for Dhan reconstruction)",
+                        options=_bt_expiry_opts,
+                        format_func=lambda c: c["label"],
+                        key="bt_expiry_select",
+                        help="Only used if this date needs Dhan reconstruction (no self-archive). "
+                             "Pick the real contract expiry you want — the app converts it to Dhan's "
+                             "internal expiryFlag/expiryCode automatically, no guessing needed.",
+                    )
+                else:
+                    _bt_expiry_sel = None
+                    st.selectbox("Expiry (for Dhan reconstruction)", options=["— none available —"],
+                                  disabled=True, key="bt_expiry_select_disabled")
+                    st.caption("No already-expired contract exists for this date's cycle yet "
+                               "(Dhan's expired-options archive only covers contracts that have "
+                               "already settled) — see the note below.")
+
+            if _bt_date_str in _bt_archived_dates:
+                st.success(f"✅ Self-archived data available for {_bt_date_str}.")
+                _bt_day_ticks = _load_backtest_day(_bt_date_str)
+            elif _bt_date_str == _bt_today_str:
+                st.info("Today isn't archived yet (ticks are saved as the day progresses). "
+                        "Check back after a few refreshes.")
+                _bt_day_ticks = []
             else:
-                _bt_exp_flag = _bt_expiry_sel["flag"]
-                _bt_exp_code = _bt_expiry_sel["code"]
-                st.caption(f"Will reconstruct against the **{_bt_expiry_sel['date']}** expiry "
-                           f"({_bt_expiry_sel['flag'].title()} series).")
-                if st.button(f"⬇️ Fetch {_bt_date_str} from Dhan", key="bt_fetch_btn"):
-                    if not USE_DHAN:
-                        st.error("Dhan credentials not configured — cannot fetch historical data.")
-                    else:
-                        _bt_prog = st.progress(0.0, text="Fetching strike-wise series from Dhan…")
-                        def _bt_progress_cb(done, total):
-                            _bt_prog.progress(min(1.0, done / max(total, 1)),
-                                               text=f"Fetching strike-wise series from Dhan… ({done}/{total})")
-                        _bt_ticks, _bt_err = _reconstruct_backtest_day_via_rollingoption(
-                            _bt_date_str, expiry_flag=_bt_exp_flag, expiry_code=_bt_exp_code,
-                            band_n=10, interval="1", progress_cb=_bt_progress_cb,
-                        )
-                        _bt_prog.empty()
-                        if _bt_ticks:
-                            for _t in _bt_ticks:
-                                _archive_tick_for_backtest(_t)   # cache so we don't re-fetch next time
-                            st.success(f"Reconstructed {len(_bt_ticks)} minute-ticks for {_bt_date_str} "
-                                       f"and cached them for future replays.")
-                            st.session_state["bt_day_ticks_cache"] = _bt_ticks
-                            st.rerun()
+                st.error(
+                    f"No self-archived data for {_bt_date_str}. Dhan's historical expired-options "
+                    "endpoint can reconstruct it using the expiry you picked above, but treat it as "
+                    "**experimental, not fully trustworthy yet** — per Dhan's own user community "
+                    "(MadeForTrade forum, Nov 2025 to Jun 2026): at least one user reported "
+                    "reconstructed ATM data was \"completely inaccurate... extremely wayoff\" vs "
+                    "independent sources. **Cross-check the reconstructed spot path against a known "
+                    "NIFTY close before trusting anything else here.** The self-archived path above "
+                    "has none of these issues since it replays this app's own live ticks."
+                )
+                _bt_day_ticks = []
+                if _bt_expiry_sel is None:
+                    st.warning(
+                        f"No fetch possible for {_bt_date_str} yet: the weekly (and monthly) "
+                        "expiries relevant to this date haven't actually expired as of today, and "
+                        "Dhan's expired-options archive only has data for settled contracts. Try an "
+                        "older backtest date, or come back after that expiry passes."
+                    )
+                else:
+                    _bt_exp_flag = _bt_expiry_sel["flag"]
+                    _bt_exp_code = _bt_expiry_sel["code"]
+                    st.caption(f"Will reconstruct against the **{_bt_expiry_sel['date']}** expiry "
+                               f"({_bt_expiry_sel['flag'].title()} series).")
+                    if st.button(f"⬇️ Fetch {_bt_date_str} from Dhan", key="bt_fetch_btn"):
+                        if not USE_DHAN:
+                            st.error("Dhan credentials not configured — cannot fetch historical data.")
                         else:
-                            st.error(f"Could not reconstruct {_bt_date_str}: {_bt_err}")
-            _bt_day_ticks = st.session_state.get("bt_day_ticks_cache", [])
-            if _bt_day_ticks and _bt_day_ticks[0].get("ts", "")[:10] != _bt_date_str:
-                _bt_day_ticks = []   # stale cache from a different date
+                            _bt_prog = st.progress(0.0, text="Fetching strike-wise series from Dhan…")
+                            def _bt_progress_cb(done, total):
+                                _bt_prog.progress(min(1.0, done / max(total, 1)),
+                                                   text=f"Fetching strike-wise series from Dhan… ({done}/{total})")
+                            _bt_ticks, _bt_err = _reconstruct_backtest_day_via_rollingoption(
+                                _bt_date_str, expiry_flag=_bt_exp_flag, expiry_code=_bt_exp_code,
+                                band_n=10, interval="1", progress_cb=_bt_progress_cb,
+                            )
+                            _bt_prog.empty()
+                            if _bt_ticks:
+                                for _t in _bt_ticks:
+                                    _archive_tick_for_backtest(_t)   # cache so we don't re-fetch next time
+                                st.success(f"Reconstructed {len(_bt_ticks)} minute-ticks for {_bt_date_str} "
+                                           f"and cached them for future replays.")
+                                st.session_state["bt_day_ticks_cache"] = _bt_ticks
+                                st.rerun()
+                            else:
+                                st.error(f"Could not reconstruct {_bt_date_str}: {_bt_err}")
+                _bt_day_ticks = st.session_state.get("bt_day_ticks_cache", [])
+                if _bt_day_ticks and _bt_day_ticks[0].get("ts", "")[:10] != _bt_date_str:
+                    _bt_day_ticks = []   # stale cache from a different date
 
-        if _bt_day_ticks:
-            # Diagnostic: surface exactly how much data actually landed for the
-            # day, so a sparse/misaligned reconstruction (fetch "succeeds" but
-            # produces far fewer minute-ticks than a real 375-min session,
-            # e.g. because per-strike timestamp grids from separate Dhan calls
-            # don't line up minute-for-minute) is visible instead of silently
-            # starving the charts below with no explanation.
-            _bt_n_all = len(_bt_day_ticks)
-            _bt_ts_lo, _bt_ts_hi = _bt_day_ticks[0]["ts"][11:16], _bt_day_ticks[-1]["ts"][11:16]
-            if _bt_n_all < 100:
-                st.warning(f"Only **{_bt_n_all} minute-ticks** cover {_bt_date_str} "
-                           f"({_bt_ts_lo}–{_bt_ts_hi} IST) — a full session is ~375. This usually "
-                           "means the reconstruction only found overlapping timestamps across a "
-                           "few strikes/sides rather than a gap in the fix itself; the charts below "
-                           "need a run of consecutive minutes to compute anything.")
-            else:
-                st.caption(f"{_bt_n_all} minute-ticks loaded for {_bt_date_str} "
-                           f"({_bt_ts_lo}–{_bt_ts_hi} IST).")
-            _bt_cutoff = f"{_bt_date_str}T{_bt_time.strftime('%H:%M:%S')}"
-            _bt_ticks_upto = [h for h in _bt_day_ticks if h.get("ts", "") <= _bt_cutoff]
-            if not _bt_ticks_upto:
-                st.warning(f"No ticks recorded on {_bt_date_str} at or before "
-                           f"{_bt_time.strftime('%H:%M')}. Earliest tick that day: "
-                           f"{_bt_day_ticks[0]['ts'][11:19]}.")
-            else:
-                _bt_snap = _bt_ticks_upto[-1]
-                _bt_src_note = (" · reconstructed from Dhan historical data"
-                                 if _bt_snap.get("_source") == "dhan_rollingoption_reconstructed"
-                                 else " · self-archived (live-recorded)")
-                st.markdown(f"**Snapshot @ {_bt_snap['ts'][11:19]} IST** "
-                            f"({len(_bt_ticks_upto)} ticks since open){_bt_src_note}")
-
-                _bt_metric_defs = [
-                    ("Spot", _bt_snap.get("spot"), "{:,.2f}"),
-                    ("ATM", _bt_snap.get("atm"), "{:,.0f}"),
-                    ("ATM IV", _bt_snap.get("atm_iv"), "{:.2f}"),
-                    ("EV Ratio (raw)", _bt_snap.get("ev_ratio_avg_strikewise"), "{:.4f}"),
-                    ("EV Ratio (OI-wtd)", _bt_snap.get("ev_ratio_oiw_avg_strikewise"), "{:.4f}"),
-                    ("GEX", _bt_snap.get("gex"), "{:,.0f}"),
-                    ("PCR", _bt_snap.get("pcr"), "{:.2f}"),
-                    ("Support", _bt_snap.get("support"), "{:,.0f}"),
-                    ("Resistance", _bt_snap.get("resistance"), "{:,.0f}"),
-                    ("Max Pain", _bt_snap.get("max_pain"), "{:,.0f}"),
-                    ("Net Delta", _bt_snap.get("net_delta"), "{:,.0f}"),
-                    ("Momentum", _bt_snap.get("momentum"), "{:,.0f}"),
-                ]
-                _bt_cards_html = "".join(
-                    f'<div style="background:#fff;border:1px solid #E5E7EB;border-radius:8px;'
-                    f'padding:8px 10px;text-align:center;min-width:110px;flex:1;">'
-                    f'<div style="font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;">{lbl}</div>'
-                    f'<div style="font-size:15px;font-weight:800;color:#1A1A2E;">'
-                    f'{fmt.format(safe_num(val)) if val is not None else "—"}</div></div>'
-                    for lbl, val, fmt in _bt_metric_defs
-                )
-                st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;">'
-                             f'{_bt_cards_html}</div>', unsafe_allow_html=True)
-
-                _bt_settings = _load_owner_settings()
-                _bt_band_n   = int(_bt_settings.get("vega_band_strikes", 3))
-                _bt_tf_min   = int(_bt_settings.get("zscore_tf_minutes", 15))
-                _bt_lookback = int(_bt_settings.get("zscore_lookback_buckets", 6))
-                st.caption(f"Charts use the same owner Z-Score settings as the live view: "
-                           f"±{_bt_band_n} strikes, {_bt_tf_min}-min TF, {_bt_lookback}-bar look-back.")
-
-                _bt_spot_fig = _bt_spot_levels_chart(_bt_ticks_upto)
-                if _bt_spot_fig:
-                    st.plotly_chart(_bt_spot_fig, use_container_width=True, config={"displayModeBar": False})
+            if _bt_day_ticks:
+                # Diagnostic: surface exactly how much data actually landed for the
+                # day, so a sparse/misaligned reconstruction (fetch "succeeds" but
+                # produces far fewer minute-ticks than a real 375-min session,
+                # e.g. because per-strike timestamp grids from separate Dhan calls
+                # don't line up minute-for-minute) is visible instead of silently
+                # starving the charts below with no explanation.
+                _bt_n_all = len(_bt_day_ticks)
+                _bt_ts_lo, _bt_ts_hi = _bt_day_ticks[0]["ts"][11:16], _bt_day_ticks[-1]["ts"][11:16]
+                if _bt_n_all < 100:
+                    st.warning(f"Only **{_bt_n_all} minute-ticks** cover {_bt_date_str} "
+                               f"({_bt_ts_lo}–{_bt_ts_hi} IST) — a full session is ~375. This usually "
+                               "means the reconstruction only found overlapping timestamps across a "
+                               "few strikes/sides rather than a gap in the fix itself; the charts below "
+                               "need a run of consecutive minutes to compute anything.")
                 else:
-                    st.info("Not enough ticks yet for a spot chart at this time.")
-
-                _bt_vr_raw, _bt_vr_oiw, _ = _bt_vega_ratio_charts(_bt_ticks_upto, _bt_band_n, _bt_tf_min, _bt_lookback)
-                if _bt_vr_raw and _bt_vr_oiw:
-                    _bt_c1, _bt_c2 = st.columns(2)
-                    with _bt_c1:
-                        st.plotly_chart(_bt_vr_raw, use_container_width=True, config={"displayModeBar": False})
-                    with _bt_c2:
-                        st.plotly_chart(_bt_vr_oiw, use_container_width=True, config={"displayModeBar": False})
+                    st.caption(f"{_bt_n_all} minute-ticks loaded for {_bt_date_str} "
+                               f"({_bt_ts_lo}–{_bt_ts_hi} IST).")
+                _bt_cutoff = f"{_bt_date_str}T{_bt_time.strftime('%H:%M:%S')}"
+                _bt_ticks_upto = [h for h in _bt_day_ticks if h.get("ts", "") <= _bt_cutoff]
+                if not _bt_ticks_upto:
+                    st.warning(f"No ticks recorded on {_bt_date_str} at or before "
+                               f"{_bt_time.strftime('%H:%M')}. Earliest tick that day: "
+                               f"{_bt_day_ticks[0]['ts'][11:19]}.")
                 else:
-                    st.info("⏳ Not enough qualifying ticks for the Vega Ratio charts at this time.")
+                    _bt_snap = _bt_ticks_upto[-1]
+                    _bt_src_note = (" · reconstructed from Dhan historical data"
+                                     if _bt_snap.get("_source") == "dhan_rollingoption_reconstructed"
+                                     else " · self-archived (live-recorded)")
+                    st.markdown(f"**Snapshot @ {_bt_snap['ts'][11:19]} IST** "
+                                f"({len(_bt_ticks_upto)} ticks since open){_bt_src_note}")
 
-                _bt_ev_raw, _bt_ev_oiw, _ = _bt_ev_ratio_charts(_bt_ticks_upto, _bt_band_n, _bt_tf_min, _bt_lookback)
-                if _bt_ev_raw and _bt_ev_oiw:
-                    _bt_c3, _bt_c4 = st.columns(2)
-                    with _bt_c3:
-                        st.plotly_chart(_bt_ev_raw, use_container_width=True, config={"displayModeBar": False})
-                    with _bt_c4:
-                        st.plotly_chart(_bt_ev_oiw, use_container_width=True, config={"displayModeBar": False})
-                else:
-                    st.info("⏳ Not enough qualifying ticks for the EV Ratio charts at this time.")
-    st.divider()
+                    _bt_metric_defs = [
+                        ("Spot", _bt_snap.get("spot"), "{:,.2f}"),
+                        ("ATM", _bt_snap.get("atm"), "{:,.0f}"),
+                        ("ATM IV", _bt_snap.get("atm_iv"), "{:.2f}"),
+                        ("EV Ratio (raw)", _bt_snap.get("ev_ratio_avg_strikewise"), "{:.4f}"),
+                        ("EV Ratio (OI-wtd)", _bt_snap.get("ev_ratio_oiw_avg_strikewise"), "{:.4f}"),
+                        ("GEX", _bt_snap.get("gex"), "{:,.0f}"),
+                        ("PCR", _bt_snap.get("pcr"), "{:.2f}"),
+                        ("Support", _bt_snap.get("support"), "{:,.0f}"),
+                        ("Resistance", _bt_snap.get("resistance"), "{:,.0f}"),
+                        ("Max Pain", _bt_snap.get("max_pain"), "{:,.0f}"),
+                        ("Net Delta", _bt_snap.get("net_delta"), "{:,.0f}"),
+                        ("Momentum", _bt_snap.get("momentum"), "{:,.0f}"),
+                    ]
+                    _bt_cards_html = "".join(
+                        f'<div style="background:#fff;border:1px solid #E5E7EB;border-radius:8px;'
+                        f'padding:8px 10px;text-align:center;min-width:110px;flex:1;">'
+                        f'<div style="font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;">{lbl}</div>'
+                        f'<div style="font-size:15px;font-weight:800;color:#1A1A2E;">'
+                        f'{fmt.format(safe_num(val)) if val is not None else "—"}</div></div>'
+                        for lbl, val, fmt in _bt_metric_defs
+                    )
+                    st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;">'
+                                 f'{_bt_cards_html}</div>', unsafe_allow_html=True)
+
+                    _bt_settings = _load_owner_settings()
+                    _bt_band_n   = int(_bt_settings.get("vega_band_strikes", 3))
+                    _bt_tf_min   = int(_bt_settings.get("zscore_tf_minutes", 15))
+                    _bt_lookback = int(_bt_settings.get("zscore_lookback_buckets", 6))
+                    st.caption(f"Charts use the same owner Z-Score settings as the live view: "
+                               f"±{_bt_band_n} strikes, {_bt_tf_min}-min TF, {_bt_lookback}-bar look-back.")
+
+                    _bt_spot_fig = _bt_spot_levels_chart(_bt_ticks_upto)
+                    if _bt_spot_fig:
+                        st.plotly_chart(_bt_spot_fig, use_container_width=True, config={"displayModeBar": False})
+                    else:
+                        st.info("Not enough ticks yet for a spot chart at this time.")
+
+                    _bt_vr_raw, _bt_vr_oiw, _ = _bt_vega_ratio_charts(_bt_ticks_upto, _bt_band_n, _bt_tf_min, _bt_lookback)
+                    if _bt_vr_raw and _bt_vr_oiw:
+                        _bt_c1, _bt_c2 = st.columns(2)
+                        with _bt_c1:
+                            st.plotly_chart(_bt_vr_raw, use_container_width=True, config={"displayModeBar": False})
+                        with _bt_c2:
+                            st.plotly_chart(_bt_vr_oiw, use_container_width=True, config={"displayModeBar": False})
+                    else:
+                        st.info("⏳ Not enough qualifying ticks for the Vega Ratio charts at this time.")
+
+                    _bt_ev_raw, _bt_ev_oiw, _ = _bt_ev_ratio_charts(_bt_ticks_upto, _bt_band_n, _bt_tf_min, _bt_lookback)
+                    if _bt_ev_raw and _bt_ev_oiw:
+                        _bt_c3, _bt_c4 = st.columns(2)
+                        with _bt_c3:
+                            st.plotly_chart(_bt_ev_raw, use_container_width=True, config={"displayModeBar": False})
+                        with _bt_c4:
+                            st.plotly_chart(_bt_ev_oiw, use_container_width=True, config={"displayModeBar": False})
+                    else:
+                        st.info("⏳ Not enough qualifying ticks for the EV Ratio charts at this time.")
+        st.divider()
+
+_render_backtest_mode()   # H8 fix: isolated in @st.fragment — immune to the live 60s autorefresh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FETCH DATA
