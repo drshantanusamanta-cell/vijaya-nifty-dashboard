@@ -105,11 +105,6 @@ NIFTY_STEP       = 50
 NIFTY_LOT_SIZE   = 65   # Current NIFTY F&O lot size — multiplies GEX to match industry standard (OI×Γ×LotSize×S²×0.01)
 REFRESH_SECONDS  = 60   # default; overridden at runtime via owner settings
 
-# ─── Section 9 — Δ-Weighted Flow Engine constants (v23-4) ────────────────────
-DW_FLOW_DECAY       = 0.85   # Graph 1: decay factor per 15-min bucket (0.90=slow/trend, 0.70=fast/pre-move)
-PCR_MIN_BUCKET_OI   = 500    # Graph 3: min lots (abs call + abs put) for a reliable PCR ratio
-NORM_WINDOW_BUCKETS = 12     # Graph 1 rolling-window normaliser: buckets to look back (~3 hours)
-
 # ─── Owner sidebar  PIN-protected advanced controls ──────────────────────────
 # Dashboard is publicly readable. Owner PIN unlocks expiry, refresh, manual reload.
 _REFRESH_OPTIONS = {
@@ -2139,224 +2134,6 @@ def strategy_recommendation(bias, m, history=None):
             "color": BLUE, "market_mode": regime, "mode_color": BLUE, "iv_context": iv_ctx}
 
 
-# ─── OI Velocity  IDENTICAL to Dash app ──────────────────────────────────────
-def _zscore(arr, window):
-    if len(arr) < 2:
-        return 0.0
-    w = arr[-window:]
-    mean = w.mean(); std = w.std()
-    if std < 1e-9:
-        return 0.0
-    return float((w[-1] - mean) / std)
-
-
-def compute_oi_velocity(history):
-    sym_history = history if isinstance(history, list) else []
-    if len(sym_history) < 3:
-        return {"call_oi_velocity":0,"put_oi_velocity":0,"call_oi_accel":0,"put_oi_accel":0,
-                "call_vel_zscore":0,"put_vel_zscore":0,"alert_level":"NONE","alert_text":"Collecting data","n_ticks":0}
-
-    call_oi = np.array([safe_num(x.get("call_oi_total",0)) for x in sym_history], dtype=float)
-    put_oi  = np.array([safe_num(x.get("put_oi_total",0))  for x in sym_history], dtype=float)
-    if call_oi.max() == 0 and put_oi.max() == 0:
-        nd_arr  = np.array([safe_num(x.get("net_delta",0))    for x in sym_history], dtype=float)
-        mom_arr = np.array([safe_num(x.get("oi_net_delta",0)) for x in sym_history], dtype=float)
-        call_oi = np.maximum(nd_arr, 0) + np.maximum(mom_arr, 0)
-        put_oi  = np.maximum(-nd_arr,0) + np.maximum(-mom_arr,0)
-
-    c_vel = np.diff(call_oi); p_vel = np.diff(put_oi)
-    if len(c_vel) < 2:
-        return {"call_oi_velocity":0,"put_oi_velocity":0,"call_oi_accel":0,"put_oi_accel":0,
-                "call_vel_zscore":0,"put_vel_zscore":0,"alert_level":"NONE","alert_text":"Collecting data","n_ticks":len(sym_history)}
-
-    c_accel = float(c_vel[-1] - c_vel[-2]) if len(c_vel) >= 2 else 0.0
-    p_accel = float(p_vel[-1] - p_vel[-2]) if len(p_vel) >= 2 else 0.0
-    window  = min(10, len(c_vel))
-    c_vel_z = _zscore(c_vel, window)
-    p_vel_z = _zscore(p_vel, window)
-    max_z   = max(abs(c_vel_z), abs(p_vel_z))
-
-    if max_z >= 2.0:
-        alert_level = "DANGER"
-        side = "CALL" if abs(c_vel_z) > abs(p_vel_z) else "PUT"
-        direction = "surge" if (c_vel_z if side=="CALL" else p_vel_z) > 0 else "unwind"
-        alert_text = f"⚡ {side} OI {direction} detected  velocity {max_z:.1f}σ above norm."
-    elif max_z >= 1.2:
-        alert_level = "WATCH"
-        side = "CALL" if abs(c_vel_z) > abs(p_vel_z) else "PUT"
-        alert_text = f"⚠ {side} OI velocity elevated ({max_z:.1f}σ). Monitor closely."
-    else:
-        alert_level = "NONE"
-        alert_text  = "OI velocity within normal range."
-
-    return {"call_oi_velocity":float(c_vel[-1]),"put_oi_velocity":float(p_vel[-1]),
-            "call_oi_accel":c_accel,"put_oi_accel":p_accel,
-            "call_vel_zscore":round(c_vel_z,2),"put_vel_zscore":round(p_vel_z,2),
-            "alert_level":alert_level,"alert_text":alert_text,"n_ticks":len(sym_history)}
-
-
-# ─── Pre-move alert  IDENTICAL to Dash app ───────────────────────────────────
-def compute_pre_move_alert(m, history):
-    sym_history = history if isinstance(history, list) else []
-    fires = []; details = []
-    atm_iv = safe_num(m.get("atm_iv", 0))
-    if len(sym_history) >= 2:
-        prev_iv = safe_num(sym_history[-2].get("atm_iv", atm_iv))
-        iv_jump = atm_iv - prev_iv
-        if iv_jump >= 2.0:
-            fires.append("IV SPIKE"); details.append(f"ATM IV jumped +{iv_jump:.2f}pp this tick")
-        elif iv_jump >= 1.0:
-            details.append(f"ATM IV up +{iv_jump:.2f}pp (watch)")
-    else:
-        details.append("IV: collecting data")
-
-    oi_vel = compute_oi_velocity(sym_history)
-    if oi_vel["alert_level"] == "DANGER":
-        fires.append("OI VELOCITY"); details.append(oi_vel["alert_text"])
-    elif oi_vel["alert_level"] == "WATCH":
-        details.append(oi_vel["alert_text"])
-
-    gex = safe_num(m.get("gex", 0))
-    gamma_flip = m.get("gamma_flip")
-    atm = safe_num(m.get("atm", 0))
-    if gamma_flip and atm > 0:
-        flip_distance = abs(atm - gamma_flip)
-        wall_width = safe_num(m.get("wall_width", 400))
-        _step = max(wall_width / 20, 50)
-        proximity_threshold = max(2.0 * _step, 100)
-        # H11 fix: original `(0 <= gex < 1000 or gex < 0)` simplifies to `gex < 1000`
-        # (the `or gex < 0` clause is dead since 0<=gex<1000 already covers the
-        # 0..1000 range and `gex < 0` covers everything below 0). Intent appears to
-        # be "small positive GEX [0,1000) OR any negative GEX" → `gex < 1000`.
-        if gex < 1000 and flip_distance < proximity_threshold:
-            fires.append("GEX FLIP RISK")
-            side_note = "below flip" if atm < gamma_flip else "above flip"
-            details.append(f"GEX={'positive' if gex>=0 else 'NEGATIVE'} ({gex:,.0f}), spot {flip_distance:.0f}pts from flip @ {int(gamma_flip)} [{side_note}]")
-
-    gt_ratio = safe_num(m.get("gt_ratio", 0))
-    if gt_ratio >= 0.08 and gex < 0:
-        fires.append("HIGH G/T"); details.append(f"G/T ratio {gt_ratio:.4f} (high) with negative GEX  unstable conditions")
-    elif gt_ratio >= 0.05:
-        details.append(f"G/T ratio {gt_ratio:.4f}  gamma starting to dominate theta")
-
-    n = len(fires)
-    if n >= 3:     alert_level = "DANGER"
-    elif n >= 2:   alert_level = "WATCH"
-    elif n == 1:   alert_level = "MONITOR"
-    else:          alert_level = "NONE"
-    return {"alert_level": alert_level, "fires": fires, "details": details, "pre_move_score": n}
-
-
-# ─── Fake Breakout Score  IDENTICAL to Dash app ─────────────────────────────
-def compute_fake_breakout_score(m, history):
-    sym_history = history if isinstance(history, list) else []
-    spot       = safe_num(m.get("atm", 0))
-    support    = safe_num(m.get("support", 0))
-    resistance = safe_num(m.get("resistance", 0))
-    wall_width = safe_num(m.get("wall_width", 400))
-    step       = wall_width / 20 if wall_width > 0 else 50
-
-    if spot == 0 or support == 0 or resistance == 0:
-        return {"score":0,"side":"NONE","alert_level":"NONE","alert_text":"No data.","factor_breakdown":{}}
-
-    dist_to_res = resistance - spot; dist_to_sup = spot - support
-    near_res    = 0 < dist_to_res < 1.5 * step
-    near_sup    = 0 < dist_to_sup < 1.5 * step
-    above_res   = spot > resistance
-    below_sup   = spot < support
-
-    if not (near_res or near_sup or above_res or below_sup):
-        return {"score":0,"side":"NONE","alert_level":"NONE","alert_text":"Spot not near any wall.","factor_breakdown":{}}
-
-    side = "CALL_WALL" if (near_res or above_res) else "PUT_WALL"
-    factors = {}; score = 0
-
-    if len(sym_history) >= 2:
-        prev = sym_history[-2]
-        curr_res = safe_num(m.get("resistance", 0)); prev_res = safe_num(prev.get("resistance", curr_res))
-        curr_sup = safe_num(m.get("support", 0));    prev_sup = safe_num(prev.get("support", curr_sup))
-        _tol = max(wall_width / 20, 50)
-        if side == "CALL_WALL":
-            wall_held = abs(curr_res - prev_res) < _tol
-            f1 = 30 if wall_held else (0 if curr_res > prev_res else 15)
-            factors["Wall OI"] = (f1, "Call wall defending" if wall_held else ("Resistance shifted UP  genuine break?" if curr_res > prev_res else "Wall eroding"))
-        else:
-            wall_held = abs(curr_sup - prev_sup) < _tol
-            f1 = 30 if wall_held else (0 if curr_sup < prev_sup else 15)
-            factors["Wall OI"] = (f1, "Put wall defending" if wall_held else ("Support shifted DOWN  genuine breakdown?" if curr_sup < prev_sup else "Wall eroding"))
-    else:
-        f1 = 15; factors["Wall OI"] = (f1, "Insufficient history")
-    score += f1
-
-    atm_iv = safe_num(m.get("atm_iv", 16))
-    if len(sym_history) >= 2:
-        prev_iv = safe_num(sym_history[-2].get("atm_iv", atm_iv))
-        iv_delta = atm_iv - prev_iv
-        if above_res or below_sup:
-            if side == "CALL_WALL" and iv_delta < 0.3:
-                f2 = 25; factors["IV Confirm"] = (f2, f"IV flat/falling ({iv_delta:+.2f}pp) on upside break  fake signal")
-            elif side == "PUT_WALL" and iv_delta < 0.3:
-                f2 = 25; factors["IV Confirm"] = (f2, f"IV flat/falling ({iv_delta:+.2f}pp) on downside break  fake signal")
-            elif iv_delta >= 1.5:
-                f2 = 0; factors["IV Confirm"] = (0, f"IV surging (+{iv_delta:.2f}pp)  genuine break likely")
-            else:
-                f2 = 10; factors["IV Confirm"] = (10, f"IV mildly rising (+{iv_delta:.2f}pp)  ambiguous")
-        else:
-            f2 = 0; factors["IV Confirm"] = (0, "Spot approaching wall  IV signal pending")
-    else:
-        f2 = 0; factors["IV Confirm"] = (0, "No IV history")
-    score += f2
-
-    atm_pressure = safe_num(m.get("atm_pressure", 0))
-    if above_res and atm_pressure > 200:
-        f3 = 20; factors["ATM Pressure"] = (20, f"ATM put building ({atm_pressure:+.0f}) after upside break  fade signal")
-    elif below_sup and atm_pressure < -200:
-        f3 = 20; factors["ATM Pressure"] = (20, f"ATM call building ({atm_pressure:+.0f}) after downside break  fade signal")
-    elif abs(atm_pressure) > 100:
-        f3 = 10; factors["ATM Pressure"] = (10, f"Moderate ATM pressure ({atm_pressure:+.0f})")
-    else:
-        f3 = 0; factors["ATM Pressure"] = (0, f"ATM pressure neutral ({atm_pressure:+.0f})")
-    score += f3
-
-    gex = safe_num(m.get("gex", 0))
-    gamma_flip = m.get("gamma_flip")
-    if gex > 0 and (above_res or below_sup):
-        f4 = 15; factors["GEX Regime"] = (15, "GEX positive after wall break  dealers in range mode = FAKE")
-    elif gex > 0 and (near_res or near_sup):
-        f4 = 10; factors["GEX Regime"] = (10, "GEX positive approaching wall  range support active")
-    elif gamma_flip and spot < gamma_flip and above_res:
-        f4 = 5; factors["GEX Regime"] = (5, "Spot above resistance but below gamma flip  unstable")
-    else:
-        f4 = 0; factors["GEX Regime"] = (0, "GEX negative  trend regime supports genuine break")
-    score += f4
-
-    if len(sym_history) >= 3:
-        pcr_arr = [safe_num(x.get("pcr", 1)) for x in sym_history[-4:]]
-        pcr_delta = pcr_arr[-1] - pcr_arr[0] if len(pcr_arr) >= 2 else 0
-        if side == "CALL_WALL" and pcr_delta > 0.05:
-            f5 = 10; factors["PCR Velocity"] = (10, f"PCR rising (+{pcr_delta:.3f}) during upside break  FAKE signal")
-        elif side == "PUT_WALL" and pcr_delta < -0.05:
-            f5 = 10; factors["PCR Velocity"] = (10, f"PCR falling ({pcr_delta:.3f}) during downside break  FAKE signal")
-        else:
-            f5 = 0; factors["PCR Velocity"] = (0, f"PCR velocity neutral ({pcr_delta:+.3f})")
-    else:
-        f5 = 0; factors["PCR Velocity"] = (0, "Insufficient PCR history")
-    score += f5
-    score = max(0, min(100, score))
-
-    if score >= 65:
-        alert_level = "DANGER"
-        alert_text  = f" FAKE {side.replace('_',' ')} RISK  Score {score}/100. Consider fading."
-    elif score >= 40:
-        alert_level = "WATCH"
-        alert_text  = f"⚠ {side.replace('_',' ')} breakout unconfirmed  Score {score}/100. Wait for confirmation."
-    else:
-        alert_level = "NONE"
-        alert_text  = f"Wall approach normal  Score {score}/100."
-
-    return {"score":score,"side":side,"alert_level":alert_level,"alert_text":alert_text,"factor_breakdown":factors}
-
-
 # ── v4: Wall Strength Index REMOVED (replaced by Leading Signals panel) ──
 
 
@@ -3841,6 +3618,13 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
         "iv_rank":      m.get("iv_rank", 50),
         "gt_ratio":     m.get("gt_ratio", 0),
         "atm":          m.get("atm", 0),
+        # Bug fix: this was never copied from `m` before, so the live chart's
+        # band-width inference (`_vd_band_n`, read from history) always fell
+        # back to the hardcoded default of 2 regardless of the owner's actual
+        # "ATM Vega band width" setting — the underlying vega/EV values were
+        # always computed with the correct configured band, only the chart
+        # title/label silently showed the wrong number of strikes.
+        "vega_band_strikes": m.get("vega_band_strikes", 2),
         "call_oi_total":call_oi_total,
         "put_oi_total": put_oi_total,
         "synth_excess": synth_excess,
@@ -4008,485 +3792,6 @@ def _force_server_refresh(expiry_override=None):
         pass
 
 
-# ─── OI Velocity bucket helpers ───────────────────────────────────────────────
-def _parse_ts_to_bucket(ts_str):
-    try:
-        t_part = ts_str.split("T")[-1] if "T" in ts_str else ts_str
-        parts  = t_part.split(":")
-        hh, mm = int(parts[0]), int(parts[1])
-        return f"{hh:02d}:{(mm // 15) * 15:02d}"
-    except Exception:
-        return None
-
-
-def compute_dw_flow_buckets(sym_history):
-    """
-    v23-4 — Decay-weighted OI flow + rolling-window normaliser.
-
-    Improvement 1 — Decay-weighted running sum (replaces flat np.cumsum):
-      running[i] = DW_FLOW_DECAY × running[i-1] + bucket_net[i]
-      Older session data fades; the line stays reactive to the current regime.
-
-    Improvement 2 — Rolling-window normalised net flow:
-      net_flow_norm[i] = net_flow[i] / max(|net_flow[i-W+1..i]|)
-      Bounded [−1, +1]. Window = NORM_WINDOW_BUCKETS (default 12 × 15min ≈ 3 hr).
-    """
-    if len(sym_history) < 2:
-        return {}
-
-    _DECAY = DW_FLOW_DECAY
-
-    bucket_data = {}
-    for tick in sym_history:
-        bkt = _parse_ts_to_bucket(tick.get("ts", ""))
-        if bkt is None:
-            continue
-        if bkt not in bucket_data:
-            bucket_data[bkt] = {
-                "call_dw": [], "put_dw": [], "spot": [],
-                "gex": [], "gamma_flip": [], "max_pain": [],
-                "support": [], "resistance": [],
-            }
-        bucket_data[bkt]["call_dw"].append(safe_num(tick.get("call_dw_flow", 0)))
-        bucket_data[bkt]["put_dw"].append(safe_num(tick.get("put_dw_flow", 0)))
-        bucket_data[bkt]["spot"].append(safe_num(tick.get("spot", 0)))
-        bucket_data[bkt]["gex"].append(safe_num(tick.get("gex", 0)))
-        gf = tick.get("gamma_flip")
-        if gf is not None:
-            bucket_data[bkt]["gamma_flip"].append(safe_num(gf))
-        bucket_data[bkt]["max_pain"].append(safe_num(tick.get("max_pain", 0)))
-        bucket_data[bkt]["support"].append(safe_num(tick.get("support", 0)))
-        bucket_data[bkt]["resistance"].append(safe_num(tick.get("resistance", 0)))
-
-    labels = sorted(bucket_data.keys())
-
-    call_flow_raw = [float(np.sum(bucket_data[b]["call_dw"])) for b in labels]
-    put_flow_raw  = [float(np.sum(bucket_data[b]["put_dw"]))  for b in labels]
-    net_flow_raw  = [p - c for c, p in zip(call_flow_raw, put_flow_raw)]
-
-    # Improvement 1: Decay-weighted running totals
-    def _decay_cumsum(raw_series, decay):
-        result = []
-        running = 0.0
-        for v in raw_series:
-            running = decay * running + v
-            result.append(running)
-        return result
-
-    call_flow = _decay_cumsum(call_flow_raw, _DECAY)
-    put_flow  = _decay_cumsum(put_flow_raw,  _DECAY)
-    net_flow  = _decay_cumsum(net_flow_raw,  _DECAY)
-
-    # Improvement 2: Rolling-window normaliser
-    _net_flow_norm_list = []
-    for _ni, _nv in enumerate(net_flow):
-        if NORM_WINDOW_BUCKETS is None:
-            _win = net_flow[:_ni + 1]
-        else:
-            _win = net_flow[max(0, _ni - NORM_WINDOW_BUCKETS + 1): _ni + 1]
-        _denom = max((abs(v) for v in _win), default=1.0)
-        _denom = max(_denom, 1.0)
-        _net_flow_norm_list.append(float(np.clip(_nv / _denom, -1.0, 1.0)))
-    net_flow_norm = _net_flow_norm_list
-
-    _session_max = max(
-        (abs(v) for v in net_flow[max(0, len(net_flow) - (NORM_WINDOW_BUCKETS or len(net_flow))):]),
-        default=1.0,
-    )
-    _session_max = max(_session_max, 1.0)
-
-    spot_close  = [float(np.mean(bucket_data[b]["spot"]))   for b in labels]
-    gex_mean    = [float(np.mean(bucket_data[b]["gex"]))    for b in labels]
-
-    def _last_valid(lst): return lst[-1] if lst else None
-    gamma_flip_v  = [_last_valid(bucket_data[b]["gamma_flip"])  for b in labels]
-    max_pain_v    = [float(np.mean(bucket_data[b]["max_pain"])) for b in labels]
-    support_v     = [float(np.mean(bucket_data[b]["support"]))  for b in labels]
-    resistance_v  = [float(np.mean(bucket_data[b]["resistance"])) for b in labels]
-
-    all_dw = [abs(v) for v in call_flow_raw + put_flow_raw]
-    delta_active = any(v > 1000 for v in all_dw)
-
-    return {
-        "labels"        : labels,
-        "call_flow"     : call_flow,
-        "put_flow"      : put_flow,
-        "net_flow"      : net_flow,
-        "net_flow_norm" : net_flow_norm,
-        "net_flow_raw"  : net_flow_raw,
-        "spot"          : spot_close,
-        "gex"           : gex_mean,
-        "gamma_flip"    : gamma_flip_v,
-        "max_pain"      : max_pain_v,
-        "support"       : support_v,
-        "resistance"    : resistance_v,
-        "delta_active"  : delta_active,
-        "decay"         : _DECAY,
-        "session_max"   : _session_max,
-    }
-
-
-def compute_raw_oi_buckets(sym_history):
-    """
-    v23-4 — Raw (non-delta-weighted) OI change into 15-min buckets.
-    PCR-of-Flow = put_oi_added[bucket] / call_oi_added[bucket] − 1 per bucket.
-    Volume guard: total < PCR_MIN_BUCKET_OI → signal clamped to 0.
-    """
-    if len(sym_history) < 2:
-        return {}
-
-    _MIN_BUCKET_OI = PCR_MIN_BUCKET_OI
-
-    bucket_data = {}
-    for i, tick in enumerate(sym_history):
-        bkt = _parse_ts_to_bucket(tick.get("ts", ""))
-        if bkt is None:
-            continue
-        if bkt not in bucket_data:
-            bucket_data[bkt] = {
-                "call_chg": [], "put_chg": [],
-                "spot": [], "gex": [],
-                "gamma_flip": [], "max_pain": [],
-                "support": [], "resistance": [],
-            }
-        if i == 0:
-            c_chg = p_chg = 0.0
-        else:
-            prev  = sym_history[i - 1]
-            c_chg = safe_num(tick.get("call_oi_total", 0)) - safe_num(prev.get("call_oi_total", 0))
-            p_chg = safe_num(tick.get("put_oi_total",  0)) - safe_num(prev.get("put_oi_total",  0))
-        bucket_data[bkt]["call_chg"].append(c_chg)
-        bucket_data[bkt]["put_chg"].append(p_chg)
-        bucket_data[bkt]["spot"].append(safe_num(tick.get("spot", 0)))
-        bucket_data[bkt]["gex"].append(safe_num(tick.get("gex", 0)))
-        gf = tick.get("gamma_flip")
-        if gf is not None:
-            bucket_data[bkt]["gamma_flip"].append(safe_num(gf))
-        bucket_data[bkt]["max_pain"].append(safe_num(tick.get("max_pain", 0)))
-        bucket_data[bkt]["support"].append(safe_num(tick.get("support", 0)))
-        bucket_data[bkt]["resistance"].append(safe_num(tick.get("resistance", 0)))
-
-    labels = sorted(bucket_data.keys())
-
-    call_chg_raw = [float(np.sum(bucket_data[b]["call_chg"])) for b in labels]
-    put_chg_raw  = [float(np.sum(bucket_data[b]["put_chg"]))  for b in labels]
-
-    call_chg = list(float(v) for v in np.cumsum(call_chg_raw))
-    put_chg  = list(float(v) for v in np.cumsum(put_chg_raw))
-    net_raw  = [p - c for c, p in zip(call_chg, put_chg)]
-
-    # PCR-of-Flow per bucket
-    pcr_flow_signal = []
-    pcr_flow_raw    = []
-    for c, p in zip(call_chg_raw, put_chg_raw):
-        total = abs(c) + abs(p)
-        if total < _MIN_BUCKET_OI:
-            pcr_flow_signal.append(0.0)
-            pcr_flow_raw.append(1.0)
-        else:
-            c_abs = max(abs(c), 1.0)
-            p_abs = max(abs(p), 1.0)
-            ratio = p_abs / c_abs
-            pcr_flow_signal.append(float(np.clip(ratio - 1.0, -5.0, 5.0)))
-            pcr_flow_raw.append(float(ratio))
-
-    spot_close = [float(np.mean(bucket_data[b]["spot"])) for b in labels]
-
-    def _last_valid(lst): return lst[-1] if lst else None
-    gamma_flip_v = [_last_valid(bucket_data[b]["gamma_flip"])    for b in labels]
-    max_pain_v   = [float(np.mean(bucket_data[b]["max_pain"]))   for b in labels]
-    support_v    = [float(np.mean(bucket_data[b]["support"]))    for b in labels]
-    resistance_v = [float(np.mean(bucket_data[b]["resistance"])) for b in labels]
-
-    return {
-        "labels"          : labels,
-        "call_chg"        : call_chg,
-        "put_chg"         : put_chg,
-        "net_raw"         : net_raw,
-        "pcr_flow_signal" : pcr_flow_signal,
-        "pcr_flow_raw"    : pcr_flow_raw,
-        "spot"            : spot_close,
-        "gamma_flip"      : gamma_flip_v,
-        "max_pain"        : max_pain_v,
-        "support"         : support_v,
-        "resistance"      : resistance_v,
-        "min_bucket_oi"   : _MIN_BUCKET_OI,
-    }
-
-
-def compute_gamma_blast_monitor(bkt: dict, m: dict, alert: dict, spot_px: float = 0.0) -> dict:
-    """
-    Compute a gamma blast risk score (0-100) and stage from existing Section 9 signals.
-    Identical logic to the Dash app version — grounded in already-computed values only.
-
-    Stage 1 STRUCTURAL SETUP  : score  1–24  (preconditions present)
-    Stage 2 PRESSURE BUILDING : score 25–54  (G/T rising, persistent flow)
-    Stage 3 IMMINENT BLAST    : score 55–79  (Section 8 fires active)
-    Stage 4 BLAST IN MOTION   : score 80–100 (all conditions met)
-    CLEAR                     : score 0
-    """
-    score   = 0
-    signals = []   # list of (label, value_str, pts, hex_color)
-
-    gex      = safe_num(m.get("gex", 0))
-    gflip    = safe_num(m.get("gamma_flip", 0))
-    wall_w   = safe_num(m.get("wall_width", 400))
-    gt_ratio = safe_num(m.get("gt_ratio", 0))
-    # Fix #1: m dict from compute_metrics() never has a "spot" key.
-    # Use the explicitly passed spot_px (module-level `spot` from payload).
-    # Fall back to ATM strike (≈ spot within ±25 pts) so the score is always live.
-    spot     = safe_num(spot_px) if spot_px else safe_num(m.get("atm", 0))
-
-    # ── Stage 1 (max 30 pts) ──────────────────────────────────────────────────
-    if gex < 0:
-        score += 15
-        signals.append(("GEX Sign", f"{gex:,.0f} (negative)", 15, "#DC2626"))
-    elif 0 <= gex < 1000:
-        score += 10
-        signals.append(("GEX Sign", f"{gex:,.0f} (near-zero)", 10, "#D97706"))
-    else:
-        signals.append(("GEX Sign", f"{gex:,.0f} (positive)", 0, "#059669"))
-
-    if gflip > 0 and spot > 0:
-        _thresh = max(2.0 * wall_w / 20, 100)
-        flip_dist = abs(spot - gflip)
-        if spot < gflip:
-            score += 15
-            signals.append(("Flip Position", f"Spot {flip_dist:.0f}pts BELOW flip", 15, "#DC2626"))
-        elif flip_dist <= _thresh:
-            score += 10
-            signals.append(("Flip Position", f"Spot {flip_dist:.0f}pts from flip (≤{_thresh:.0f})", 10, "#D97706"))
-        else:
-            signals.append(("Flip Position", f"Spot {flip_dist:.0f}pts above flip", 0, "#059669"))
-    else:
-        signals.append(("Flip Position", "N/A", 0, "#6B7280"))
-
-    # ── Stage 2 (max 30 pts) ──────────────────────────────────────────────────
-    if gt_ratio >= 0.08 and gex < 0:
-        score += 15
-        signals.append(("G/T Ratio", f"{gt_ratio:.4f} — HIGH G/T fire", 15, "#DC2626"))
-    elif gt_ratio >= 0.05:
-        score += 8
-        signals.append(("G/T Ratio", f"{gt_ratio:.4f} — watch zone", 8, "#D97706"))
-    else:
-        signals.append(("G/T Ratio", f"{gt_ratio:.4f} — normal", 0, "#059669"))
-
-    net_flow = bkt.get("net_flow", [])
-    if len(net_flow) >= 3:
-        last3     = net_flow[-3:]
-        neg_count = sum(1 for v in last3 if v < 0)
-        pos_count = sum(1 for v in last3 if v > 0)
-        if neg_count >= 2:
-            score += 10
-            signals.append(("Flow Direction", f"{neg_count}/3 buckets bearish", 10, "#DC2626"))
-        elif pos_count >= 2:
-            signals.append(("Flow Direction", f"{pos_count}/3 buckets bullish", 0, "#059669"))
-        else:
-            signals.append(("Flow Direction", "Mixed", 0, "#6B7280"))
-        if len(net_flow) >= 2:
-            accel = net_flow[-1] - net_flow[-2]
-            if accel < 0 and neg_count >= 2:
-                score += 5
-                signals.append(("Flow Accel", "Bearish & accelerating ↓", 5, "#DC2626"))
-            elif accel > 0 and pos_count >= 2:
-                signals.append(("Flow Accel", "Bullish & accelerating ↑", 0, "#059669"))
-            else:
-                signals.append(("Flow Accel", f"Δ {accel:+.1f} — decelerating/mixed", 0, "#6B7280"))
-    else:
-        signals.append(("Flow Direction", "< 3 buckets — building", 0, "#6B7280"))
-
-    # ── Stage 3 (from Pre-Move Alert fires, max 45 pts) ───────────────────────
-    fires = alert.get("fires", [])
-    pre_move_score = alert.get("pre_move_score", 0)
-    _fire_pts = {"IV_SPIKE": 8, "OI_VELOCITY": 12, "GEX_FLIP_RISK": 15, "HIGH_GT": 10}
-    for fk, pts in _fire_pts.items():
-        fired = any(fk.replace("_", " ").lower() in str(f).lower() or
-                    fk.lower() in str(f).lower() for f in fires)
-        if fired:
-            score += pts
-            signals.append((f"🔥 {fk.replace('_',' ')}", "S8 fire", pts, "#DC2626"))
-
-    score = min(100, score)
-
-    if score == 0:
-        stage, s_col, s_bg = "CLEAR",                "#059669", "#ECFDF5"
-    elif score < 25:
-        stage, s_col, s_bg = "STAGE 1 — STRUCTURAL", "#0F766E", "#F0FDFA"
-    elif score < 55:
-        stage, s_col, s_bg = "STAGE 2 — PRESSURE",   "#B45309", "#FFFBEB"
-    elif score < 80:
-        stage, s_col, s_bg = "STAGE 3 — IMMINENT",   "#DC2626", "#FEF2F2"
-    else:
-        stage, s_col, s_bg = "STAGE 4 — BLAST",      "#7C3AED", "#F5F3FF"
-
-    if score == 0:
-        note = "No blast preconditions. GEX positive, spot above flip — dealers absorbing."
-    elif score < 25:
-        note = "Structural preconditions present. Monitor G/T ratio and flow direction."
-    elif score < 55:
-        note = "Pressure building. G/T rising and/or persistent bearish flow. Watch Section 8 fires."
-    elif score < 80:
-        note = "⚠️ Imminent blast. Section 8 fires active. Spot near or through flip. Act or protect now."
-    else:
-        note = "🚨 Blast in motion. All conditions met. IV spike likely imminent."
-
-    return {
-        "score": score, "stage": stage, "s_col": s_col, "s_bg": s_bg,
-        "signals": signals, "note": note, "pre_move_score": pre_move_score,
-    }
-
-
-def compute_dw_composite_bias(bkt, expiry_str=None):
-    """
-    Composite bias score −100 to +100 from:
-      35% — Net delta flow direction + momentum
-      25% — Delta flow acceleration (last bucket vs prev)
-      20% — GEX sign & magnitude
-      20% — Gamma flip side (spot above/below flip)
-      Max pain gravity: only weighted on expiry week (Thurs/Fri)
-    """
-    if not bkt or len(bkt.get("labels", [])) < 2:
-        return {"score": 0, "direction": "NEUTRAL", "confidence": 0,
-                "components": {}, "narrative": "Insufficient data — need 2+ buckets."}
-
-    labels   = bkt["labels"]
-    net_flow = bkt["net_flow"]
-    gex_arr  = bkt["gex"]
-    gf_arr   = bkt["gamma_flip"]
-    spot_arr = bkt["spot"]
-    # CHANGE 4 (audit fix): use the RAW (un-decayed) net flow for normalization.
-    # `compute_dw_flow_buckets` exposes `net_flow_raw` alongside the decay-weighted
-    # `net_flow`. With DW_FLOW_DECAY=0.85, the decayed series grows monotonically
-    # under sustained flow (steady state ≈ X / (1-0.85) = 6.67X). Normalizing
-    # decayed flow_3 against decayed session_max therefore saturates near ±1.0
-    # after a few consistent buckets — destroying magnitude differentiation
-    # between "mild sustained" and "strong sustained" sessions.
-    # Using raw on both sides preserves the magnitude signal while keeping the
-    # decayed series available for the display label.
-    net_flow_raw = bkt.get("net_flow_raw", net_flow)  # fallback to decayed if missing
-
-    recent_flow     = net_flow[-1]                                # decayed (for label)
-    flow_3          = float(np.mean(net_flow[-3:])) if len(net_flow) >= 3 else recent_flow   # decayed (for label)
-    recent_flow_raw = net_flow_raw[-1]
-    flow_3_raw      = float(np.mean(net_flow_raw[-3:])) if len(net_flow_raw) >= 3 else recent_flow_raw
-    session_range_raw = max(abs(f) for f in net_flow_raw) if any(f != 0 for f in net_flow_raw) else 1.0
-    session_range   = session_range_raw                           # for label consistency
-
-    flow_norm = max(-1.0, min(1.0, flow_3_raw / max(session_range_raw, 1.0)))
-    c1_score  = round(flow_norm * 35, 1)
-    c1_label  = (f"Net Δ-flow (PUT−CALL): {flow_3:+,.0f}  "
-                 f"({'PUT dominant — bullish' if flow_3 > 0 else 'CALL dominant — bearish'})  "
-                 f"[session max (raw): {session_range:,.0f}]")
-
-    if len(net_flow_raw) >= 2:
-        # Acceleration: use RAW flow change so the signal reflects genuine
-        # per-bucket delta, not the smoothed decayed difference.
-        accel      = net_flow_raw[-1] - net_flow_raw[-2]
-        accel_norm = max(-1.0, min(1.0, accel / max(session_range_raw, 1.0)))
-        c2_score   = round(accel_norm * 25, 1)
-        c2_label   = (f"Flow accel (PUT−CALL): {accel:+,.0f}  "
-                      f"({'PUT accelerating ↑' if accel_norm > 0.1 else 'CALL accelerating ↓' if accel_norm < -0.1 else 'steady →'})")
-    else:
-        c2_score, c2_label = 0, "Acceleration: need 2+ buckets"
-
-    gex_now = gex_arr[-1] if gex_arr else 0
-    if gex_now > 0:
-        # FIX (Issue 1): was +10 bull / -20 bear — undocumented structural tilt.
-        # Now symmetric ±10: both regimes carry equal directional weight.
-        # Short-gamma danger is captured by the Fake Breakout engine (Section 8).
-        c3_score = +10
-        c3_label = f"GEX +{gex_now:,.0f} (long-gamma regime — pinning tendency)"
-    elif gex_now < 0:
-        c3_score = -10
-        c3_label = f"GEX {gex_now:,.0f} (short-gamma — trending/amplifying regime)"
-    else:
-        c3_score, c3_label = 0, "GEX near zero — unstable transition"
-
-    spot_now = spot_arr[-1] if spot_arr else 0
-    gf_now   = next((g for g in reversed(gf_arr) if g is not None), None)
-    if gf_now and spot_now > 0:
-        dist      = spot_now - gf_now
-        dist_norm = max(-1.0, min(1.0, dist / max(abs(dist) + 1e-9, 500)))
-        c4_score  = round(dist_norm * 20, 1)
-        side_lbl  = "above flip (stable)" if dist > 0 else "BELOW flip (short-gamma danger)"
-        c4_label  = f"Spot {dist:+.0f}pts from flip @ {gf_now:,.0f} — {side_lbl}"
-    else:
-        c4_score, c4_label = 0, "Gamma flip not available"
-
-    c5_score, c5_label = 0, "Max pain: not expiry week (no weight)"
-    if expiry_str:
-        try:
-            exp_date    = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-            days_to_exp = (exp_date - date.today()).days
-            if days_to_exp <= 2:
-                mp_now = bkt["max_pain"][-1] if bkt["max_pain"] else 0
-                if mp_now > 0 and spot_now > 0:
-                    pull      = mp_now - spot_now
-                    pull_norm = max(-1.0, min(1.0, pull / 500))
-                    c5_score  = round(pull_norm * 10, 1)
-                    c5_label  = f"Max pain gravity: {pull:+.0f}pts toward {mp_now:,.0f} ({days_to_exp}d to exp)"
-        except Exception:
-            pass
-
-    total_score = max(-100, min(100, c1_score + c2_score + c3_score + c4_score + c5_score))
-
-    if total_score >= 45:
-        direction = "BULLISH"
-    elif total_score >= 15:
-        direction = "MILD BULLISH"
-    elif total_score <= -45:
-        direction = "BEARISH"
-    elif total_score <= -15:
-        direction = "MILD BEARISH"
-    else:
-        direction = "NEUTRAL"
-
-    # FIX (Issue 2): confidence was purely abs(total_score)*multiplier — a monotonic
-    # transform of score magnitude that ignores whether components actually agree.
-    # Now: count how many scored components agree in sign with the direction,
-    # blend 60% agreement ratio + 40% score magnitude for a richer signal.
-    _all_comp_scores = [c1_score, c2_score, c3_score, c4_score]
-    if c5_score != 0:
-        _all_comp_scores.append(c5_score)
-    _total_sign = 1 if total_score > 0 else (-1 if total_score < 0 else 0)
-    if _total_sign == 0:
-        confidence = max(0, 100 - int(abs(total_score) * 3))
-    else:
-        _agree = sum(1 for s in _all_comp_scores if s * _total_sign > 0)
-        _n     = len(_all_comp_scores)
-        _agree_pct = _agree / _n if _n > 0 else 0.0
-        _mag_norm  = min(1.0, abs(total_score) / 100.0)
-        confidence = min(100, max(0, int((_agree_pct * 0.60 + _mag_norm * 0.40) * 100)))
-
-    _delta_ok  = bkt.get("delta_active", False)
-    _flow_note = (
-        f"Net Δ-flow (PUT−CALL) {'positive — PUT dominant (bullish)' if flow_3 > 0 else 'negative — CALL dominant (bearish)'}"
-        if _delta_ok
-        else "⚠️ Δ-flow zero or proxy only — bias reflects GEX + flip, NOT delta flow"
-    )
-    narrative = (
-        f"{_flow_note} | "
-        f"GEX {'long-gamma (range-bound)' if gex_now > 0 else 'short-gamma (amplifying)'} | "
-        f"{'Above' if (gf_now and spot_now > gf_now) else 'Below'} gamma flip"
-        + (f" | Max pain pull {c5_label}" if c5_score != 0 else "")
-    )
-
-    return {
-        "score"      : round(total_score, 1),
-        "direction"  : direction,
-        "confidence" : confidence,
-        "components" : {
-            "net_flow_dir" : (c1_score, c1_label),
-            "flow_accel"   : (c2_score, c2_label),
-            "gex_regime"   : (c3_score, c3_label),
-            "flip_side"    : (c4_score, c4_label),
-            "max_pain"     : (c5_score, c5_label),
-        },
-        "narrative"  : narrative,
-        "delta_active": bkt.get("delta_active", False),
-    }
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SERVER-SIDE PERSISTENT STATE: History + Settings + Bias/Smile history
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4561,6 +3866,520 @@ def _save_history(history):
             _atomic_json_write(_HISTORY_FILE, history[-500:])
         except Exception:
             pass
+
+# ── Backtest day-archive (full-resolution, one file per trading day) ─────────
+# `_HISTORY_FILE` above only keeps a rolling ~500-tick window, which is not
+# enough to look back at an arbitrary past date. Every new tick is ALSO
+# appended to a per-day file here so the owner-only Backtest Mode module can
+# replay any day since this feature was added. Note: Dhan's API has no
+# historical option-chain endpoint (only live/current chain data), so days
+# before this archiving started cannot be backfilled — only days going
+# forward from deployment are backtestable.
+_BACKTEST_DIR            = os.path.join(_BASE_DIR, "nifty_backtest_archive")
+_BACKTEST_RETENTION_DAYS = 90   # auto-prune archive files older than this
+_backtest_prune_cache    = {"ts": 0.0}
+_BACKTEST_PRUNE_TTL      = 6 * 3600.0   # only glob+prune at most every 6h
+
+def _backtest_day_path(date_str):
+    return os.path.join(_BACKTEST_DIR, f"nifty_backtest_{date_str}.json")
+
+def _archive_tick_for_backtest(hist_entry):
+    """Append one tick to today's day-archive file (separate from the
+    rolling 500-tick _HISTORY_FILE). Safe to call every tick — dedup is the
+    caller's responsibility (same tick-dedup guard used for _save_history)."""
+    ts = hist_entry.get("ts", "")
+    date_str = ts.split("T")[0] if "T" in ts else ts[:10]
+    if not date_str:
+        return
+    try:
+        os.makedirs(_BACKTEST_DIR, exist_ok=True)
+    except Exception:
+        return
+    path = _backtest_day_path(date_str)
+    with _persist_lock:
+        try:
+            try:
+                with open(path, "r") as f:
+                    day_ticks = json.load(f)
+                    if not isinstance(day_ticks, list):
+                        day_ticks = []
+            except Exception:
+                day_ticks = []
+            day_ticks.append(hist_entry)
+            _atomic_json_write(path, day_ticks)
+        except Exception:
+            pass
+    _maybe_prune_backtest_archive()
+
+def _load_backtest_day(date_str):
+    """Load all archived ticks for one calendar date (YYYY-MM-DD). Returns []
+    if no archive exists for that date (e.g. before archiving was enabled, a
+    non-trading day, or a future date)."""
+    path = _backtest_day_path(date_str)
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def _list_backtest_dates():
+    """Return sorted list of YYYY-MM-DD strings that have an archive file."""
+    try:
+        os.makedirs(_BACKTEST_DIR, exist_ok=True)
+        names = os.listdir(_BACKTEST_DIR)
+    except Exception:
+        return []
+    dates = []
+    prefix, suffix = "nifty_backtest_", ".json"
+    for n in names:
+        if n.startswith(prefix) and n.endswith(suffix):
+            d = n[len(prefix):-len(suffix)]
+            if len(d) == 10:
+                dates.append(d)
+    return sorted(dates)
+
+def _maybe_prune_backtest_archive():
+    """Delete day-archive files older than _BACKTEST_RETENTION_DAYS. Throttled
+    to run at most once per _BACKTEST_PRUNE_TTL so we're not doing a disk
+    glob on every single tick."""
+    now = time.time()
+    if now - _backtest_prune_cache["ts"] < _BACKTEST_PRUNE_TTL:
+        return
+    _backtest_prune_cache["ts"] = now
+    try:
+        cutoff = (now_ist().date() - timedelta(days=_BACKTEST_RETENTION_DAYS)).isoformat()
+        for d in _list_backtest_dates():
+            if d < cutoff:
+                try:
+                    os.remove(_backtest_day_path(d))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+# ── Backtest Mode chart builders ──────────────────────────────────────────────
+# Standalone counterparts of the live Vega-Ratio / EV-Ratio Z-Score chart pairs
+# (Section: "ATM Band Vega Ratio" / "CE/PE EV Ratio"), parameterized over an
+# arbitrary tick list (a backtest day's archive, filtered up to a chosen time)
+# instead of `today_history`, and taking the owner's TF/look-back/band-width
+# settings as explicit arguments rather than re-reading them — so the same
+# settings that govern the live charts can be reused to plot the requested
+# historical window without re-running any of the live-page code.
+def _bt_make_tf_buckets(ts_list, cols, freq_min):
+    _idx = pd.to_datetime(ts_list)
+    _df = pd.DataFrame(cols)
+    _df["bucket"] = _idx.floor(f"{freq_min}min")
+    return _df.groupby("bucket", as_index=True).last().sort_index()
+
+def _bt_bucket_zscore(series, window_buckets):
+    _roll = series.rolling(window_buckets, min_periods=2)
+    _mean = _roll.mean()
+    _std  = _roll.std(ddof=0)
+    _z = (series - _mean) / _std.replace(0, np.nan)
+    return _z.fillna(0.0).round(3)
+
+def _bt_add_atm_change_annotations(fig, times, atm_ks):
+    _prev = None
+    for _ti, _ak in zip(times, atm_ks):
+        if _ak and _ak != _prev and _prev is not None:
+            fig.add_vline(x=_ti, line_dash="dash", line_color="#6B7280",
+                          line_width=1, opacity=0.5)
+            fig.add_annotation(x=_ti, y=0.95, xref="x", yref="paper",
+                               text=f"ATM→{_ak:,}", font=dict(size=8, color="#6B7280"),
+                               showarrow=False, xanchor="left")
+        _prev = _ak
+
+def _bt_vega_ratio_charts(tick_list, band_n, tf_min, lookback_n):
+    """Backtest counterpart of the live 'Raw / OI-Wtd Vega Ratio Z-Score' pair.
+    Returns (fig_raw, fig_oiw, lookback_label) or (None, None, None) if the
+    tick list doesn't have enough qualifying points to plot."""
+    times, spot_l, atm_k = [], [], []
+    raw_ratio, oiw_ratio, ts_full = [], [], []
+    for h in tick_list:
+        cv_raw, pv_raw = h.get("atm_call_vega_raw"), h.get("atm_put_vega_raw")
+        cv_oiw, pv_oiw = h.get("atm_call_vega"), h.get("atm_put_vega")
+        if (cv_raw is not None and pv_raw is not None and float(pv_raw) != 0 and
+                cv_oiw is not None and pv_oiw is not None and float(pv_oiw) != 0 and
+                h.get("spot")):
+            ts_full.append(h["ts"]); times.append(h["ts"][11:19])
+            spot_l.append(float(h["spot"]))
+            raw_ratio.append(round(float(cv_raw) / float(pv_raw), 4))
+            oiw_ratio.append(round(float(cv_oiw) / float(pv_oiw), 4))
+            atm_k.append(int(h.get("atm", 0)))
+    if len(ts_full) < 2:
+        return None, None, None
+
+    bkt = _bt_make_tf_buckets(ts_full, {"spot": spot_l, "atm": atm_k,
+                                         "raw_ratio": raw_ratio, "oiw_ratio": oiw_ratio}, tf_min)
+    times     = bkt.index.strftime("%H:%M").tolist()
+    spot_l    = bkt["spot"].tolist()
+    atm_k     = bkt["atm"].astype(int).tolist()
+    raw_ratio = bkt["raw_ratio"].tolist()
+    oiw_ratio = bkt["oiw_ratio"].tolist()
+    raw_z     = _bt_bucket_zscore(bkt["raw_ratio"], lookback_n).tolist()
+    oiw_z     = _bt_bucket_zscore(bkt["oiw_ratio"], lookback_n).tolist()
+    lookback_label = f"{lookback_n}×{tf_min}m bars ({lookback_n * tf_min}min lookback)"
+    if len(times) < 2:
+        return None, None, None
+
+    def _mk(y_z, ratio_cd, name, color, mean_col, band_col, label, extra):
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=times, y=spot_l, name="Nifty Spot", mode="lines",
+                                  line=dict(color="#F59E0B", width=2.5), yaxis="y1",
+                                  hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>"))
+        fig.add_trace(go.Scatter(x=times, y=y_z, name=name, mode="lines+markers",
+                                  line=dict(color=color, width=2.0), marker=dict(size=4, color=color),
+                                  yaxis="y2", customdata=ratio_cd,
+                                  hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>"
+                                                f"Ratio: %{{customdata:.4f}}<extra>{extra}</extra>"))
+        fig.add_hline(y=0, yref="y2", line_dash="dot", line_color=mean_col, line_width=1.5)
+        fig.add_annotation(x=1, y=0, xref="paper", yref="y2", text="Mean (0σ)",
+                            font=dict(size=9, color=color), showarrow=False, xanchor="left")
+        for zlvl, zcol, zdash in [(1, band_col, "dash"), (-1, band_col, "dash"),
+                                   (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+            fig.add_hline(y=zlvl, yref="y2", line_dash=zdash, line_color=zcol, line_width=1)
+            fig.add_annotation(x=1, y=zlvl, xref="paper", yref="y2", text=f"{zlvl:+d}σ",
+                                font=dict(size=8, color=zcol), showarrow=False, xanchor="left")
+        _bt_add_atm_change_annotations(fig, times, atm_k)
+        fig.update_layout(
+            title=dict(text=f"{label} — {lookback_label}  (±{band_n} strikes)", font=dict(size=13)),
+            height=270, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=65, r=65, t=55, b=30),
+            legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+            yaxis=dict(title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                       tickfont=dict(color="#F59E0B", size=9), gridcolor="#F3F4F6",
+                       autorange=True, showgrid=True),
+            yaxis2=dict(title=dict(text=f"{label} Z-Score", font=dict(color=color)),
+                        tickfont=dict(color=color, size=9), overlaying="y", side="right",
+                        zeroline=False, autorange=True, showgrid=False),
+            xaxis=dict(tickfont=dict(size=9), title="Time (IST)", showgrid=True, gridcolor="#F3F4F6"),
+            hovermode="x unified", font=dict(color="#1A1A2E", size=11),
+        )
+        return fig
+
+    fig_raw = _mk(raw_z, raw_ratio, f"Raw Vega Ratio Z-Score ({lookback_label}, ±{band_n} strikes)",
+                  "#7C3AED", "#C4B5FD", "#A78BFA", "Raw Vega Ratio Z-Score", "Σcall_vega / Σput_vega")
+    fig_oiw = _mk(oiw_z, oiw_ratio, f"OI-Wtd Vega Ratio Z-Score ({lookback_label}, ±{band_n} strikes)",
+                  "#0891B2", "#A5F3FC", "#67E8F9", "OI-Wtd Vega Ratio Z-Score", "ΣOI×call_vega / ΣOI×put_vega")
+    return fig_raw, fig_oiw, lookback_label
+
+def _bt_ev_ratio_charts(tick_list, band_n, tf_min, lookback_n):
+    """Backtest counterpart of the live 'Raw / OI-Wtd CE/PE EV Ratio Z-Score' pair."""
+    times, spot_l, atm_k = [], [], []
+    raw_ratio, oiw_ratio, ts_full = [], [], []
+    for h in tick_list:
+        evr, evr_oiw = h.get("ev_ratio_avg_strikewise"), h.get("ev_ratio_oiw_avg_strikewise")
+        if evr is not None and evr_oiw is not None and h.get("spot"):
+            ts_full.append(h["ts"]); times.append(h["ts"][11:19])
+            spot_l.append(float(h["spot"]))
+            raw_ratio.append(float(evr)); oiw_ratio.append(float(evr_oiw))
+            atm_k.append(int(h.get("atm", 0)))
+    if len(ts_full) < 2:
+        return None, None, None
+
+    bkt = _bt_make_tf_buckets(ts_full, {"spot": spot_l, "atm": atm_k,
+                                         "raw_ratio": raw_ratio, "oiw_ratio": oiw_ratio}, tf_min)
+    times     = bkt.index.strftime("%H:%M").tolist()
+    spot_l    = bkt["spot"].tolist()
+    atm_k     = bkt["atm"].astype(int).tolist()
+    raw_ratio = bkt["raw_ratio"].tolist()
+    oiw_ratio = bkt["oiw_ratio"].tolist()
+    raw_z     = _bt_bucket_zscore(bkt["raw_ratio"], lookback_n).tolist()
+    oiw_z     = _bt_bucket_zscore(bkt["oiw_ratio"], lookback_n).tolist()
+    lookback_label = f"{lookback_n}×{tf_min}m bars ({lookback_n * tf_min}min lookback)"
+    if len(times) < 2:
+        return None, None, None
+
+    def _mk(y_z, ratio_cd, name, color, mean_col, band_col, label, extra):
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=times, y=spot_l, name="Nifty Spot", mode="lines",
+                                  line=dict(color="#F59E0B", width=2.5), yaxis="y1",
+                                  hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>"))
+        fig.add_trace(go.Scatter(x=times, y=y_z, name=name, mode="lines+markers",
+                                  line=dict(color=color, width=2.0), marker=dict(size=4, color=color),
+                                  yaxis="y2", customdata=ratio_cd,
+                                  hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>"
+                                                f"Ratio: %{{customdata:.4f}}<extra>{extra}</extra>"))
+        fig.add_hline(y=0, yref="y2", line_dash="dot", line_color=mean_col, line_width=1.5)
+        fig.add_annotation(x=1, y=0, xref="paper", yref="y2", text="Mean (0σ)",
+                            font=dict(size=9, color=color), showarrow=False, xanchor="left")
+        for zlvl, zcol, zdash in [(1, band_col, "dash"), (-1, band_col, "dash"),
+                                   (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+            fig.add_hline(y=zlvl, yref="y2", line_dash=zdash, line_color=zcol, line_width=1)
+            fig.add_annotation(x=1, y=zlvl, xref="paper", yref="y2", text=f"{zlvl:+d}σ",
+                                font=dict(size=8, color=zcol), showarrow=False, xanchor="left")
+        _bt_add_atm_change_annotations(fig, times, atm_k)
+        fig.update_layout(
+            title=dict(text=f"{label} — {lookback_label}  (±{band_n} strikes)", font=dict(size=13)),
+            height=270, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=65, r=65, t=55, b=30),
+            legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+            yaxis=dict(title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                       tickfont=dict(color="#F59E0B", size=9), gridcolor="#F3F4F6",
+                       autorange=True, showgrid=True),
+            yaxis2=dict(title=dict(text=f"{label} Z-Score", font=dict(color=color)),
+                        tickfont=dict(color=color, size=9), overlaying="y", side="right",
+                        zeroline=False, autorange=True, showgrid=False),
+            xaxis=dict(tickfont=dict(size=9), title="Time (IST)", showgrid=True, gridcolor="#F3F4F6"),
+            hovermode="x unified", font=dict(color="#1A1A2E", size=11),
+        )
+        return fig
+
+    fig_raw = _mk(raw_z, raw_ratio, f"Raw CE/PE EV Ratio Z-Score ({lookback_label}, ±{band_n} strikes)",
+                  "#059669", "#A7F3D0", "#6EE7B7", "Raw CE/PE EV Ratio Z-Score", "strike-wise avg")
+    fig_oiw = _mk(oiw_z, oiw_ratio, f"OI-Wtd CE/PE EV Ratio Z-Score ({lookback_label}, ±{band_n} strikes)",
+                  "#DB2777", "#FBCFE8", "#F9A8D4", "OI-Wtd CE/PE EV Ratio Z-Score", "strike-wise OI-weighted")
+    return fig_raw, fig_oiw, lookback_label
+
+def _bt_spot_levels_chart(tick_list):
+    """Intraday Nifty spot line (from market open through the selected time)
+    with the session's Support / Resistance / Max Pain / Gamma Flip drawn as
+    reference lines, using the last available tick's levels as the session
+    snapshot — mirrors the style used elsewhere in the live dashboard."""
+    times, spot_l = [], []
+    for h in tick_list:
+        if h.get("spot"):
+            times.append(h["ts"][11:19])
+            spot_l.append(float(h["spot"]))
+    if len(times) < 2:
+        return None
+    last = tick_list[-1]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=times, y=spot_l, name="Nifty Spot", mode="lines",
+                              line=dict(color="#F59E0B", width=2.5),
+                              hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>"))
+    gf_val  = safe_num(last.get("gamma_flip", 0))
+    mp_val  = safe_num(last.get("max_pain", 0))
+    sup_val = safe_num(last.get("support", 0))
+    res_val = safe_num(last.get("resistance", 0))
+    if gf_val:
+        fig.add_hline(y=gf_val, line_dash="dash", line_color="#F59E0B", line_width=1.8,
+                      annotation_text=f"Gamma Flip {gf_val:,.0f}", annotation_position="top left",
+                      annotation_font=dict(color="#F59E0B", size=10))
+    if mp_val:
+        fig.add_hline(y=mp_val, line_dash="dot", line_color="#6B7280", line_width=1.5,
+                      annotation_text=f"Max Pain {mp_val:,.0f}", annotation_position="bottom right",
+                      annotation_font=dict(color="#6B7280", size=10))
+    if sup_val:
+        fig.add_hline(y=sup_val, line_dash="dash", line_color="#059669", line_width=2,
+                      annotation_text=f"Support {sup_val:,.0f}", annotation_position="top left",
+                      annotation_font=dict(color="#059669", size=10))
+    if res_val:
+        fig.add_hline(y=res_val, line_dash="dash", line_color="#DC2626", line_width=2,
+                      annotation_text=f"Resistance {res_val:,.0f}", annotation_position="bottom left",
+                      annotation_font=dict(color="#DC2626", size=10))
+    fig.update_layout(
+        title=dict(text="Backtest — Intraday Spot vs Key Levels  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Amber=Spot · Green=Support · Red=Resistance · Grey=Max Pain · "
+                         "Amber dash=Gamma Flip</span>", font=dict(size=13)),
+        height=320, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=55, r=20, t=55, b=30),
+        legend=dict(orientation="h", y=1.15, font=dict(size=10)),
+        yaxis=dict(title="Nifty Spot", gridcolor="#F3F4F6", showgrid=True),
+        xaxis=dict(title="Time (IST)", tickfont=dict(size=9), showgrid=True, gridcolor="#F3F4F6"),
+        font=dict(color="#1A1A2E", size=11),
+    )
+    return fig
+
+# ── Backtest Mode: Dhan historical reconstruction (expired options) ──────────
+# Beyond the self-archived days above (today onward), Dhan's v2 API exposes a
+# SEPARATE endpoint for expired option contracts — /v2/charts/rollingoption —
+# that returns per-minute OHLC + IV + OI + spot for a given relative strike
+# (ATM, ATM+1, ATM-1, ... up to ATM±10 for index options) going back up to 5
+# years. It does NOT return a full chain snapshot in one call (one call =
+# one relative strike + one side), so we make one call per strike-offset per
+# side, reassemble a per-minute chain, derive Greeks with the SAME
+# Black-Scholes engine used live (_bs_greeks — rollingoption gives IV, not
+# Greeks), and run each minute through the EXISTING compute_metrics() /
+# build_history_entry() pipeline. This guarantees the reconstructed EV Ratio,
+# Vega Ratio, GEX etc. are computed identically to how the live dashboard
+# computes them — not a re-implementation that could quietly drift.
+#
+# KNOWN UNCERTAINTY (flagging honestly rather than guessing silently):
+# Dhan's docs specify `expiryFlag` ("WEEK"/"MONTH") and `expiryCode` (integer)
+# as required request fields but only point to the Instrument List page for
+# meaning, which documents SEM_EXPIRY_CODE for FUTURES contracts — it does not
+# fully specify how expiryCode indexes options expiries for this endpoint.
+# We default to expiryCode=0 (interpreted as "the expiry nearest the requested
+# date range") and expiryFlag="WEEK", exposed as an Advanced override in the
+# UI. This could not be verified against a live Dhan account in this
+# environment — if the reconstructed spot path looks inconsistent with known
+# NIFTY closes for that day, try adjusting expiryCode/expiryFlag.
+# Likewise, the exact time-to-expiry used for Greek derivation is APPROXIMATED
+# (nearest Thursday for weekly, since the endpoint doesn't echo back the
+# resolved expiry date) — this mainly affects Vega/Theta magnitude, less so
+# Delta, so EV-ratio and directional reads are more robust than absolute vega
+# levels from this path.
+_ROLLINGOPTION_PACE_SEC = 0.25   # ~4 req/sec sustained (below Dhan's 5 req/sec Data-API ceiling)
+
+def _rollingoption_strike_label(offset):
+    if offset == 0:
+        return "ATM"
+    return f"ATM+{offset}" if offset > 0 else f"ATM{offset}"   # offset already negative → "ATM-3"
+
+def _fetch_rollingoption_series(expiry_flag, expiry_code, offset, opt_side, interval, from_date, to_date):
+    """One call to /v2/charts/rollingoption for a single relative strike + side.
+    Returns (block_dict, error_str). block_dict has open/high/low/close/iv/oi/
+    strike/spot/timestamp lists, or None on failure (error_str explains why)."""
+    sec = DHAN_SECURITY["NIFTY"]
+    payload = {
+        "exchangeSegment": sec["seg"],
+        "interval": str(interval),
+        "securityId": sec["id"],
+        "instrument": "OPTIDX",
+        "expiryFlag": expiry_flag,
+        "expiryCode": expiry_code,
+        "strike": _rollingoption_strike_label(offset),
+        "drvOptionType": opt_side,
+        "requiredData": ["open", "high", "low", "close", "iv", "volume", "strike", "oi", "spot"],
+        "fromDate": from_date,
+        "toDate": to_date,
+    }
+    try:
+        resp = _dhan_post("https://api.dhan.co/v2/charts/rollingoption", payload, timeout=20)
+    except (DhanAPIError, Exception) as e:
+        return None, str(e)
+    data = resp.get("data") or {}
+    side_key = "ce" if opt_side == "CALL" else "pe"
+    block = data.get(side_key) or {}
+    if not block or not block.get("timestamp"):
+        return None, "empty response for this strike/side"
+    return block, None
+
+def _reconstruct_backtest_day_via_rollingoption(target_date_str, expiry_flag="WEEK", expiry_code=0,
+                                                 band_n=10, interval="1", progress_cb=None):
+    """Pull ATM±band_n CE+PE rolling-option series for one day from Dhan and
+    reconstruct per-minute tick dicts (same schema as build_history_entry) by
+    replaying each minute's chain through the existing compute_metrics/
+    build_history_entry pipeline. Returns (list_of_tick_dicts, error_str_or_None).
+    See module comment above for the expiryCode/expiry-date caveats."""
+    if not USE_DHAN:
+        return [], "Dhan credentials not configured"
+
+    from_date = target_date_str
+    to_date = (datetime.strptime(target_date_str, "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
+
+    offsets = list(range(-band_n, band_n + 1))
+    series = {}
+    errors = []
+    n_calls, total_calls = 0, len(offsets) * 2
+    for off in offsets:
+        for side in ("CALL", "PUT"):
+            block, err = _fetch_rollingoption_series(expiry_flag, expiry_code, off, side,
+                                                       interval, from_date, to_date)
+            n_calls += 1
+            if block is None:
+                errors.append(f"{_rollingoption_strike_label(off)}/{side}: {err}")
+            else:
+                series[(off, side)] = block
+            if progress_cb:
+                try:
+                    progress_cb(n_calls, total_calls)
+                except Exception:
+                    pass
+            time.sleep(_ROLLINGOPTION_PACE_SEC)   # stay well under the 5 req/sec Data API limit
+
+    if not series:
+        return [], "No data returned from Dhan for any strike (" + "; ".join(errors[:3]) + ")"
+
+    # Reassemble into per-timestamp chains: ts -> {"CALL": {strike: row}, "PUT": {strike: row}}
+    by_ts = {}
+    for (off, side), block in series.items():
+        ts_list = block.get("timestamp") or []
+        for i, ts in enumerate(ts_list):
+            def _at(key, _i=i, _blk=block):
+                arr = _blk.get(key) or []
+                return arr[_i] if _i < len(arr) else None
+            strike_val = _at("strike")
+            if strike_val is None:
+                continue
+            row = {
+                "strike": safe_num(strike_val),
+                "ltp":    safe_num(_at("close")),
+                "iv":     safe_num(_at("iv")),
+                "oi":     int(safe_num(_at("oi"))),
+                "spot":   safe_num(_at("spot")),
+            }
+            by_ts.setdefault(ts, {"CALL": {}, "PUT": {}})[side][row["strike"]] = row
+
+    if not by_ts:
+        return [], "Dhan returned series but no aligned per-minute rows could be parsed"
+
+    ordered_ts = sorted(by_ts.keys())
+    ticks = []
+    prev_oi = {"CALL": {}, "PUT": {}}
+    for ts in ordered_ts:
+        snap = by_ts[ts]
+        calls, puts = snap["CALL"], snap["PUT"]
+        strikes = sorted(set(calls.keys()) | set(puts.keys()))
+        if len(strikes) < 3:
+            continue
+        spot_vals = [r["spot"] for r in list(calls.values()) + list(puts.values()) if r.get("spot")]
+        if not spot_vals:
+            continue
+        spot_px = float(np.median(spot_vals))
+
+        rows = []
+        for K in strikes:
+            c = calls.get(K, {}); p = puts.get(K, {})
+            c_oi, p_oi = int(c.get("oi", 0) or 0), int(p.get("oi", 0) or 0)
+            c_prev = prev_oi["CALL"].get(K, c_oi)
+            p_prev = prev_oi["PUT"].get(K, p_oi)
+            rows.append({
+                "strike": K,
+                "call_ltp": c.get("ltp", 0.0), "call_oi": c_oi, "call_oi_chg": c_oi - c_prev,
+                "call_iv":  c.get("iv", 0.0),
+                "call_delta": 0.0, "call_gamma": 0.0, "call_theta": 0.0, "call_vega": 0.0,
+                "put_ltp":  p.get("ltp", 0.0), "put_oi": p_oi, "put_oi_chg": p_oi - p_prev,
+                "put_iv":   p.get("iv", 0.0),
+                "put_delta": 0.0, "put_gamma": 0.0, "put_theta": 0.0, "put_vega": 0.0,
+            })
+            prev_oi["CALL"][K] = c_oi
+            prev_oi["PUT"][K]  = p_oi
+
+        df_min = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+
+        # Approximate expiry date for Black-Scholes T (see module caveat above):
+        # nearest Thursday on/after the tick's date for weekly, else month-end.
+        _tick_dt = datetime.utcfromtimestamp(ts)
+        _tick_date = _tick_dt.date()
+        if expiry_flag == "WEEK":
+            _days_to_thu = (3 - _tick_date.weekday()) % 7
+            _approx_expiry = _tick_date + timedelta(days=_days_to_thu)
+        else:
+            _nxt = _tick_date.replace(day=28) + timedelta(days=4)
+            _approx_expiry = _nxt - timedelta(days=_nxt.day)
+        _T = max((_approx_expiry - _tick_date).days, 0.5) / 365.0
+
+        for i, row in df_min.iterrows():
+            K = row["strike"]
+            if row["call_iv"] and spot_px > 0:
+                d, g, th, ve = _bs_greeks(spot_px, K, _T, RISK_FREE_RATE, row["call_iv"] / 100.0, "CE")
+                df_min.at[i, "call_delta"] = d; df_min.at[i, "call_gamma"] = g
+                df_min.at[i, "call_theta"] = th; df_min.at[i, "call_vega"] = ve
+            if row["put_iv"] and spot_px > 0:
+                d, g, th, ve = _bs_greeks(spot_px, K, _T, RISK_FREE_RATE, row["put_iv"] / 100.0, "PE")
+                df_min.at[i, "put_delta"] = d; df_min.at[i, "put_gamma"] = g
+                df_min.at[i, "put_theta"] = th; df_min.at[i, "put_vega"] = ve
+
+        try:
+            m = compute_metrics(df_min, spot_px, expiry=_approx_expiry.isoformat(), history=None)
+        except Exception:
+            continue
+        if not m:
+            continue
+        call_oi_total = float(df_min["call_oi"].sum())
+        put_oi_total  = float(df_min["put_oi"].sum())
+        entry = build_history_entry(m, spot_px, call_oi_total, put_oi_total, _approx_expiry.isoformat())
+        entry["ts"] = _tick_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        entry["_source"] = "dhan_rollingoption_reconstructed"   # transparency flag for the UI
+        ticks.append(entry)
+
+    if not ticks:
+        return [], "Parsed rows but none produced valid metrics (possibly too few strikes per minute)"
+    return ticks, ("; ".join(errors[:3]) if errors else None)
 
 # ── Owner settings (refresh interval, selected expiry) ───────────────────────
 def _load_owner_settings():
@@ -4709,13 +4528,6 @@ div[data-testid="stMetric"] { background:#fff; border-radius:10px; padding:10px 
 [data-testid="block-container"] {
   max-width: 100% !important;
   overflow-x: hidden !important;
-}
-/* Section 9 sentiment indicator cards ─ wrap gracefully on narrow screens */
-.s9-ind-row { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
-.s9-ind-card {
-  flex: 1 1 140px; min-width:120px;
-  background:#fff; border-radius:10px; padding:10px 12px;
-  text-align:center; box-sizing:border-box;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -4872,6 +4684,168 @@ with st.container():
                     unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BACKTEST MODE (Owner Only)
+# ─────────────────────────────────────────────────────────────────────────────
+# Two data sources, auto-selected by date:
+#  1. Self-archive  every tick this app has ever recorded is saved to
+#     nifty_backtest_archive/nifty_backtest_<date>.json (see _archive_tick_for_backtest,
+#     wired in below the data-fetch section). Full-fidelity, but only covers
+#     today onward from whenever this feature was deployed.
+#  2. Dhan historical (expired options)  for older dates with no self-archive,
+#     reconstructed on demand from Dhan's /v2/charts/rollingoption endpoint
+#     (see _reconstruct_backtest_day_via_rollingoption above). Once fetched,
+#     the reconstruction is cached to the SAME per-day archive file so it
+#     isn't re-fetched from Dhan next time.
+if st.session_state.get("owner_unlocked"):
+    with st.expander("🕰️ Backtest Mode — Owner Only", expanded=False):
+        st.caption(
+            "Replay a past trading day. Self-recorded days (today onward) use this app's own "
+            "archived ticks. Older expired-contract dates are reconstructed on demand from "
+            "Dhan's historical option data — see the note below before trusting absolute levels."
+        )
+        _bt_archived_dates = _list_backtest_dates()
+        _bt_today_str = now_ist().date().isoformat()
+
+        _bt_dcol1, _bt_dcol2 = st.columns(2)
+        with _bt_dcol1:
+            _bt_date = st.date_input(
+                "Backtest date", value=now_ist().date(),
+                min_value=date(2015, 1, 1), max_value=now_ist().date(),
+                key="bt_date_input",
+                help="Self-archived days are replayed instantly. Older dates trigger an "
+                     "on-demand Dhan historical reconstruction (takes a few seconds).",
+            )
+        with _bt_dcol2:
+            _bt_time = st.time_input(
+                "As-of time (IST)", value=datetime.strptime("15:30", "%H:%M").time(),
+                key="bt_time_input",
+            )
+        _bt_date_str = _bt_date.isoformat()
+
+        if _bt_date_str in _bt_archived_dates:
+            st.success(f"✅ Self-archived data available for {_bt_date_str}.")
+            _bt_day_ticks = _load_backtest_day(_bt_date_str)
+        elif _bt_date_str == _bt_today_str:
+            st.info("Today isn't archived yet (ticks are saved as the day progresses). "
+                    "Check back after a few refreshes.")
+            _bt_day_ticks = []
+        else:
+            st.warning(
+                f"No self-archived data for {_bt_date_str}. It can be reconstructed from Dhan's "
+                "historical expired-options endpoint (rolling ATM±10, derived Greeks via the "
+                "same Black-Scholes engine used live). **Expiry-code resolution and time-to-"
+                "expiry are best-effort approximations** — not verified against a live Dhan "
+                "account in this build, so treat absolute vega/theta-driven levels with caution; "
+                "directional reads (EV ratio, spot path) are more robust."
+            )
+            with st.expander("Advanced: expiry resolution override", expanded=False):
+                _bt_exp_flag = st.selectbox("Expiry flag", ["WEEK", "MONTH"], key="bt_exp_flag")
+                _bt_exp_code = st.number_input("Expiry code", min_value=0, max_value=10, value=0,
+                                                step=1, key="bt_exp_code")
+            _bt_exp_flag = st.session_state.get("bt_exp_flag", "WEEK")
+            _bt_exp_code = int(st.session_state.get("bt_exp_code", 0))
+            _bt_day_ticks = []
+            if st.button(f"⬇️ Fetch {_bt_date_str} from Dhan", key="bt_fetch_btn"):
+                if not USE_DHAN:
+                    st.error("Dhan credentials not configured — cannot fetch historical data.")
+                else:
+                    _bt_prog = st.progress(0.0, text="Fetching strike-wise series from Dhan…")
+                    def _bt_progress_cb(done, total):
+                        _bt_prog.progress(min(1.0, done / max(total, 1)),
+                                           text=f"Fetching strike-wise series from Dhan… ({done}/{total})")
+                    _bt_ticks, _bt_err = _reconstruct_backtest_day_via_rollingoption(
+                        _bt_date_str, expiry_flag=_bt_exp_flag, expiry_code=_bt_exp_code,
+                        band_n=10, interval="1", progress_cb=_bt_progress_cb,
+                    )
+                    _bt_prog.empty()
+                    if _bt_ticks:
+                        for _t in _bt_ticks:
+                            _archive_tick_for_backtest(_t)   # cache so we don't re-fetch next time
+                        st.success(f"Reconstructed {len(_bt_ticks)} minute-ticks for {_bt_date_str} "
+                                   f"and cached them for future replays.")
+                        st.session_state["bt_day_ticks_cache"] = _bt_ticks
+                        st.rerun()
+                    else:
+                        st.error(f"Could not reconstruct {_bt_date_str}: {_bt_err}")
+            _bt_day_ticks = st.session_state.get("bt_day_ticks_cache", [])
+            if _bt_day_ticks and _bt_day_ticks[0].get("ts", "")[:10] != _bt_date_str:
+                _bt_day_ticks = []   # stale cache from a different date
+
+        if _bt_day_ticks:
+            _bt_cutoff = f"{_bt_date_str}T{_bt_time.strftime('%H:%M:%S')}"
+            _bt_ticks_upto = [h for h in _bt_day_ticks if h.get("ts", "") <= _bt_cutoff]
+            if not _bt_ticks_upto:
+                st.warning(f"No ticks recorded on {_bt_date_str} at or before "
+                           f"{_bt_time.strftime('%H:%M')}. Earliest tick that day: "
+                           f"{_bt_day_ticks[0]['ts'][11:19]}.")
+            else:
+                _bt_snap = _bt_ticks_upto[-1]
+                _bt_src_note = (" · reconstructed from Dhan historical data"
+                                 if _bt_snap.get("_source") == "dhan_rollingoption_reconstructed"
+                                 else " · self-archived (live-recorded)")
+                st.markdown(f"**Snapshot @ {_bt_snap['ts'][11:19]} IST** "
+                            f"({len(_bt_ticks_upto)} ticks since open){_bt_src_note}")
+
+                _bt_metric_defs = [
+                    ("Spot", _bt_snap.get("spot"), "{:,.2f}"),
+                    ("ATM", _bt_snap.get("atm"), "{:,.0f}"),
+                    ("ATM IV", _bt_snap.get("atm_iv"), "{:.2f}"),
+                    ("EV Ratio (raw)", _bt_snap.get("ev_ratio_avg_strikewise"), "{:.4f}"),
+                    ("EV Ratio (OI-wtd)", _bt_snap.get("ev_ratio_oiw_avg_strikewise"), "{:.4f}"),
+                    ("GEX", _bt_snap.get("gex"), "{:,.0f}"),
+                    ("PCR", _bt_snap.get("pcr"), "{:.2f}"),
+                    ("Support", _bt_snap.get("support"), "{:,.0f}"),
+                    ("Resistance", _bt_snap.get("resistance"), "{:,.0f}"),
+                    ("Max Pain", _bt_snap.get("max_pain"), "{:,.0f}"),
+                    ("Net Delta", _bt_snap.get("net_delta"), "{:,.0f}"),
+                    ("Momentum", _bt_snap.get("momentum"), "{:,.0f}"),
+                ]
+                _bt_cards_html = "".join(
+                    f'<div style="background:#fff;border:1px solid #E5E7EB;border-radius:8px;'
+                    f'padding:8px 10px;text-align:center;min-width:110px;flex:1;">'
+                    f'<div style="font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;">{lbl}</div>'
+                    f'<div style="font-size:15px;font-weight:800;color:#1A1A2E;">'
+                    f'{fmt.format(safe_num(val)) if val is not None else "—"}</div></div>'
+                    for lbl, val, fmt in _bt_metric_defs
+                )
+                st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;">'
+                             f'{_bt_cards_html}</div>', unsafe_allow_html=True)
+
+                _bt_settings = _load_owner_settings()
+                _bt_band_n   = int(_bt_settings.get("vega_band_strikes", 2))
+                _bt_tf_min   = int(_bt_settings.get("zscore_tf_minutes", 15))
+                _bt_lookback = int(_bt_settings.get("zscore_lookback_buckets", 6))
+                st.caption(f"Charts use the same owner Z-Score settings as the live view: "
+                           f"±{_bt_band_n} strikes, {_bt_tf_min}-min TF, {_bt_lookback}-bar look-back.")
+
+                _bt_spot_fig = _bt_spot_levels_chart(_bt_ticks_upto)
+                if _bt_spot_fig:
+                    st.plotly_chart(_bt_spot_fig, use_container_width=True, config={"displayModeBar": False})
+                else:
+                    st.info("Not enough ticks yet for a spot chart at this time.")
+
+                _bt_vr_raw, _bt_vr_oiw, _ = _bt_vega_ratio_charts(_bt_ticks_upto, _bt_band_n, _bt_tf_min, _bt_lookback)
+                if _bt_vr_raw and _bt_vr_oiw:
+                    _bt_c1, _bt_c2 = st.columns(2)
+                    with _bt_c1:
+                        st.plotly_chart(_bt_vr_raw, use_container_width=True, config={"displayModeBar": False})
+                    with _bt_c2:
+                        st.plotly_chart(_bt_vr_oiw, use_container_width=True, config={"displayModeBar": False})
+                else:
+                    st.info("⏳ Not enough qualifying ticks for the Vega Ratio charts at this time.")
+
+                _bt_ev_raw, _bt_ev_oiw, _ = _bt_ev_ratio_charts(_bt_ticks_upto, _bt_band_n, _bt_tf_min, _bt_lookback)
+                if _bt_ev_raw and _bt_ev_oiw:
+                    _bt_c3, _bt_c4 = st.columns(2)
+                    with _bt_c3:
+                        st.plotly_chart(_bt_ev_raw, use_container_width=True, config={"displayModeBar": False})
+                    with _bt_c4:
+                        st.plotly_chart(_bt_ev_oiw, use_container_width=True, config={"displayModeBar": False})
+                else:
+                    st.info("⏳ Not enough qualifying ticks for the EV Ratio charts at this time.")
+    st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FETCH DATA
 # ─────────────────────────────────────────────────────────────────────────────
 # H24 fix: previously `st.spinner(...)` wrapped get_server_data unconditionally,
@@ -4926,7 +4900,15 @@ hist_entry["_df_band_records"] = df_band_records  # Enhanced NDM: store per-stri
 # Only append if this is a genuinely new Dhan data fetch (fetch_ts changed)
 if not history or history[-1].get("_fetch_ts", 0) != _payload_fetch_ts:
     history.append(hist_entry)
-    _save_history(history)   # persist new tick to disk
+    _save_history(history)   # persist new tick to disk (rolling ~500-tick window)
+    # Also archive to the per-day file (Backtest Mode) — a lean copy without
+    # the large internal-only `_df_band_records` per-strike LTP snapshot.
+    try:
+        _bt_copy = {k: v for k, v in hist_entry.items()
+                    if k not in ("_df_band_records", "_fetch_ts")}
+        _archive_tick_for_backtest(_bt_copy)
+    except Exception:
+        pass
 history = history[-500:]
 st.session_state.history = history
 
@@ -7969,845 +7951,6 @@ with metrics_col:
               <div style="font-size:16px;font-weight:800;color:{color};">{val}</div>
             </div>
             """, unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 8: PRE-MOVE ALERT + FAKE BREAKOUT + OI VELOCITY
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">⚡ Section 8 — Pre-Move Alert | Fake Breakout Detector | OI Velocity</div>', unsafe_allow_html=True)
-
-alert   = compute_pre_move_alert(m, history)
-fbo     = compute_fake_breakout_score(m, history)
-oi_vel  = compute_oi_velocity(history)
-
-# Pre-move alert banner
-level_map = {"NONE":("alert-none","✅ Pre-Move Monitor: All Clear","#059669"),
-             "MONITOR":("alert-none"," Pre-Move Monitor: 1 Signal  Monitor","#2563EB"),
-             "WATCH":("alert-watch","⚠️ Pre-Move Monitor: Stay Alert","#D97706"),
-             "DANGER":("alert-danger"," Pre-Move Monitor: Elevated Move Risk","#DC2626")}
-css_cls, title_txt, txt_col = level_map.get(alert["alert_level"], level_map["NONE"])
-fires_str = "    ".join(alert["fires"]) if alert["fires"] else ""
-details_str = " | ".join(alert["details"][:4])
-st.markdown(f"""
-<div class="{css_cls}">
-  <div style="font-weight:700;font-size:14px;color:{txt_col};">{title_txt}  (Score: {alert['pre_move_score']}/4)</div>
-  {f'<div style="font-size:12px;font-weight:600;color:{txt_col};margin-top:4px;">Active: {fires_str}</div>' if fires_str else ''}
-  <div style="font-size:12px;color:{txt_col};margin-top:4px;line-height:1.6;">{details_str}</div>
-</div>
-""", unsafe_allow_html=True)
-
-# FBO + WSI + OI Velocity cards
-fbo_col, vel_col = st.columns([2, 2])
-with fbo_col:
-    fbo_colors = {"NONE":BLUE,"WATCH":AMBER,"DANGER":RED}
-    fc = fbo_colors.get(fbo["alert_level"], BLUE)
-    st.markdown(f"""
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <span style="font-size:11px;font-weight:700;color:#1A1A2E;text-transform:uppercase;">Fake Breakout Score</span>
-        <span style="font-size:22px;font-weight:800;color:{fc};">{fbo['score']} / 100</span>
-      </div>
-      <div style="font-size:12px;font-weight:600;color:{fc};padding:6px 8px;background:#F9FAFB;border-radius:6px;margin-bottom:8px;">{fbo['alert_text']}</div>
-      {''.join(f'<div style="display:flex;justify-content:space-between;border-bottom:1px solid #E5E7EB;padding:4px 0;"><span style="font-size:11px;font-weight:600;color:#374151;">{k}</span><span style="font-size:11px;color:#6B7280;flex:1;margin:0 8px;">{v[1]}</span><span style="font-size:12px;font-weight:700;color:{"#DC2626" if v[0]>=20 else "#D97706" if v[0]>=10 else "#6B7280"};">+{v[0]}</span></div>' for k,v in fbo.get("factor_breakdown",{}).items())}
-    </div>
-    """, unsafe_allow_html=True)
-
-with vel_col:
-    vel_c_col = RED if oi_vel["call_vel_zscore"]>=2 else (AMBER if oi_vel["call_vel_zscore"]>=1.2 else GREEN if oi_vel["call_vel_zscore"]<=-1.2 else MUTED)
-    vel_p_col = RED if oi_vel["put_vel_zscore"]>=2  else (AMBER if oi_vel["put_vel_zscore"]>=1.2  else GREEN if oi_vel["put_vel_zscore"]<=-1.2  else MUTED)
-    st.markdown(f"""
-    <div class="card">
-      <div style="display:flex;gap:12px;margin-bottom:10px;">
-        <div style="flex:1;text-align:center;">
-          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Call OI Vel/tick</div>
-          <div style="font-size:18px;font-weight:700;color:{vel_c_col};">{oi_vel['call_oi_velocity']:+,.0f}</div>
-          <div style="font-size:12px;font-weight:600;color:{vel_c_col};">z={oi_vel['call_vel_zscore']:+.2f}</div>
-        </div>
-        <div style="flex:1;text-align:center;">
-          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Put OI Vel/tick</div>
-          <div style="font-size:18px;font-weight:700;color:{vel_p_col};">{oi_vel['put_oi_velocity']:+,.0f}</div>
-          <div style="font-size:12px;font-weight:600;color:{vel_p_col};">z={oi_vel['put_vel_zscore']:+.2f}</div>
-        </div>
-      </div>
-      <div style="font-size:12px;font-weight:600;color:{'#DC2626' if oi_vel['alert_level']=='DANGER' else '#D97706' if oi_vel['alert_level']=='WATCH' else '#059669'};padding:6px 8px;background:#F9FAFB;border-radius:6px;">
-        {oi_vel['alert_text']}
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# IV History chart + OI Velocity charts
-if len(today_history) >= 3:  # Fix #2: intraday only
-    # Build 15-min bucketed history charts
-    hist_df = pd.DataFrame(today_history)  # Fix #2: intraday only
-    def bucket_series(key):
-        try:
-            t = pd.to_datetime(hist_df["ts"], errors="coerce")
-            hist_df2 = hist_df.assign(t=t)
-            hist_df2["bucket"] = hist_df2["t"].dt.floor("15min")
-            hist_df2[key] = pd.to_numeric(hist_df2[key], errors="coerce").fillna(0)
-            base = hist_df2[key].iloc[0]
-            grp = hist_df2.groupby("bucket")[key].last().reset_index()
-            grp["cum"] = grp[key] - base
-            grp["lbl"] = grp["bucket"].dt.strftime("%H:%M")
-            return grp["lbl"].tolist(), grp["cum"].tolist()
-        except Exception:
-            return [], []
-
-    iv_labels, iv_vals = bucket_series("atm_iv")
-    iv_color = "#059669" if (iv_vals[-1]<-0.5 if iv_vals else False) else ("#DC2626" if (iv_vals[-1]>0.5 if iv_vals else False) else CYAN)
-
-    # Call/Put OI velocity z-score 15-min
-    def compute_vel_buckets(side_key, total_key):
-        try:
-            arr = np.array([safe_num(x.get(total_key,0)) for x in today_history], dtype=float)  # Fix #2
-            ts  = [x.get("ts","") for x in today_history]  # Fix #2
-            vel = np.diff(arr); ts_v = ts[1:]
-            buckets = {}
-            for i, t in enumerate(ts_v):
-                lbl = _parse_ts_to_bucket(t) or t
-                buckets[lbl] = buckets.get(lbl, 0.0) + float(vel[i])
-            labels = sorted(buckets.keys())
-            arr_c  = np.array([buckets[l] for l in labels], dtype=float)
-            if arr_c.std() < 1e-9:
-                return labels, [0.0]*len(labels)
-            z_arr = (arr_c - arr_c.mean()) / arr_c.std()
-            return labels, list(z_arr)
-        except Exception:
-            return [], []
-
-    c_vel_labels, c_vel_zs = compute_vel_buckets("call", "call_oi_total")
-    p_vel_labels, p_vel_zs = compute_vel_buckets("put",  "put_oi_total")
-
-    iv_col, cv_col, pv_col = st.columns(3)
-    with iv_col:
-        if iv_labels:
-            iv_fig = go.Figure()
-            iv_fig.add_hline(y=0, line_dash="dash", line_color=MUTED, opacity=0.5)
-            iv_fig.add_trace(go.Scatter(x=iv_labels, y=iv_vals, mode="lines+markers",
-                line=dict(color=iv_color, width=2.5), marker=dict(size=6),
-                name="Cumul Δ ATM IV",
-                hovertemplate="%{x}<br>Δ IV: %{y:+.2f}pp<extra></extra>"))
-            iv_fig.update_layout(title="Cumulative Δ ATM IV (15-min)", height=260,
-                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-                margin=dict(l=40,r=18,t=50,b=40),
-                font=dict(color="#1A1A2E",size=11),
-            hoverlabel=dict(bgcolor="#fff",font_color="#1A1A2E",font_size=11),
-            legend=dict(font=dict(color="#1A1A2E",size=11)))
-            st.plotly_chart(iv_fig, width='stretch', config={"displayModeBar":False})
-    with cv_col:
-        if c_vel_labels:
-            cf = go.Figure()
-            cf.add_hline(y=2.0,  line_dash="dot", line_color=RED,   opacity=0.65, annotation_text="+2σ",  annotation_font_color=RED)
-            cf.add_hline(y=-2.0, line_dash="dot", line_color=GREEN, opacity=0.65, annotation_text="-2σ",  annotation_font_color=GREEN)
-            cf.add_hline(y=0,    line_dash="dash",line_color=MUTED, opacity=0.4)
-            cf.add_trace(go.Scatter(x=c_vel_labels, y=c_vel_zs, mode="lines+markers",
-                line=dict(color="#38BDF8",width=2.5), marker=dict(size=6),
-                hovertemplate="%{x}<br>Z: %{y:+.2f}σ<extra></extra>", name="Call OI Vel Z"))
-            cf.update_layout(title="Δ Call OI Velocity Z-Score (15-min)", height=260,
-                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-                margin=dict(l=40,r=18,t=50,b=40), font=dict(color="#1A1A2E",size=11),
-            hoverlabel=dict(bgcolor="#fff",font_color="#1A1A2E",font_size=11),
-            legend=dict(font=dict(color="#1A1A2E",size=11)))
-            st.plotly_chart(cf, width='stretch', config={"displayModeBar":False})
-    with pv_col:
-        if p_vel_labels:
-            pf = go.Figure()
-            pf.add_hline(y=2.0,  line_dash="dot", line_color=RED,   opacity=0.65, annotation_text="+2σ",  annotation_font_color=RED)
-            pf.add_hline(y=-2.0, line_dash="dot", line_color=GREEN, opacity=0.65, annotation_text="-2σ",  annotation_font_color=GREEN)
-            pf.add_hline(y=0,    line_dash="dash",line_color=MUTED, opacity=0.4)
-            pf.add_trace(go.Scatter(x=p_vel_labels, y=p_vel_zs, mode="lines+markers",
-                line=dict(color="#FB7185",width=2.5), marker=dict(size=6),
-                hovertemplate="%{x}<br>Z: %{y:+.2f}σ<extra></extra>", name="Put OI Vel Z"))
-            pf.update_layout(title="Δ Put OI Velocity Z-Score (15-min)", height=260,
-                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-                margin=dict(l=40,r=18,t=50,b=40), font=dict(color="#1A1A2E",size=11),
-            hoverlabel=dict(bgcolor="#fff",font_color="#1A1A2E",font_size=11),
-            legend=dict(font=dict(color="#1A1A2E",size=11)))
-            st.plotly_chart(pf, width='stretch', config={"displayModeBar":False})
-else:
-    st.info(f"Collecting history data for Section 8 charts {len(history)}/3 ticks received.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 9: DELTA-WEIGHTED OI FLOW ENGINE  (v23-4)
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown(
-    '<div class="section-header">🧲 Section 9 — Δ-Weighted OI Flow · Raw OI Change · Sentiment · Composite Bias</div>',
-    unsafe_allow_html=True,
-)
-# Legend note
-st.markdown(
-    '''<div style="font-size:12px;color:#6B7280;background:#F9FAFB;padding:8px 12px;
-               border-radius:6px;line-height:1.8;margin-bottom:10px;">
-    <strong>Graph 1 — Δ-Weighted OI Flow:</strong>
-    running[i] = decay×running[i-1] + bucket_Σ(OI_chg×|δ|)  |
-    Green line=PUT floor building (bullish)  Red line=CALL ceiling building (bearish)  
-    Coloured segments=net sentiment vs ZERO  Purple dashed=rolling-normalised net ∈[−1,+1].<br>
-    <strong>Graph 2 — Raw OI Change + PCR-of-Flow:</strong>
-    put_added/call_added − 1 per bucket  |  Green=PUT-heavy(bullish)  Red=CALL-heavy(bearish)  |
-    Vol guard ≥{} lots.<br>
-    <strong>Graph 3 — NIFTY Spot:</strong>
-    15-min closes with Gamma Flip (amber), Support/Resistance walls (green/red), Max Pain (grey).<br>
-    <em>Click a legend item to toggle that line on/off.  Double-click to isolate it.</em>
-    </div>'''.format(PCR_MIN_BUCKET_OI),
-    unsafe_allow_html=True,
-)
-
-if len(history) >= 2:
-    bkt  = compute_dw_flow_buckets(today_history)   # Fix #2: intraday only
-    rbkt = compute_raw_oi_buckets(today_history)    # Fix #2: intraday only
-
-    if bkt and len(bkt.get("labels", [])) >= 1:
-        labels        = bkt["labels"]
-        call_flow     = bkt["call_flow"]
-        put_flow      = bkt["put_flow"]
-        net_flow      = bkt["net_flow"]
-        net_flow_norm = bkt.get("net_flow_norm", [])
-        spot_arr      = bkt["spot"]
-        decay         = bkt.get("decay", DW_FLOW_DECAY)
-        session_max   = bkt.get("session_max", 1.0)
-        norm_w        = NORM_WINDOW_BUCKETS if NORM_WINDOW_BUCKETS else "session"
-
-        # ── Confluence Summary Panel (v23-4) ─────────────────────────────────
-        pcr_signal = rbkt.get("pcr_flow_signal", []) if rbkt else []
-        call_chg   = rbkt.get("call_chg", [])        if rbkt else []
-        put_chg_rb = rbkt.get("put_chg", [])         if rbkt else []
-
-        def _last2(lst, n=2): return lst[-n:] if len(lst) >= n else lst[:]
-
-        # NET Sentiment direction
-        recent_net = _last2(net_flow, 3)
-        if len(recent_net) >= 2:
-            signs      = [1 if v > 0 else (-1 if v < 0 else 0) for v in recent_net]
-            bull_count = signs.count(1);  bear_count = signs.count(-1)
-            if bull_count >= 2:   net_dir, net_consec = "BULLISH", bull_count
-            elif bear_count >= 2: net_dir, net_consec = "BEARISH", bear_count
-            else:                 net_dir, net_consec = "MIXED", 0
-        elif len(recent_net) == 1:
-            net_dir = "BULLISH" if recent_net[0] > 0 else ("BEARISH" if recent_net[0] < 0 else "MIXED")
-            net_consec = 1
-        else:
-            net_dir, net_consec = "MIXED", 0
-
-        # NET Normalised strength
-        norm_val = net_flow_norm[-1] if net_flow_norm else 0.0
-        abs_norm = abs(norm_val)
-        if abs_norm >= 0.65:   norm_label = "STRONG"
-        elif abs_norm >= 0.30: norm_label = "MODERATE"
-        else:                  norm_label = "WEAK"
-
-        # PCR-of-Flow confluence
-        recent_pcr = _last2(pcr_signal, 3)
-        if recent_pcr:
-            pcr_signs = [1 if v > 0.05 else (-1 if v < -0.05 else 0) for v in recent_pcr]
-            pcr_bull  = pcr_signs.count(1);  pcr_bear = pcr_signs.count(-1)
-            if pcr_bull >= 2:   pcr_dir = "BULLISH"
-            elif pcr_bear >= 2: pcr_dir = "BEARISH"
-            else:               pcr_dir = "MIXED"
-            pcr_latest = recent_pcr[-1]
-        else:
-            pcr_dir, pcr_latest = "MIXED", 0.0
-
-        # Cumulative OI slope
-        if len(call_chg) >= 2 and len(put_chg_rb) >= 2:
-            call_slope = call_chg[-1] - call_chg[-min(3, len(call_chg))]
-            put_slope  = put_chg_rb[-1] - put_chg_rb[-min(3, len(put_chg_rb))]
-            if   put_slope > call_slope * 1.1:  cum_dir = "BULLISH"
-            elif call_slope > put_slope * 1.1:  cum_dir = "BEARISH"
-            else:                               cum_dir = "MIXED"
-        else:
-            cum_dir = "MIXED"
-
-        # FIX (Issue 4): norm_val vote was a direct transform of net_flow (same
-        # source as net_dir), letting net_flow cast 2 of 4 votes alone.
-        # Replaced with flow acceleration: net_flow[-1] − net_flow[-2].
-        # Acceleration is the second derivative — can disagree with direction
-        # (e.g. flow bullish but decelerating) and is a genuinely independent signal.
-        if len(net_flow) >= 2:
-            _accel    = net_flow[-1] - net_flow[-2]
-            accel_dir = "BULLISH" if _accel > 0 else ("BEARISH" if _accel < 0 else "MIXED")
-            accel_val = _accel
-        else:
-            accel_dir, accel_val = "MIXED", 0.0
-
-        # Confluence tally — 4 independent signals
-        bull_votes = sum([
-            1 if net_dir   == "BULLISH" else 0,   # delta-weighted flow direction (G1)
-            1 if pcr_dir   == "BULLISH" else 0,   # PCR-of-Flow (G2, raw OI)
-            1 if cum_dir   == "BULLISH" else 0,   # cumulative OI slope (G2, raw OI)
-            1 if accel_dir == "BULLISH" else 0,   # flow acceleration 2nd derivative (G1)
-        ])
-        bear_votes = sum([
-            1 if net_dir   == "BEARISH" else 0,
-            1 if pcr_dir   == "BEARISH" else 0,
-            1 if cum_dir   == "BEARISH" else 0,
-            1 if accel_dir == "BEARISH" else 0,
-        ])
-
-        delta_active = bkt.get("delta_active", False)
-
-        if bull_votes >= 3:
-            overall_dir, overall_col, overall_bg, overall_emoji = "BULLISH",      "#059669", "#ECFDF5", "🟢"
-        elif bear_votes >= 3:
-            overall_dir, overall_col, overall_bg, overall_emoji = "BEARISH",      "#DC2626", "#FEF2F2", "🔴"
-        elif bull_votes == 2 and bear_votes <= 1:
-            overall_dir, overall_col, overall_bg, overall_emoji = "MILD BULLISH", "#10B981", "#F0FDF4", "🟡"
-        elif bear_votes == 2 and bull_votes <= 1:
-            overall_dir, overall_col, overall_bg, overall_emoji = "MILD BEARISH", "#F87171", "#FFF5F5", "🟡"
-        else:
-            overall_dir, overall_col, overall_bg, overall_emoji = "NEUTRAL / MIXED", "#D97706", "#FFFBEB", "⚪"
-
-        strength_col = overall_col if abs_norm >= 0.65 else ("#D97706" if abs_norm >= 0.30 else "#6B7280")
-        strength_label = "HIGH" if abs_norm >= 0.65 else ("MEDIUM" if abs_norm >= 0.30 else "LOW")
-
-        consec_txt = f"{net_consec} of last 3 buckets confirm" if net_consec > 0 else "buckets mixed"
-        if overall_dir in ("BULLISH", "MILD BULLISH"):
-            explanation = (
-                f"Put writers are active — floor is building. "
-                f"NET sentiment green ({consec_txt}), "
-                f"PCR-of-Flow {'also bullish — strong confluence.' if pcr_dir == 'BULLISH' else 'mixed — wait for confirmation.'} "
-                f"Flow {'accelerating ↑' if accel_dir == 'BULLISH' else 'decelerating ↓' if accel_dir == 'BEARISH' else 'steady →'}. "
-                f"Normalised flow context: {norm_val:+.2f}. "
-                f"{'✅ Delta-weighted active — signals reliable.' if delta_active else '⚠️ Proxy mode — treat with caution.'}"
-            )
-        elif overall_dir in ("BEARISH", "MILD BEARISH"):
-            explanation = (
-                f"Call writers dominating — ceiling pressure building. "
-                f"NET sentiment red ({consec_txt}), "
-                f"PCR-of-Flow {'also bearish — strong confluence.' if pcr_dir == 'BEARISH' else 'mixed — wait for confirmation.'} "
-                f"Flow {'accelerating ↓' if accel_dir == 'BEARISH' else 'decelerating ↑' if accel_dir == 'BULLISH' else 'steady →'}. "
-                f"Normalised flow context: {norm_val:+.2f}. "
-                f"{'✅ Delta-weighted active — signals reliable.' if delta_active else '⚠️ Proxy mode — treat with caution.'}"
-            )
-        else:
-            explanation = (
-                f"Flow is balanced — no dominant side yet. "
-                f"NET: {net_dir.lower()}, PCR-of-Flow: {pcr_dir.lower()}, CumOI: {cum_dir.lower()}, Accel: {accel_dir.lower()}. "
-                f"Normalised flow near zero ({norm_val:+.2f}). "
-                f"Wait for 2+ consecutive aligned buckets before acting. "
-                f"{'✅ Delta-weighted active.' if delta_active else '⚠️ Proxy mode active.'}"
-            )
-
-        net_col   = "#059669" if net_dir   == "BULLISH" else ("#DC2626" if net_dir   == "BEARISH" else "#D97706")
-        accel_col = "#059669" if accel_dir == "BULLISH" else ("#DC2626" if accel_dir == "BEARISH" else "#D97706")
-        pcr_col   = "#059669" if pcr_dir   == "BULLISH" else ("#DC2626" if pcr_dir   == "BEARISH" else "#D97706")
-        cum_col   = "#059669" if cum_dir   == "BULLISH" else ("#DC2626" if cum_dir   == "BEARISH" else "#D97706")
-
-        # ── Proxy mode warning ───────────────────────────────────────────────
-        if not delta_active:
-            st.warning(
-                "⚠️ **PROXY MODE ACTIVE — Delta flow unreliable**  |  "
-                "Dhan returned IV = 0 for all strikes this tick — BS backfill had no input. "
-                "Charts use a flat 0.3 delta proxy (= scaled raw OI change). "
-                "Sentiment line and composite bias score are not meaningful until real IV arrives.",
-                icon=None,
-            )
-
-        # ── Confluence header panel ──────────────────────────────────────────
-        st.markdown(
-            f'''<div style="background:{overall_bg};border:1.5px solid {overall_col};border-radius:10px;
-                        padding:12px 16px;margin-bottom:12px;">
-              <div style="display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
-                <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
-                  <span style="font-size:10px;font-weight:700;color:#6B7280;letter-spacing:0.05em;">DIRECTION</span>
-                  <span style="background:{overall_col}22;color:{overall_col};border:1.5px solid {overall_col};
-                               border-radius:6px;padding:3px 10px;font-size:13px;font-weight:800;">
-                    {overall_emoji} {overall_dir}
-                  </span>
-                </div>
-                <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
-                  <span style="font-size:10px;font-weight:700;color:#6B7280;letter-spacing:0.05em;">STRENGTH</span>
-                  <span style="background:{strength_col}22;color:{strength_col};border:1.5px solid {strength_col};
-                               border-radius:6px;padding:3px 10px;font-size:13px;font-weight:800;">
-                    {strength_label}  {norm_val:+.2f}
-                  </span>
-                </div>
-                <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
-                  <span style="font-size:10px;font-weight:700;color:#6B7280;letter-spacing:0.05em;">CONFLUENCE</span>
-                  <span style="background:#F9FAFB;color:#1A1A2E;border:1px solid #E5E7EB;
-                               border-radius:6px;padding:3px 10px;font-size:12px;font-weight:700;">
-                    {max(bull_votes, bear_votes)}/4 signals agree
-                  </span>
-                </div>
-                <div style="flex:1;min-width:220px;font-size:12px;color:#1A1A2E;line-height:1.6;
-                            background:rgba(255,255,255,0.55);border-radius:6px;padding:4px 8px;">
-                  {explanation}
-                </div>
-              </div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                <div style="flex:1;min-width:120px;background:#F9FAFB;border-radius:8px;padding:8px 10px;
-                            border-left:3px solid {net_col};">
-                  <div style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;">NET Sentiment (G1)</div>
-                  <div style="font-size:13px;font-weight:800;color:{net_col};">{net_dir}</div>
-                  <div style="font-size:10px;color:#6B7280;margin-top:2px;">{net_consec}/3 buckets {net_dir.lower()}</div>
-                </div>
-                <div style="flex:1;min-width:120px;background:#F9FAFB;border-radius:8px;padding:8px 10px;
-                            border-left:3px solid {accel_col};">
-                  <div style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;">Flow Accel (G1)</div>
-                  <div style="font-size:13px;font-weight:800;color:{accel_col};">{accel_dir}</div>
-                  <div style="font-size:10px;color:#6B7280;margin-top:2px;">Δ last bucket | norm: {norm_val:+.2f}</div>
-                </div>
-                <div style="flex:1;min-width:120px;background:#F9FAFB;border-radius:8px;padding:8px 10px;
-                            border-left:3px solid {pcr_col};">
-                  <div style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;">PCR-of-Flow (G2)</div>
-                  <div style="font-size:13px;font-weight:800;color:{pcr_col};">{pcr_dir}</div>
-                  <div style="font-size:10px;color:#6B7280;margin-top:2px;">latest bucket: {pcr_latest:+.2f} | ratio−1</div>
-                </div>
-                <div style="flex:1;min-width:120px;background:#F9FAFB;border-radius:8px;padding:8px 10px;
-                            border-left:3px solid {cum_col};">
-                  <div style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;">Cumul. OI Slope (G2)</div>
-                  <div style="font-size:13px;font-weight:800;color:{cum_col};">{cum_dir}</div>
-                  <div style="font-size:10px;color:#6B7280;margin-top:2px;">put slope vs call slope (last 3 bkts)</div>
-                </div>
-              </div>
-            </div>''',
-            unsafe_allow_html=True,
-        )
-
-        # ── Graph 1: Δ-Weighted OI Flow (full-width, v23-4) ─────────────────
-        import math as _math
-        dw_fig = go.Figure()
-
-        # Call Δ-Flow
-        dw_fig.add_trace(go.Scatter(
-            x=labels, y=call_flow,
-            name=f"CALL Δ-Flow  [Σ(OI_chg × |δ|), decay={decay}]  → ceiling building (bearish)",
-            legendgroup="call_flow", mode="lines+markers",
-            line=dict(color=RED, width=3), marker=dict(size=6, color=RED),
-            hovertemplate="<b>%{x}</b><br>Call Δ-flow (decay-wtd): %{y:,.0f}<extra>CALL Δ-Flow</extra>",
-            yaxis="y1",
-        ))
-
-        # Put Δ-Flow
-        dw_fig.add_trace(go.Scatter(
-            x=labels, y=put_flow,
-            name=f"PUT  Δ-Flow  [Σ(OI_chg × |δ|), decay={decay}]  → floor building (bullish)",
-            legendgroup="put_flow", mode="lines+markers",
-            line=dict(color=GREEN, width=3), marker=dict(size=6, color=GREEN),
-            hovertemplate="<b>%{x}</b><br>Put Δ-flow (decay-wtd): %{y:,.0f}<extra>PUT Δ-Flow</extra>",
-            yaxis="y1",
-        ))
-
-        # Net Sentiment segments — coloured vs ZERO
-        _COL_BULL = "#16A34A";  _COL_BEAR = "#DC2626";  _COL_NEUT = AMBER
-        _SYMLOG_LIN = max(1.0, max(abs(v) for v in net_flow) * 0.01) if net_flow else 1.0
-        def _symlog(v): return _math.copysign(_math.log10(1.0 + abs(v) / _SYMLOG_LIN), v)
-        net_flow_sl = [_symlog(v) for v in net_flow]
-
-        if len(net_flow) >= 2:
-            for _i in range(1, len(net_flow)):
-                _curr_real = net_flow[_i]
-                _is_live   = (_i == len(net_flow) - 1)
-                _seg_col   = _COL_BULL if _curr_real > 0 else (_COL_BEAR if _curr_real < 0 else _COL_NEUT)
-                _bias_lbl  = ("BULLISH — put-writing dominates" if _curr_real > 0
-                               else ("BEARISH — call-writing dominates" if _curr_real < 0 else "NEUTRAL"))
-                dw_fig.add_trace(go.Scatter(
-                    x=[labels[_i - 1], labels[_i]], y=[net_flow_sl[_i - 1], net_flow_sl[_i]],
-                    customdata=[[net_flow[_i - 1]], [_curr_real]],
-                    name="NET Sentiment  [PUT_dw − CALL_dw, sign vs zero]",
-                    legendgroup="net_flow", showlegend=(_i == 1),
-                    mode="lines+markers",
-                    line=dict(color=_seg_col, width=3.5 if _is_live else 2.5, dash="solid"),
-                    marker=dict(size=9 if _is_live else 6, color=_seg_col),
-                    hovertemplate=(
-                        "<b>%{x}</b>" + ("  🔴 LIVE" if _is_live else "") + "<br>"
-                        "Net Δ-flow: %{customdata[0]:,.0f}<br>Signal: " + _bias_lbl +
-                        "<extra>NET Sentiment</extra>"
-                    ),
-                    yaxis="y1",
-                ))
-
-        # Normalised Net Flow (y3, dashed — colour-coded by previous bucket close)
-        if net_flow_norm:
-            if len(net_flow_norm) == 1:
-                _seg_col = _COL_BULL if net_flow_norm[0] > 0 else (_COL_BEAR if net_flow_norm[0] < 0 else _COL_NEUT)
-                dw_fig.add_trace(go.Scatter(
-                    x=labels[:1], y=net_flow_norm[:1],
-                    name=f"NET Normalised  [rolling-max window={norm_w} bkts]  ∈ [−1, +1]  ÷ rolling_max≈{session_max:,.0f}",
-                    legendgroup="net_norm", showlegend=True,
-                    mode="lines+markers",
-                    line=dict(color=_seg_col, width=2.5, dash="dash"),
-                    marker=dict(size=5, color=_seg_col,
-                                symbol="circle" if net_flow_norm[0] >= 0 else "circle-open"),
-                    hovertemplate=(
-                        "<b>%{x}</b><br>Net norm: %{y:.3f}<br>"
-                        f"+1=max bullish  −1=max bearish  |  rolling max≈{session_max:,.0f}"
-                        "<extra>NET Normalised</extra>"
-                    ),
-                    yaxis="y3",
-                ))
-            else:
-                for _ni in range(1, len(net_flow_norm)):
-                    # colour: current value vs previous bucket close
-                    _prev = net_flow_norm[_ni - 1]
-                    _curr = net_flow_norm[_ni]
-                    _seg_col = _COL_BULL if _curr > _prev else (_COL_BEAR if _curr < _prev else _COL_NEUT)
-                    _is_live = (_ni == len(net_flow_norm) - 1)
-                    dw_fig.add_trace(go.Scatter(
-                        x=[labels[_ni - 1], labels[_ni]],
-                        y=[net_flow_norm[_ni - 1], net_flow_norm[_ni]],
-                        name=f"NET Normalised  [rolling-max window={norm_w} bkts]  ∈ [−1, +1]  ÷ rolling_max≈{session_max:,.0f}",
-                        legendgroup="net_norm", showlegend=(_ni == 1),
-                        mode="lines+markers",
-                        line=dict(color=_seg_col, width=2.5 if _is_live else 2.0, dash="dash"),
-                        marker=dict(size=7 if _is_live else 5, color=_seg_col,
-                                    symbol=["circle" if v >= 0 else "circle-open"
-                                            for v in [net_flow_norm[_ni - 1], net_flow_norm[_ni]]]),
-                        hovertemplate=(
-                            "<b>%{x}</b>" + ("  🔴 LIVE" if _is_live else "") + "<br>"
-                            "Net norm: %{y:.3f}<br>"
-                            f"+1=max bullish  −1=max bearish  |  rolling max≈{session_max:,.0f}"
-                            "<extra>NET Normalised</extra>"
-                        ),
-                        yaxis="y3",
-                    ))
-            dw_fig.add_hline(y=0, line_dash="dot", line_color=MUTED, line_width=0.8, opacity=0.35)
-
-        dw_fig.add_hline(y=0, line_dash="dash", line_color=MUTED, line_width=1)
-
-        # NIFTY Spot on y2
-        if spot_arr:
-            dw_fig.add_trace(go.Scatter(
-                x=labels, y=spot_arr, name="NIFTY Spot", legendgroup="spot",
-                mode="lines+markers", line=dict(color=BLUE, width=2.5), marker=dict(size=5, color=BLUE),
-                hovertemplate="<b>%{x}</b><br>Spot: %{y:,.2f}<extra>NIFTY Spot</extra>",
-                yaxis="y2",
-            ))
-
-        delta_note = "" if delta_active else "  ⚠️ PROXY MODE — delta≈0, greeks sparse"
-        dw_fig.update_layout(
-            title=(
-                f"Graph 1 — Δ-Weighted OI Flow  |  "
-                f"running[i] = {decay}×running[i-1] + bucket_Σ(OI_chg×|δ|)  |  "
-                f"Net normalised over rolling {norm_w}-bucket window{delta_note}"
-            ),
-            height=420, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-            margin=dict(l=52, r=110, t=68, b=44),
-            font=dict(color="#1A1A2E", size=11),
-            hoverlabel=dict(bgcolor="#fff", font_color="#1A1A2E", font_size=11),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(color="#1A1A2E", size=10),
-                        itemclick="toggle", itemdoubleclick="toggleothers"),
-            yaxis=dict(
-                title="Decay-Weighted OI Flow (symlog)<br><sup>Green=PUT floor  Red=CALL ceiling  Segments=net sentiment</sup>",
-                side="left", showgrid=True, gridcolor="#F3F4F6",
-                zeroline=True, zerolinecolor=MUTED, zerolinewidth=1,
-            ),
-            yaxis2=dict(title="NIFTY Spot", overlaying="y", side="right",
-                        showgrid=False, zeroline=False, position=0.88),
-            yaxis3=dict(
-                title="Net Norm [−1 → +1]<br><sup>rolling max, purple dashed</sup>",
-                overlaying="y", side="right", showgrid=False, zeroline=True,
-                zerolinecolor="#7C3AED", zerolinewidth=0.8,
-                anchor="free", position=1.0, range=[-1.25, 1.25],
-                tickfont=dict(size=9, color="#7C3AED"),
-                tickvals=[-1, -0.5, 0, 0.5, 1],
-                ticktext=["-1", "-½", "0", "+½", "+1"],
-            ),
-        )
-        st.plotly_chart(dw_fig, width='stretch', config={"displayModeBar": False})
-
-        # ── Graph 2: Raw OI Change + PCR-of-Flow (full-width, v23-4) ────────
-        if rbkt and rbkt.get("labels"):
-            rl        = rbkt["labels"]
-            call_chg  = rbkt["call_chg"]
-            put_chg   = rbkt["put_chg"]
-            pcr_sig   = rbkt["pcr_flow_signal"]
-            pcr_raw_v = rbkt.get("pcr_flow_raw", [])
-            raw_spot  = rbkt["spot"]
-            min_bkt   = rbkt.get("min_bucket_oi", PCR_MIN_BUCKET_OI)
-
-            rf = go.Figure()
-            # Call OI cumulative
-            rf.add_trace(go.Scatter(
-                x=rl, y=call_chg,
-                name="CALL OI  [cumulative raw change — ceiling building (bearish)]",
-                legendgroup="call_chg", mode="lines+markers",
-                line=dict(color=RED, width=3), marker=dict(size=6, color=RED),
-                hovertemplate="<b>%{x}</b><br>Call OI Δ cumulative: %{y:+,.0f}<extra>CALL OI cumulative</extra>",
-                yaxis="y1",
-            ))
-            # Put OI cumulative
-            rf.add_trace(go.Scatter(
-                x=rl, y=put_chg,
-                name="PUT  OI  [cumulative raw change — floor building (bullish)]",
-                legendgroup="put_chg", mode="lines+markers",
-                line=dict(color=GREEN, width=3), marker=dict(size=6, color=GREEN),
-                hovertemplate="<b>%{x}</b><br>Put OI Δ cumulative: %{y:+,.0f}<extra>PUT OI cumulative</extra>",
-                yaxis="y1",
-            ))
-            # PCR-of-Flow segments (y3) — coloured vs ZERO
-            if len(pcr_sig) >= 2:
-                for _ri in range(1, len(pcr_sig)):
-                    _cs = pcr_sig[_ri];  _ps = pcr_sig[_ri - 1]
-                    _cr = pcr_raw_v[_ri] if pcr_raw_v else 1.0
-                    _pr = pcr_raw_v[_ri - 1] if pcr_raw_v else 1.0
-                    _live = (_ri == len(pcr_sig) - 1)
-                    _scol = _COL_BULL if _cs > 0 else (_COL_BEAR if _cs < 0 else _COL_NEUT)
-                    _blbl = ("PUT-heavy ↑ — bullish floor building" if _cs > 0
-                             else ("CALL-heavy ↓ — bearish ceiling building" if _cs < 0
-                                   else "Balanced / thin bucket (vol guard)"))
-                    rf.add_trace(go.Scatter(
-                        x=[rl[_ri - 1], rl[_ri]], y=[_ps, _cs],
-                        customdata=[[_pr, _ps], [_cr, _cs]],
-                        name="PCR-of-Flow  [put_added/call_added − 1, sign vs zero]",
-                        legendgroup="pcr_flow", showlegend=(_ri == 1),
-                        mode="lines+markers",
-                        line=dict(color=_scol, width=3.5 if _live else 2.5),
-                        marker=dict(size=9 if _live else 6, color=_scol),
-                        hovertemplate=(
-                            "<b>%{x}</b>" + ("  🔴 LIVE" if _live else "") + "<br>"
-                            "PCR-Flow ratio: %{customdata[0]:.3f}<br>"
-                            "Signal (ratio−1): %{customdata[1]:+.3f}<br>"
-                            "Signal: " + _blbl + f"<br>Vol guard ≥{min_bkt:,} lots"
-                            "<extra>PCR-of-Flow</extra>"
-                        ),
-                        yaxis="y3",
-                    ))
-            elif len(pcr_sig) == 1:
-                _c = _COL_BULL if pcr_sig[0] > 0 else (_COL_BEAR if pcr_sig[0] < 0 else _COL_NEUT)
-                rf.add_trace(go.Scatter(
-                    x=rl, y=pcr_sig, name="PCR-of-Flow  [put_added/call_added − 1, sign vs zero]",
-                    legendgroup="pcr_flow", mode="markers", marker=dict(size=9, color=_c),
-                    hovertemplate="<b>%{x}</b><br>PCR signal: %{y:+.3f}<extra>PCR-of-Flow</extra>",
-                    yaxis="y3",
-                ))
-            rf.add_hline(y=0, line_dash="dash", line_color=MUTED, line_width=1)
-            # Spot on y2
-            if raw_spot:
-                rf.add_trace(go.Scatter(
-                    x=rl, y=raw_spot, name="NIFTY Spot", legendgroup="spot",
-                    mode="lines+markers", line=dict(color=BLUE, width=2.5), marker=dict(size=5, color=BLUE),
-                    hovertemplate="<b>%{x}</b><br>Spot: %{y:,.2f}<extra>NIFTY Spot</extra>",
-                    yaxis="y2",
-                ))
-            # Key levels on y2
-            gf2  = next((g for g in reversed(rbkt.get("gamma_flip", [])) if g is not None), None)
-            sup2 = rbkt["support"][-1]    if rbkt.get("support")    else None
-            res2 = rbkt["resistance"][-1] if rbkt.get("resistance") else None
-            if gf2:
-                rf.add_hline(y=gf2, line_dash="solid", line_color=AMBER, line_width=2,
-                             annotation_text=f"Gamma Flip {gf2:,.0f}", annotation_font=dict(color=AMBER, size=10),
-                             yref="y2")
-            if sup2 and sup2 > 0:
-                rf.add_hline(y=sup2, line_dash="dash", line_color=GREEN, line_width=1.5,
-                             annotation_text=f"Support {sup2:,.0f}", annotation_font=dict(color=GREEN, size=10),
-                             yref="y2")
-            if res2 and res2 > 0:
-                rf.add_hline(y=res2, line_dash="dash", line_color=RED, line_width=1.5,
-                             annotation_text=f"Resistance {res2:,.0f}", annotation_font=dict(color=RED, size=10),
-                             yref="y2")
-            rf.update_layout(
-                title=(
-                    f"Graph 2 — Raw OI Change + PCR-of-Flow Sentiment  |  "
-                    f"Formula: put_added / call_added − 1  |  "
-                    f"Vol guard ≥{min_bkt:,} lots  |  "
-                    "GREEN=PUT-heavy(bullish)  RED=CALL-heavy(bearish)  coloured vs ZERO"
-                ),
-                height=420, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-                margin=dict(l=52, r=110, t=68, b=44),
-                font=dict(color="#1A1A2E", size=11),
-                hoverlabel=dict(bgcolor="#fff", font_color="#1A1A2E", font_size=11),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                            font=dict(color="#1A1A2E", size=10),
-                            itemclick="toggle", itemdoubleclick="toggleothers"),
-                yaxis=dict(
-                    title="Cumulative Raw OI Change (lots)<br><sup>Green=PUT cumulative  Red=CALL cumulative</sup>",
-                    side="left", showgrid=True, gridcolor="#F3F4F6",
-                    zeroline=True, zerolinecolor=MUTED, zerolinewidth=1,
-                ),
-                yaxis2=dict(title="NIFTY Spot", overlaying="y", side="right",
-                            showgrid=False, zeroline=False, position=0.88),
-                yaxis3=dict(
-                    title="PCR-Flow (put/call − 1)<br><sup>+ve=bullish  −ve=bearish</sup>",
-                    overlaying="y", side="right", showgrid=False, zeroline=True,
-                    zerolinecolor="#6B7280", zerolinewidth=1,
-                    anchor="free", position=1.0,
-                    tickfont=dict(size=9, color="#6B7280"),
-                    tickvals=[-2, -1, -0.5, 0, 0.5, 1, 2],
-                    ticktext=["-2", "-1", "-½", "0", "+½", "+1", "+2"],
-                ),
-            )
-            st.plotly_chart(rf, width='stretch', config={"displayModeBar": False})
-
-        # ── Graph 3: NIFTY Spot with Key Levels (full-width, v23-4) ─────────
-        if spot_arr:
-            sf2 = go.Figure()
-            sf2.add_trace(go.Scatter(
-                x=labels, y=spot_arr,
-                name="NIFTY Spot  [15-min bucket close]",
-                legendgroup="spot", mode="lines+markers",
-                line=dict(color=BLUE, width=3), marker=dict(size=6, color=BLUE),
-                hovertemplate="<b>%{x}</b><br>Spot: %{y:,.2f}<extra>NIFTY Spot</extra>",
-            ))
-            gf_val = next((g for g in reversed(bkt.get("gamma_flip", [])) if g is not None), None)
-            mp_val = bkt["max_pain"][-1] if bkt.get("max_pain") else None
-            sup_v  = bkt["support"][-1]    if bkt.get("support")    else None
-            res_v  = bkt["resistance"][-1] if bkt.get("resistance") else None
-            if gf_val:
-                sf2.add_hline(y=gf_val, line_dash="solid", line_color=AMBER, line_width=2.5,
-                              annotation_text=f"Gamma Flip  {gf_val:,.0f}  [GEX=0 crossover]",
-                              annotation_position="top right",
-                              annotation_font=dict(color=AMBER, size=10))
-            if mp_val and mp_val > 0:
-                sf2.add_hline(y=mp_val, line_dash="dot", line_color=MUTED, line_width=1.5,
-                              annotation_text=f"Max Pain  {mp_val:,.0f}  [aggregate loss minimum]",
-                              annotation_position="bottom right",
-                              annotation_font=dict(color=MUTED, size=10))
-            if sup_v and sup_v > 0:
-                sf2.add_hline(y=sup_v, line_dash="dash", line_color=GREEN, line_width=2,
-                              annotation_text=f"Support  {sup_v:,.0f}  [max put OI wall]",
-                              annotation_position="top left",
-                              annotation_font=dict(color=GREEN, size=10))
-            if res_v and res_v > 0:
-                sf2.add_hline(y=res_v, line_dash="dash", line_color=RED, line_width=2,
-                              annotation_text=f"Resistance  {res_v:,.0f}  [max call OI wall]",
-                              annotation_position="bottom left",
-                              annotation_font=dict(color=RED, size=10))
-            sf2.update_layout(
-                title=(
-                    "Graph 3 — NIFTY Spot (15-min)  |  "
-                    "Amber=Gamma Flip  Green=Put Wall(Support)  Red=Call Wall(Resistance)  Grey=Max Pain"
-                ),
-                height=420, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-                margin=dict(l=52, r=18, t=68, b=44),
-                font=dict(color="#1A1A2E", size=11),
-                hoverlabel=dict(bgcolor="#fff", font_color="#1A1A2E", font_size=11),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                            font=dict(color="#1A1A2E", size=10),
-                            itemclick="toggle", itemdoubleclick="toggleothers"),
-                yaxis=dict(title="NIFTY Spot (points)", showgrid=True, gridcolor="#F3F4F6", zeroline=False),
-            )
-            st.plotly_chart(sf2, width='stretch', config={"displayModeBar": False})
-
-        # ── Composite Δ-Flow Bias + Gamma Blast Monitor side by side ────────
-        # H19 fix: was `bias = ...` which shadowed the module-level `bias`
-        # (compute_nifty_bias) used elsewhere. The two dicts have different
-        # schemas (legacy has factors/regime/confidence; DW has components/
-        # narrative/delta_active). Renamed to `dw_bias` so any code after this
-        # block that reads `bias["bias_score"]` etc. correctly gets the legacy
-        # nifty-bias values, not the DW composite.
-        dw_bias = compute_dw_composite_bias(bkt, expiry)
-
-        # Compute gamma blast monitor
-        _alert_for_gbm = compute_pre_move_alert(m, history)
-        gbm = compute_gamma_blast_monitor(bkt, m, _alert_for_gbm, spot_px=spot)  # Fix #1
-
-        bias_col, blast_col = st.columns(2)
-
-        with bias_col:
-            b_score  = dw_bias.get("score", 0)
-            b_dir    = dw_bias.get("direction", "NEUTRAL")
-            b_conf   = dw_bias.get("confidence", 0)
-            b_comps  = dw_bias.get("components", {})
-            b_narr   = dw_bias.get("narrative", "")
-            b_dact   = dw_bias.get("delta_active", False)
-
-            if b_score >= 45:    b_col = "#059669"
-            elif b_score >= 15:  b_col = "#10B981"
-            elif b_score <= -45: b_col = "#DC2626"
-            elif b_score <= -15: b_col = "#F87171"
-            else:                b_col = AMBER
-
-            pct_bar = int((b_score + 100) / 2)
-            delta_badge = (
-                '<span style="font-size:11px;font-weight:700;background:#ECFDF5;color:#065F46;padding:2px 8px;border-radius:5px;">✅ Δ-weighted active</span>'
-                if b_dact else
-                '<span style="font-size:11px;font-weight:700;background:#FEF3C7;color:#92400E;padding:2px 8px;border-radius:5px;">⚠️ Δ≈0 — raw proxy</span>'
-            )
-            comp_labels = {
-                "net_flow_dir": "Net Δ-Flow Direction",
-                "flow_accel"  : "Flow Acceleration",
-                "gex_regime"  : "GEX Regime",
-                "flip_side"   : "vs Gamma Flip",
-                "max_pain"    : "Max Pain Gravity",
-            }
-            comp_rows_html = ""
-            for key, (pts, lbl) in b_comps.items():
-                col = "#059669" if pts > 0 else ("#DC2626" if pts < 0 else MUTED)
-                comp_rows_html += (
-                    f'<div style="display:flex;justify-content:space-between;margin-bottom:4px;align-items:flex-start;">'
-                    f'<span style="font-size:12px;color:#1A1A2E;font-weight:600;min-width:160px;">{comp_labels.get(key, key)}</span>'
-                    f'<span style="font-size:12px;font-weight:700;color:{col};margin-right:8px;white-space:nowrap;">{pts:+.1f} pts</span>'
-                    f'<span style="font-size:11px;color:#6B7280;font-weight:500;">{lbl}</span></div>'
-                )
-
-            st.markdown(
-                f'''<div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;
-                            padding:14px 18px;box-shadow:0 1px 4px rgba(0,0,0,0.07);margin-top:6px;">
-                  <div style="display:flex;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">
-                    <span style="font-weight:800;font-size:14px;color:#5C35CC;">Composite Δ-Flow Bias</span>
-                    <span style="background:{b_col}22;color:{b_col};border:1px solid {b_col};
-                                 border-radius:6px;padding:2px 10px;font-size:13px;font-weight:800;">
-                      {b_dir}  {b_score:+.1f}/100
-                    </span>
-                    <span style="font-size:12px;color:#6B7280;font-weight:600;">Conf {b_conf}%</span>
-                    {delta_badge}
-                  </div>
-                  <div style="background:#E5E7EB;border-radius:6px;height:10px;margin-bottom:10px;position:relative;">
-                    <div style="width:{pct_bar}%;height:100%;background:{b_col};border-radius:6px;transition:width 0.4s ease;"></div>
-                    <div style="position:absolute;top:-1px;left:50%;width:2px;height:12px;background:#6B7280;"></div>
-                  </div>
-                  <div style="margin-bottom:8px;">{comp_rows_html}</div>
-                  <div style="font-size:12px;color:#1A1A2E;font-weight:500;background:#F9FAFB;
-                              padding:7px 10px;border-radius:6px;line-height:1.6;">{b_narr}</div>
-                </div>''',
-                unsafe_allow_html=True,
-            )
-
-        with blast_col:
-            g_score  = gbm["score"]
-            g_stage  = gbm["stage"]
-            g_col    = gbm["s_col"]
-            g_bg     = gbm["s_bg"]
-            g_sigs   = gbm["signals"]
-            g_note   = gbm["note"]
-            g_pms    = gbm["pre_move_score"]
-
-            g_pct    = g_score  # 0-100 bar
-            pms_col  = "#DC2626" if g_pms >= 2 else "#6B7280"
-            pms_bg   = "#FEF2F2" if g_pms >= 2 else "#F9FAFB"
-
-            sig_rows_html = ""
-            for sig_label, sig_val, sig_pts, sig_color in g_sigs:
-                pts_str = f"+{sig_pts}pt" if sig_pts > 0 else "—"
-                sig_rows_html += (
-                    f'<div style="display:flex;justify-content:space-between;margin-bottom:3px;align-items:flex-start;">'
-                    f'<span style="font-size:11.5px;color:#1A1A2E;font-weight:600;min-width:120px;">{sig_label}</span>'
-                    f'<span style="font-size:11px;font-weight:700;color:{sig_color};margin-right:6px;white-space:nowrap;">{pts_str}</span>'
-                    f'<span style="font-size:11px;color:#6B7280;font-weight:500;">{sig_val}</span></div>'
-                )
-
-            st.markdown(
-                f'''<div style="background:#fff;border:2px solid {g_col};border-radius:10px;
-                            padding:14px 16px;box-shadow:0 1px 6px rgba(0,0,0,0.10);margin-top:6px;height:100%;">
-                  <div style="display:flex;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:6px;">
-                    <span style="font-weight:800;font-size:13.5px;color:{g_col};">💥 Gamma Blast Monitor</span>
-                    <span style="background:{g_bg};color:{g_col};border:1px solid {g_col};
-                                 border-radius:6px;padding:2px 9px;font-size:12px;font-weight:800;">{g_stage}</span>
-                    <span style="font-size:12px;color:#6B7280;font-weight:600;">Risk: {g_score}/100</span>
-                    <span style="font-size:11px;color:{pms_col};font-weight:700;
-                                 background:{pms_bg};padding:2px 7px;border-radius:5px;">S8 Fires: {g_pms}/4</span>
-                  </div>
-                  <div style="background:#E5E7EB;border-radius:6px;height:10px;margin-bottom:10px;">
-                    <div style="width:{g_pct}%;height:100%;background:{g_col};border-radius:6px;transition:width 0.4s ease;"></div>
-                  </div>
-                  <div style="margin-bottom:8px;">{sig_rows_html}</div>
-                  <div style="font-size:11.5px;color:#1A1A2E;font-weight:500;background:{g_bg};
-                              padding:6px 10px;border-radius:6px;line-height:1.55;
-                              border-left:3px solid {g_col};">
-                    <strong style="color:{g_col};">What this means: </strong>{g_note}
-                  </div>
-                  <div style="font-size:10px;color:#6B7280;margin-top:6px;font-style:italic;">
-                    Stage 1=structural setup · Stage 2=pressure building · Stage 3=imminent · Stage 4=blast in motion
-                  </div>
-                </div>''',
-                unsafe_allow_html=True,
-            )
-
-    else:
-        st.info(f"⏳ Collecting data for Section 9 — need 2+ buckets (≈30 min after open)...")
-else:
-    st.info(f"Collecting history for Section 9 charts — {len(history)}/2 ticks.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
