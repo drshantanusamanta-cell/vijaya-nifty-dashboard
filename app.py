@@ -4197,16 +4197,28 @@ def _bt_spot_levels_chart(tick_list):
 # Vega Ratio, GEX etc. are computed identically to how the live dashboard
 # computes them — not a re-implementation that could quietly drift.
 #
-# KNOWN UNCERTAINTY (flagging honestly rather than guessing silently):
-# Dhan's docs specify `expiryFlag` ("WEEK"/"MONTH") and `expiryCode` (integer)
-# as required request fields but only point to the Instrument List page for
-# meaning, which documents SEM_EXPIRY_CODE for FUTURES contracts — it does not
-# fully specify how expiryCode indexes options expiries for this endpoint.
-# We default to expiryCode=0 (interpreted as "the expiry nearest the requested
-# date range") and expiryFlag="WEEK", exposed as an Advanced override in the
-# UI. This could not be verified against a live Dhan account in this
-# environment — if the reconstructed spot path looks inconsistent with known
-# NIFTY closes for that day, try adjusting expiryCode/expiryFlag.
+# KNOWN LIMITATION  confirmed via Dhan's own user community (MadeForTrade
+# forum thread "Feature Request: Contract-Level Expiry Info in Expired
+# Options API", Nov 2025 - Jun 2026), not just guessed:
+#   - expiryCode is 1-indexed: 1 = current/nearest expiry, 2 = next, 3 = far
+#     ("current / next / far" relative to the trading date), NOT 0-indexed.
+#   - Dhan's own staff confirm (as of their Feb 2026 reply) there is currently
+#     NO reliable way to know which exact expiry date a given
+#     (expiryFlag, expiryCode) pair resolves to  a forum user flagged that
+#     "sometimes months have 4 weekly expiries... passing expiry code as 3
+#     doesn't provide reliable data or give proof which expiry the data
+#     belongs to." Dhan says they are "assessing feasibility" of adding an
+#     explicit expiry_date field; unresolved as of their latest reply
+#     (Mar 2026).
+#   - Separately, at least one user reported (Mar 2026) that reconstructed
+#     ATM-strike data checked against independent sources "is completely
+#     inaccurate... extremely wayoff" for this endpoint  unresolved by Dhan
+#     as of that report.
+# Given this, treat "Dhan historical (expired options)" reconstruction as
+# EXPERIMENTAL, not a trustworthy backtest source yet  cross-check the
+# reconstructed spot path against a known NIFTY close before relying on it.
+# The self-archived path (today onward) has no such issue since it replays
+# this app's own live-recorded ticks.
 # Likewise, the exact time-to-expiry used for Greek derivation is APPROXIMATED
 # (nearest Thursday for weekly, since the endpoint doesn't echo back the
 # resolved expiry date) — this mainly affects Vega/Theta magnitude, less so
@@ -4248,7 +4260,50 @@ def _fetch_rollingoption_series(expiry_flag, expiry_code, offset, opt_side, inte
         return None, "empty response for this strike/side"
     return block, None
 
-def _reconstruct_backtest_day_via_rollingoption(target_date_str, expiry_flag="WEEK", expiry_code=0,
+def _bt_expiry_candidates(ref_date_str, weekly_count=6, monthly_count=3):
+    """Real calendar expiry dates on/after ref_date_str, for the Backtest Mode
+    expiry-date dropdown. NIFTY weekly options expire every Tuesday (moved from
+    Thursday, effective 1-Sep-2025); monthly expiry = last Tuesday of the month.
+    Each candidate carries the Dhan expiryFlag/expiryCode it maps to, so the UI
+    shows a real date while _reconstruct_backtest_day_via_rollingoption still
+    gets the flag+code the Dhan endpoint actually expects. This sidesteps the
+    "which expiryCode is which date" ambiguity entirely — we pick the date, then
+    derive the code, rather than guessing what a code means.
+    Caveat: doesn't account for exchange holidays shifting an expiry a day
+    earlier — cross-check the fetched spot path if a holiday fell near this date.
+    """
+    d = date.fromisoformat(ref_date_str)
+    days_ahead = (1 - d.weekday()) % 7  # Tuesday == weekday() 1
+    first_tue = d + timedelta(days=days_ahead)
+
+    out = []
+    cur = first_tue
+    for i in range(weekly_count):
+        out.append({
+            "date": cur.isoformat(), "flag": "WEEK", "code": i + 1,
+            "label": f"{cur.strftime('%d-%b-%Y')} (Tue) · Weekly, expiry #{i + 1}",
+        })
+        cur = cur + timedelta(days=7)
+
+    probe_month_start = date(d.year, d.month, 1)
+    added = 0
+    while added < monthly_count:
+        next_month = (date(probe_month_start.year + 1, 1, 1) if probe_month_start.month == 12
+                      else date(probe_month_start.year, probe_month_start.month + 1, 1))
+        last_day = next_month - timedelta(days=1)
+        last_tue = last_day - timedelta(days=(last_day.weekday() - 1) % 7)
+        if last_tue >= d:
+            out.append({
+                "date": last_tue.isoformat(), "flag": "MONTH", "code": added + 1,
+                "label": f"{last_tue.strftime('%d-%b-%Y')} (Tue) · Monthly, expiry #{added + 1}",
+            })
+            added += 1
+        probe_month_start = next_month
+
+    out.sort(key=lambda c: c["date"])
+    return out
+
+def _reconstruct_backtest_day_via_rollingoption(target_date_str, expiry_flag="WEEK", expiry_code=1,
                                                  band_n=10, interval="1", progress_cb=None):
     """Pull ATM±band_n CE+PE rolling-option series for one day from Dhan and
     reconstruct per-minute tick dicts (same schema as build_history_entry) by
@@ -4706,7 +4761,7 @@ if st.session_state.get("owner_unlocked"):
         _bt_archived_dates = _list_backtest_dates()
         _bt_today_str = now_ist().date().isoformat()
 
-        _bt_dcol1, _bt_dcol2 = st.columns(2)
+        _bt_dcol1, _bt_dcol2, _bt_dcol3 = st.columns([1, 1, 1.3])
         with _bt_dcol1:
             _bt_date = st.date_input(
                 "Backtest date", value=now_ist().date(),
@@ -4721,6 +4776,17 @@ if st.session_state.get("owner_unlocked"):
                 key="bt_time_input",
             )
         _bt_date_str = _bt_date.isoformat()
+        _bt_expiry_opts = _bt_expiry_candidates(_bt_date_str)
+        with _bt_dcol3:
+            _bt_expiry_sel = st.selectbox(
+                "Expiry (for Dhan reconstruction)",
+                options=_bt_expiry_opts,
+                format_func=lambda c: c["label"],
+                key="bt_expiry_select",
+                help="Only used if this date needs Dhan reconstruction (no self-archive). "
+                     "Pick the real contract expiry you want — the app converts it to Dhan's "
+                     "internal expiryFlag/expiryCode automatically, no guessing needed.",
+            )
 
         if _bt_date_str in _bt_archived_dates:
             st.success(f"✅ Self-archived data available for {_bt_date_str}.")
@@ -4730,20 +4796,20 @@ if st.session_state.get("owner_unlocked"):
                     "Check back after a few refreshes.")
             _bt_day_ticks = []
         else:
-            st.warning(
-                f"No self-archived data for {_bt_date_str}. It can be reconstructed from Dhan's "
-                "historical expired-options endpoint (rolling ATM±10, derived Greeks via the "
-                "same Black-Scholes engine used live). **Expiry-code resolution and time-to-"
-                "expiry are best-effort approximations** — not verified against a live Dhan "
-                "account in this build, so treat absolute vega/theta-driven levels with caution; "
-                "directional reads (EV ratio, spot path) are more robust."
+            st.error(
+                f"No self-archived data for {_bt_date_str}. Dhan's historical expired-options "
+                "endpoint can reconstruct it using the expiry you picked above, but treat it as "
+                "**experimental, not fully trustworthy yet** — per Dhan's own user community "
+                "(MadeForTrade forum, Nov 2025 to Jun 2026): at least one user reported "
+                "reconstructed ATM data was \"completely inaccurate... extremely wayoff\" vs "
+                "independent sources. **Cross-check the reconstructed spot path against a known "
+                "NIFTY close before trusting anything else here.** The self-archived path above "
+                "has none of these issues since it replays this app's own live ticks."
             )
-            with st.expander("Advanced: expiry resolution override", expanded=False):
-                _bt_exp_flag = st.selectbox("Expiry flag", ["WEEK", "MONTH"], key="bt_exp_flag")
-                _bt_exp_code = st.number_input("Expiry code", min_value=0, max_value=10, value=0,
-                                                step=1, key="bt_exp_code")
-            _bt_exp_flag = st.session_state.get("bt_exp_flag", "WEEK")
-            _bt_exp_code = int(st.session_state.get("bt_exp_code", 0))
+            _bt_exp_flag = _bt_expiry_sel["flag"]
+            _bt_exp_code = _bt_expiry_sel["code"]
+            st.caption(f"Will reconstruct against the **{_bt_expiry_sel['date']}** expiry "
+                       f"({_bt_expiry_sel['flag'].title()} series).")
             _bt_day_ticks = []
             if st.button(f"⬇️ Fetch {_bt_date_str} from Dhan", key="bt_fetch_btn"):
                 if not USE_DHAN:
