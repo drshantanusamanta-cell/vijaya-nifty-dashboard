@@ -4420,11 +4420,21 @@ def _reconstruct_backtest_day_via_rollingoption(target_date_str, expiry_flag="WE
 
         # Approximate expiry date for Black-Scholes T (see module caveat above):
         # nearest Thursday on/after the tick's date for weekly, else month-end.
-        _tick_dt = datetime.utcfromtimestamp(ts)
+        # H5 fix: Dhan's rollingoption epoch is true UTC (confirmed by decoding
+        # Dhan's own docs sample timestamps — utcfromtimestamp() alone lands at
+        # 03:37 IST-clock-digits for a candle that's actually 09:07 IST, i.e.
+        # 5h30m early). Every downstream market-hours / "since open" check in
+        # this app assumes hist_entry["ts"] is IST wall-clock, so this was
+        # silently pushing every reconstructed tick outside the 09:15-15:30
+        # window — the actual cause of charts staying empty even though the
+        # fetch itself reported no error.
+        _tick_dt = datetime.utcfromtimestamp(ts) + timedelta(hours=5, minutes=30)
         _tick_date = _tick_dt.date()
         if expiry_flag == "WEEK":
-            _days_to_thu = (3 - _tick_date.weekday()) % 7
-            _approx_expiry = _tick_date + timedelta(days=_days_to_thu)
+            # NIFTY weekly expiry moved from Thursday to Tuesday effective
+            # 1-Sep-2025 (NSE circular) — matches _bt_expiry_candidates above.
+            _days_to_tue = (1 - _tick_date.weekday()) % 7
+            _approx_expiry = _tick_date + timedelta(days=_days_to_tue)
         else:
             _nxt = _tick_date.replace(day=28) + timedelta(days=4)
             _approx_expiry = _nxt - timedelta(days=_nxt.day)
@@ -4876,6 +4886,23 @@ if st.session_state.get("owner_unlocked"):
                 _bt_day_ticks = []   # stale cache from a different date
 
         if _bt_day_ticks:
+            # Diagnostic: surface exactly how much data actually landed for the
+            # day, so a sparse/misaligned reconstruction (fetch "succeeds" but
+            # produces far fewer minute-ticks than a real 375-min session,
+            # e.g. because per-strike timestamp grids from separate Dhan calls
+            # don't line up minute-for-minute) is visible instead of silently
+            # starving the charts below with no explanation.
+            _bt_n_all = len(_bt_day_ticks)
+            _bt_ts_lo, _bt_ts_hi = _bt_day_ticks[0]["ts"][11:16], _bt_day_ticks[-1]["ts"][11:16]
+            if _bt_n_all < 100:
+                st.warning(f"Only **{_bt_n_all} minute-ticks** cover {_bt_date_str} "
+                           f"({_bt_ts_lo}–{_bt_ts_hi} IST) — a full session is ~375. This usually "
+                           "means the reconstruction only found overlapping timestamps across a "
+                           "few strikes/sides rather than a gap in the fix itself; the charts below "
+                           "need a run of consecutive minutes to compute anything.")
+            else:
+                st.caption(f"{_bt_n_all} minute-ticks loaded for {_bt_date_str} "
+                           f"({_bt_ts_lo}–{_bt_ts_hi} IST).")
             _bt_cutoff = f"{_bt_date_str}T{_bt_time.strftime('%H:%M:%S')}"
             _bt_ticks_upto = [h for h in _bt_day_ticks if h.get("ts", "") <= _bt_cutoff]
             if not _bt_ticks_upto:
