@@ -236,14 +236,18 @@ def _render_owner_sidebar(expiry_list):
             # AND the strike-wise averaging band for the CE/PE EV Ratio charts —
             # one control now governs the strike width for all 4 Z-Score charts
             # (Raw & OI-Wtd Vega Ratio, Raw & OI-Wtd CE/PE EV Ratio).
-            # ±1 = tight (expiry-day); ±2 = default; ±3/4 = monthlies with wide smile.
-            _VEGA_BAND_OPTIONS = {"±1 strike  (50 pts)": 1,
-                                  "±2 strikes (100 pts) — default": 2,
-                                  "±3 strikes (150 pts)": 3,
-                                  "±4 strikes (200 pts)": 4}
-            _saved_vb = _cur_settings.get("vega_band_strikes", 2)
+            # H6 fix: reduced to the 2 requested options (±3 / ±5). Also — this
+            # is baked into compute_metrics at FETCH time (not read fresh at
+            # render time like the Z-Score TF/lookback settings below), so the
+            # selector silently had no visible effect until the next scheduled
+            # refresh cycle (up to `refresh_interval` seconds later). That's
+            # the actual reason it looked "broken" — fixed by force-expiring
+            # the server cache immediately on change, same as the expiry selector.
+            _VEGA_BAND_OPTIONS = {"±3 strikes (150 pts) — default": 3,
+                                  "±5 strikes (250 pts)": 5}
+            _saved_vb = _cur_settings.get("vega_band_strikes", 3)
             _vb_label = next((k for k, v in _VEGA_BAND_OPTIONS.items() if v == _saved_vb),
-                             "±2 strikes (100 pts) — default")
+                             "±3 strikes (150 pts) — default")
             _chosen_vb = st.selectbox(
                 "📐 ATM Vega band width",
                 list(_VEGA_BAND_OPTIONS.keys()),
@@ -252,13 +256,14 @@ def _render_owner_sidebar(expiry_list):
                 help="Number of strikes either side of ATM. Governs all 4 Z-Score "
                      "charts: the OI-weighted band vega sum (Raw & OI-Wtd Vega "
                      "Ratio charts) and the strike-wise averaging band (Raw & "
-                     "OI-Wtd CE/PE EV Ratio charts). Wider = smoother but includes "
-                     "more OTM noise.",
+                     "OI-Wtd CE/PE EV Ratio charts). Takes effect on the next "
+                     "data fetch (forced immediately on change).",
             )
             _new_vb = _VEGA_BAND_OPTIONS[_chosen_vb]
             if _new_vb != _saved_vb:
                 _cur_settings["vega_band_strikes"] = _new_vb
                 _save_owner_settings(_cur_settings)
+                _force_server_refresh()   # H6 fix: recompute immediately with the new band width
             st.caption(f"Band: ATM ± {_new_vb} × 50 = ±{_new_vb * NIFTY_STEP} pts")
 
             st.divider()
@@ -1154,7 +1159,7 @@ def compute_metrics(df, spot, expiry=None, history=None):
     # Ratio). Loaded here (pre-backfill) since only band membership is needed,
     # not vega values themselves — those are captured separately below.
     try:
-        _zband_n = int(_load_owner_settings().get("vega_band_strikes", 2))
+        _zband_n = int(_load_owner_settings().get("vega_band_strikes", 3))
     except Exception:
         _zband_n = 2
     _zband_lo = atm - _zband_n * NIFTY_STEP
@@ -1276,7 +1281,7 @@ def compute_metrics(df, spot, expiry=None, history=None):
     # Placed here (after IV+greek backfill) so we always read filled vega values.
     try:
         _vb_settings  = _load_owner_settings()
-        _vega_band_n  = int(_vb_settings.get("vega_band_strikes", 2))
+        _vega_band_n  = int(_vb_settings.get("vega_band_strikes", 3))
     except Exception:
         _vega_band_n  = 2
     _vb_lo = atm - _vega_band_n * NIFTY_STEP
@@ -3624,7 +3629,7 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
         # "ATM Vega band width" setting — the underlying vega/EV values were
         # always computed with the correct configured band, only the chart
         # title/label silently showed the wrong number of strikes.
-        "vega_band_strikes": m.get("vega_band_strikes", 2),
+        "vega_band_strikes": m.get("vega_band_strikes", 3),
         "call_oi_total":call_oi_total,
         "put_oi_total": put_oi_total,
         "synth_excess": synth_excess,
@@ -4943,7 +4948,7 @@ if st.session_state.get("owner_unlocked"):
                              f'{_bt_cards_html}</div>', unsafe_allow_html=True)
 
                 _bt_settings = _load_owner_settings()
-                _bt_band_n   = int(_bt_settings.get("vega_band_strikes", 2))
+                _bt_band_n   = int(_bt_settings.get("vega_band_strikes", 3))
                 _bt_tf_min   = int(_bt_settings.get("zscore_tf_minutes", 15))
                 _bt_lookback = int(_bt_settings.get("zscore_lookback_buckets", 6))
                 st.caption(f"Charts use the same owner Z-Score settings as the live view: "
@@ -7518,18 +7523,29 @@ if not _sv_df.empty:
     )
     st.caption(
         "Raw NDM assumes ALL OI addition is buyer-driven. "
-        "Enhanced NDM corrects this: when premium FALLS as OI rises, a WRITER is adding — "
-        "the MM takes the opposite side, reversing the hedge direction. "
+        "Enhanced NDM corrects this using the raw Call/Put Extrinsic Value ratio: "
+        "EV ratio > 1 → Call buyer / Put writer; EV ratio < 1 → Put buyer / Call writer. "
+        "The MM takes the opposite side of the buyer, reversing the hedge direction. "
         "If Enhanced NDM diverges from Raw NDM, the raw signal is unreliable."
     )
 
-    # Build Enhanced NDM per strike using call_ltp / put_ltp direction
-    # Prev-tick LTP: look up history[-2] if available, else fall back to current (no change)
-    _prev_band_map = {}
-    if len(history) >= 2:
-        _prev_band_records = history[-2].get("_df_band_records", [])
-        for _pb in _prev_band_records:
-            _prev_band_map[_pb.get("strike")] = _pb
+    # Build Enhanced NDM using the raw Call/Put Extrinsic Value ratio (the same
+    # ev_ratio_avg_strikewise metric driving the "Raw CE/PE EV Ratio" Z-Score
+    # chart) to decide the buyer/writer stance for THIS tick — replacing the
+    # previous per-strike prev-tick premium-direction comparison:
+    #   EV ratio > 1  -> Call buyer, Put seller/writer
+    #   EV ratio < 1  -> Put buyer, Call seller/writer
+    #   EV ratio == 1 -> no dominant side (neutral)
+    # This single stance applies uniformly to every strike in the band. All
+    # other reasoning — contribution formulas, Raw NDM, signal classification,
+    # suppression window — is unchanged.
+    _ev_ratio_now = float(m.get("ev_ratio_avg_strikewise", 0) or 0)
+    if _ev_ratio_now > 1:
+        _c_prem_dir_g, _p_prem_dir_g = 1, -1     # Call buyer / Put seller(writer)
+    elif _ev_ratio_now < 1:
+        _c_prem_dir_g, _p_prem_dir_g = -1, 1     # Put buyer / Call seller(writer)
+    else:
+        _c_prem_dir_g, _p_prem_dir_g = 0, 0      # EV ratio exactly 1 — no dominant side
 
     _endm_rows = []
     for _r in df_band_records:
@@ -7538,38 +7554,19 @@ if not _sv_df.empty:
         _p_oi_chg   = float(_r.get("put_oi_chg",  0) or 0)
         _c_delta    = abs(float(_r.get("call_delta", 0) or 0))
         _p_delta    = abs(float(_r.get("put_delta",  0) or 0))
-        _c_ltp      = float(_r.get("call_ltp", 0) or 0)
-        _p_ltp      = float(_r.get("put_ltp",  0) or 0)
 
-        # Prev LTP — fallback to current if no history (= no change, prem_dir = +1)
-        _prev       = _prev_band_map.get(_strike, {})
-        _c_ltp_prev = float(_prev.get("call_ltp", _c_ltp) or _c_ltp)
-        _p_ltp_prev = float(_prev.get("put_ltp",  _p_ltp) or _p_ltp)
+        _c_prem_dir = _c_prem_dir_g
+        _p_prem_dir = _p_prem_dir_g
 
-        # Fix 5: Noise floor — ignore premium moves < 0.50 Rs (bid-ask bounce)
-        # Direction set to 0 (ambiguous) when move is sub-floor; those strikes
-        # still contribute raw NDM but don't influence Enhanced NDM.
-        _PREM_FLOOR = 0.50
-        _c_prem_move = abs(_c_ltp - _c_ltp_prev)
-        _p_prem_move = abs(_p_ltp - _p_ltp_prev)
-        if _c_prem_move < _PREM_FLOOR:
-            _c_prem_dir = 0   # ambiguous — treat as neutral
-        else:
-            _c_prem_dir = 1 if _c_ltp >= _c_ltp_prev else -1
-        if _p_prem_move < _PREM_FLOOR:
-            _p_prem_dir = 0   # ambiguous — treat as neutral
-        else:
-            _p_prem_dir = 1 if _p_ltp >= _p_ltp_prev else -1
-
-        # If both sides are sub-floor (pure noise tick), skip this strike entirely
+        # EV ratio exactly 1 (rare) — no dominant side this tick.
         if _c_prem_dir == 0 and _p_prem_dir == 0:
             _raw_ndm_v = (_c_oi_chg * _c_delta) - (_p_oi_chg * _p_delta)
             _endm_rows.append({
                 "Strike":        int(_strike),
                 "C OI Chg":      int(_c_oi_chg),
-                "C Prem Dir":    "~ Noise",
+                "C Prem Dir":    "~ Neutral",
                 "P OI Chg":      int(_p_oi_chg),
-                "P Prem Dir":    "~ Noise",
+                "P Prem Dir":    "~ Neutral",
                 "Enhanced NDM":  0,
                 "Raw NDM":       round(_raw_ndm_v),
             })
@@ -7577,7 +7574,6 @@ if not _sv_df.empty:
 
         # Call: buyer aggressor → MM short call → buys futures → +delta
         # Call: writer aggressor → MM long call  → sells futures → -delta
-        # prem_dir=0 → ambiguous; zero contribution for that leg
         _c_contrib  = _c_oi_chg * _c_delta * _c_prem_dir
 
         # Put: buyer aggressor → MM short put → sells futures → -delta  (prem_dir=+1 → negative)
@@ -7590,9 +7586,9 @@ if not _sv_df.empty:
         _endm_rows.append({
             "Strike":        int(_strike),
             "C OI Chg":      int(_c_oi_chg),
-            "C Prem Dir":    "↑ Buyer" if _c_prem_dir == 1 else ("↓ Writer" if _c_prem_dir == -1 else "~ Noise"),
+            "C Prem Dir":    "↑ Buyer" if _c_prem_dir == 1 else "↓ Writer",
             "P OI Chg":      int(_p_oi_chg),
-            "P Prem Dir":    "↑ Buyer" if _p_prem_dir == 1 else ("↓ Writer" if _p_prem_dir == -1 else "~ Noise"),
+            "P Prem Dir":    "↑ Buyer" if _p_prem_dir == 1 else "↓ Writer",
             "Enhanced NDM":  round(_endm_val),
             "Raw NDM":       round(_raw_ndm_v),
         })
@@ -7662,9 +7658,11 @@ if not _sv_df.empty:
 
         with st.expander("📊 Strike-by-Strike Enhanced NDM Breakdown", expanded=False):
             st.caption(
-                "↑ Buyer = OI added with rising premium (MM hedges WITH the move). "
-                "↓ Writer = OI added with falling premium (MM hedges AGAINST the move, flipping sign). "
-                "Enhanced NDM corrects raw NDM for writer-dominated strikes."
+                f"Raw Call/Put EV ratio this tick: **{_ev_ratio_now:.3f}**. "
+                "↑ Buyer = this side is buyer-dominated per the EV ratio (MM hedges WITH the move). "
+                "↓ Writer = this side is writer-dominated (MM hedges AGAINST the move, flipping sign). "
+                "Stance is the same across every strike this tick; only OI change and delta vary "
+                "row to row."
             )
 
             def _endm_style(val):
