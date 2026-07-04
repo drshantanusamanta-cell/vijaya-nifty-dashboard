@@ -1161,7 +1161,7 @@ def compute_metrics(df, spot, expiry=None, history=None):
     try:
         _zband_n = int(_load_owner_settings().get("vega_band_strikes", 3))
     except Exception:
-        _zband_n = 2
+        _zband_n = 3
     _zband_lo = atm - _zband_n * NIFTY_STEP
     _zband_hi = atm + _zband_n * NIFTY_STEP
     t_band = t[t["strike"].between(_zband_lo, _zband_hi)]
@@ -1275,7 +1275,7 @@ def compute_metrics(df, spot, expiry=None, history=None):
         pass
 
     # ── Band vega capture (post-backfill) ────────────────────────────────────────
-    # Read vega_band_strikes from persisted owner settings (default 2 = ±100 pts).
+    # Read vega_band_strikes from persisted owner settings (default 3 = ±150 pts).
     # OI-weighted sum across the band gives a stable, positioning-aware vega signal
     # that doesn't jump discontinuously when ATM shifts by one strike.
     # Placed here (after IV+greek backfill) so we always read filled vega values.
@@ -1283,7 +1283,7 @@ def compute_metrics(df, spot, expiry=None, history=None):
         _vb_settings  = _load_owner_settings()
         _vega_band_n  = int(_vb_settings.get("vega_band_strikes", 3))
     except Exception:
-        _vega_band_n  = 2
+        _vega_band_n  = 3
     _vb_lo = atm - _vega_band_n * NIFTY_STEP
     _vb_hi = atm + _vega_band_n * NIFTY_STEP
     _vb_df = w[w["strike"].between(_vb_lo, _vb_hi)].copy()
@@ -6942,7 +6942,7 @@ if not df_band.empty:
             legend=dict(font=dict(color="#1A1A2E",size=11)))
         st.plotly_chart(f2, width='stretch', config={"displayModeBar":False})
     with ch3:
-        gv = (df_band["call_oi"]*df_band["call_gamma"] - df_band["put_oi"]*df_band["put_gamma"]) * spot**2 * 0.01
+        gv = (df_band["call_oi"]*df_band["call_gamma"] - df_band["put_oi"]*df_band["put_gamma"]) * NIFTY_LOT_SIZE * spot**2 * 0.01
         gc2 = [RED if v>0 else GREEN for v in gv]
         f3 = go.Figure(go.Bar(x=x, y=gv, marker_color=gc2))
         f3.add_vline(x=spot, line_width=2, line_dash="dash", line_color=CYAN)
@@ -6950,7 +6950,7 @@ if not df_band.empty:
             f3.add_vline(x=m["gamma_flip"], line_width=2, line_dash="dot", line_color=RED)
             f3.add_annotation(x=m["gamma_flip"], y=0, text=f"Flip@{int(m['gamma_flip'])}",
                 showarrow=True, arrowhead=2, font=dict(color=RED,size=10), ax=0, ay=-30)
-        f3.update_layout(title="★ GEX per Strike (Distance-Weighted)", height=275,
+        f3.update_layout(title="★ GEX per Strike", height=275,
             paper_bgcolor="#fff", plot_bgcolor="#F9FAFB", margin=dict(l=40,r=18,t=50,b=40), font=dict(color="#1A1A2E",size=11),
             hoverlabel=dict(bgcolor="#fff",font_color="#1A1A2E",font_size=11),
             legend=dict(font=dict(color="#1A1A2E",size=11)))
@@ -7233,7 +7233,7 @@ with strat_col:
       <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Market Mode</div>
       <div style="font-size:16px;font-weight:700;color:{strat['mode_color']};margin-bottom:8px;">{strat['market_mode']}</div>
       <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Direction</div>
-      <div style="font-size:14px;font-weight:700;color:{bc};margin-bottom:8px;">{direction_label}</div>
+      <div style="font-size:14px;font-weight:700;color:{bc};margin-bottom:8px;">{_s34_bias["direction"]}</div>
       <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Strategy</div>
       <div style="font-size:14px;font-weight:700;color:{strat['color']};margin-bottom:6px;">{strat['name']}</div>
       <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Execution</div>
