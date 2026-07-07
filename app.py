@@ -6987,6 +6987,45 @@ if not df_band.empty:
             legend=dict(orientation="h",y=1.08,x=0,font=dict(color="#1A1A2E",size=11)), yaxis_title="IV %")
         st.plotly_chart(f5, width='stretch', config={"displayModeBar":False})
 
+    # ★ Strike-wise CE/PE Extrinsic-Value Ratio bars — Raw & OI-Weighted.
+    # Same per-strike ratios that feed the EV-Ratio Z-Score charts
+    # (compute_metrics: ev_c/ev_p and ev_c×CallOI / ev_p×PutOI), over the
+    # SAME shared ATM±vega_band_strikes band. Baseline = 1 (bars extend
+    # above/below it): >1 = Call extrinsic rich, <1 = Put extrinsic rich.
+    _ev_band_n = int(m.get("vega_band_strikes", 3))
+    _ev_atm_k  = safe_num(m.get("atm", 0))
+    _ev_bd = df_band[df_band["strike"].between(
+        _ev_atm_k - _ev_band_n * NIFTY_STEP,
+        _ev_atm_k + _ev_band_n * NIFTY_STEP)].copy()
+    _ev_bd["ev_c"] = np.maximum(0, _ev_bd["call_ltp"] - np.maximum(0, spot - _ev_bd["strike"]))
+    _ev_bd["ev_p"] = np.maximum(0, _ev_bd["put_ltp"]  - np.maximum(0, _ev_bd["strike"] - spot))
+    _evr_raw_s = (_ev_bd["ev_c"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
+    _evr_oiw_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi"]) /
+                  (_ev_bd["ev_p"] * _ev_bd["put_oi"]).replace(0, np.nan)).fillna(1.0)
+
+    def _s4_evr_bar(vals, title):
+        _cols = [GREEN if v >= 1 else RED for v in vals]
+        f = go.Figure(go.Bar(x=_ev_bd["strike"], y=vals - 1.0, base=1.0,
+                             marker_color=_cols, customdata=vals,
+                             hovertemplate="Strike %{x}<br>CE/PE EV Ratio: %{customdata:.3f}<extra></extra>"))
+        f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED)
+        f.add_vline(x=spot, line_width=2, line_dash="dash", line_color=CYAN)
+        f.update_layout(title=title, height=275,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB", margin=dict(l=40,r=18,t=50,b=40), font=dict(color="#1A1A2E",size=11),
+            hoverlabel=dict(bgcolor="#fff",font_color="#1A1A2E",font_size=11),
+            legend=dict(font=dict(color="#1A1A2E",size=11)), yaxis_title="CE/PE EV Ratio")
+        return f
+
+    ch6, ch7 = st.columns(2)
+    with ch6:
+        f6 = _s4_evr_bar(_evr_raw_s,
+                         f"★ Raw CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV rich · Red<1=Put EV rich")
+        st.plotly_chart(f6, width='stretch', config={"displayModeBar":False})
+    with ch7:
+        f7 = _s4_evr_bar(_evr_oiw_s,
+                         f"★ OI-Wtd CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×OI rich · Red<1=Put EV×OI rich")
+        st.plotly_chart(f7, width='stretch', config={"displayModeBar":False})
+
     # ── IV Smile Live Interpretation (full-width, powered by session history) ─
     # Maintain intraday rolling history for trend-aware classification
     if "iv_smile_history" not in st.session_state:
