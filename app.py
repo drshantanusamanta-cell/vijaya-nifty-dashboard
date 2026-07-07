@@ -382,7 +382,8 @@ METRIC_EXPLAIN = {
     "Bias Score":      "Hedge-flow bias score (-100..+100) from the legacy compute_nifty_bias engine — uses SIGNED delta x OI (net_delta), so it reads dealer hedge-flow pressure, not writer positioning. Use the S3/4 / Combined Decision panels for the authoritative directional call.",
     "Confidence":      "Signal quality score based on regime, persistence, concentration, and wall behavior.",
     "Regime":          "Range/pin, trend/expansion, or transition inferred from gamma, IV, walls, and persistence.",
-    "EV Ratio":        "Call vs put time value near spot; higher means call premium stronger, lower means put premium stronger.",
+    "EV Ratio (Raw Avg)":    "Per-strike Call/Put time-value ratio averaged across the ATM band (same series as the Raw CE/PE EV Ratio Z-Score chart); higher means call premium stronger, lower means put premium stronger.",
+    "EV Ratio (OI-Wtd Avg)": "Per-strike (Call EV x Call OI)/(Put EV x Put OI) averaged across the ATM band (same series as the OI-Wtd CE/PE EV Ratio Z-Score chart).",
     "Net Delta":       "Directional lean from near-spot open interest weighted by delta.",
     "Momentum":        "Fresh intraday open-interest change weighted by delta near spot.",
     "GEX":             "Gamma exposure from the structural band; positive tends to pin, negative tends to expand moves.",
@@ -1667,9 +1668,13 @@ def compute_nifty_bias(m, history=None):
     elif m["momentum"] < 0:
         direction -= BW["momentum"]; factors.append("OI momentum bearish")
 
-    if m["ev_ratio"] >= BW["ev_ratio_bull"]:
+    # EV signal now uses the raw per-strike average CE/PE EV ratio
+    # (ev_ratio_avg_strikewise, same series as the Z-Score charts) instead of
+    # the legacy ratio-of-sums ev_ratio.
+    _ev_sig = m.get("ev_ratio_avg_strikewise", m["ev_ratio"])
+    if _ev_sig >= BW["ev_ratio_bull"]:
         direction += BW["ev_ratio"]; factors.append("Call premium stronger")
-    elif m["ev_ratio"] <= BW["ev_ratio_bear"]:
+    elif _ev_sig <= BW["ev_ratio_bear"]:
         direction -= BW["ev_ratio"]; factors.append("Put premium stronger")
 
     if m["atm_pressure"] > 0:
@@ -1999,7 +2004,9 @@ def strategy_recommendation(bias, m, history=None):
     gamma_flip = m.get("gamma_flip")
     iv_rank    = m.get("iv_rank", 50)
     momentum   = m.get("momentum", 0)
-    ev_ratio   = m.get("ev_ratio", 1.0)
+    # Raw per-strike average CE/PE EV ratio (Z-Score chart series) replaces
+    # the legacy ratio-of-sums ev_ratio for the EV bias signal.
+    ev_ratio   = m.get("ev_ratio_avg_strikewise", m.get("ev_ratio", 1.0))
     pcr        = m.get("pcr", 1.0)
     skew_slope = m.get("skew_slope", 0)
     near_oichg = m.get("near_oichg_concentration", 0.5)
@@ -7247,7 +7254,10 @@ with strat_col:
 with metrics_col:
     mc = st.columns(4)
     metric_items = [
-        ("EV Ratio", m["ev_ratio"], GREEN if m["ev_ratio"]>=1.05 else (AMBER if m["ev_ratio"]>=0.95 else RED)),
+        ("EV Ratio (Raw Avg)", m.get("ev_ratio_avg_strikewise", 1.0),
+             GREEN if m.get("ev_ratio_avg_strikewise", 1.0)>=1.05 else (AMBER if m.get("ev_ratio_avg_strikewise", 1.0)>=0.95 else RED)),
+        ("EV Ratio (OI-Wtd Avg)", m.get("ev_ratio_oiw_avg_strikewise", 1.0),
+             GREEN if m.get("ev_ratio_oiw_avg_strikewise", 1.0)>=1.05 else (AMBER if m.get("ev_ratio_oiw_avg_strikewise", 1.0)>=0.95 else RED)),
         ("Net Delta", f"{int(m['net_delta']):,}", GREEN if m["net_delta"]>0 else RED),
         ("Momentum",  f"{int(m['momentum']):,}",  GREEN if m["momentum"]>0 else RED),
         ("GEX",       f"{m['gex']:,.0f}",          GREEN if m["gex"]>0 else RED),
