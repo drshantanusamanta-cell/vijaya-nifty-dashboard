@@ -7026,6 +7026,16 @@ if not df_band.empty:
                          f"★ OI-Wtd CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×OI rich · Red<1=Put EV×OI rich")
         st.plotly_chart(f7, width='stretch', config={"displayModeBar":False})
 
+    # ★ Strike-wise OI-CHANGE-Weighted CE/PE EV Ratio — per strike,
+    # (Intraday Call OI Chg × ev_c) : (Intraday Put OI Chg × ev_p), same
+    # ATM±vega_band_strikes band. Baseline = 1: >1 = Call EV×ΔOI rich,
+    # <1 (incl. negative when ΔOI signs differ) = Put EV×ΔOI rich.
+    _evr_oic_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi_chg"]) /
+                  (_ev_bd["ev_p"] * _ev_bd["put_oi_chg"]).replace(0, np.nan)).fillna(1.0)
+    f8 = _s4_evr_bar(_evr_oic_s,
+                     f"★ OI-Chg-Wtd CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×ΔOI rich · Red<1=Put EV×ΔOI rich")
+    st.plotly_chart(f8, width='stretch', config={"displayModeBar":False})
+
     # ── IV Smile Live Interpretation (full-width, powered by session history) ─
     # Maintain intraday rolling history for trend-aware classification
     if "iv_smile_history" not in st.session_state:
