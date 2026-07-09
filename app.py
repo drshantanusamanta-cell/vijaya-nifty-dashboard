@@ -8,6 +8,7 @@
 ║  v6 — Hardened Edition: CI #2-10 + H1-H26 audit fixes applied      ║
 ║  v8 — Cosmetic re-layout: S3→S4→S2→Gamma&Vega→S10 on top;          ║
 ║       Section-4 charts in 4 rows × 2; responsive + clearer labels  ║
+║  v9 — Owner refresh dropdown: new 30-sec Turbo interval added      ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -83,7 +84,17 @@ st.set_page_config(
 # st.session_state in the main body) and should be done as a separate PR.
 # For now, st_autorefresh at the top is the safe fix that preserves all existing
 # behavior while solving the st.stop() recovery problem.
-st_autorefresh(interval=60_000, key="nifty_autorefresh")
+#
+# v9: the page rerun cadence follows the owner data-refresh setting when it is
+# FASTER than 60s (the new "30 sec Turbo" option) — otherwise freshly fetched
+# data would sit unseen until the next 60s rerun. All other choices keep 60s.
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "nifty_settings.json"), "r") as _arf:
+        _ar_secs = int(json.load(_arf).get("refresh_interval", 60))
+except Exception:
+    _ar_secs = 60
+st_autorefresh(interval=(30_000 if _ar_secs < 60 else 60_000), key="nifty_autorefresh")
 
 
 # ─── Credentials ──────────────────────────────────────────────────────────────
@@ -110,6 +121,7 @@ REFRESH_SECONDS  = 60   # default; overridden at runtime via owner settings
 # ─── Owner sidebar  PIN-protected advanced controls ──────────────────────────
 # Dashboard is publicly readable. Owner PIN unlocks expiry, refresh, manual reload.
 _REFRESH_OPTIONS = {
+    "🚀 30 sec  Turbo":             30,   # v9: fastest option — page rerun drops to 30s too
     "⚡ 1 min   Live market":       60,
     " 5 min   Active monitoring": 300,
     " 15 min  Slow watch":        900,
@@ -228,7 +240,9 @@ def _render_owner_sidebar(expiry_list):
                 _save_owner_settings(_cur_settings)
                 st.session_state.refresh_seconds = new_interval
             mins = new_interval // 60
-            st.info(f"Data refresh: **{new_interval}s** ({mins} min)\nPage refresh: **60s** (always)")
+            _ref_lbl  = f"{mins} min" if new_interval >= 60 else f"{new_interval} sec"
+            _page_lbl = "30s (follows Turbo)" if new_interval < 60 else "60s"
+            st.info(f"Data refresh: **{new_interval}s** ({_ref_lbl})\nPage refresh: **{_page_lbl}**")
 
             st.divider()
 
