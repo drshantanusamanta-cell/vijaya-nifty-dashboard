@@ -64,7 +64,7 @@ def is_market_hours():
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Shantanu's Options Dashboard — NIFTY · v11",   # H21 fix: was mojibake (\x97 where em-dash should be)
+    page_title="Shantanu's Options Dashboard — NIFTY · v12",   # H21 fix: was mojibake (\x97 where em-dash should be)
     page_icon="📊",   # H21 fix: was empty — browser showed default favicon
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -112,7 +112,7 @@ USE_DHAN          = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
 USE_DEMO_MODE     = not USE_DHAN
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v11"
+APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v12"
 RISK_FREE_RATE   = 0.065
 STRUCTURAL_BAND  = 10
 SIGNAL_BAND      = 5
@@ -6913,7 +6913,20 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             _ev_atm_k + _ev_band_n * NIFTY_STEP)].copy()
         _ev_bd["ev_c"] = np.maximum(0, _ev_bd["call_ltp"] - np.maximum(0, spot - _ev_bd["strike"]))
         _ev_bd["ev_p"] = np.maximum(0, _ev_bd["put_ltp"]  - np.maximum(0, _ev_bd["strike"] - spot))
-        _evr_raw_s = (_ev_bd["ev_c"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
+        # ★ v12: parity correction — European put-call parity forces
+        # EV_c − EV_p = K(1 − e^(−rT)) (carry on the strike), so the NEUTRAL
+        # CE/PE EV ratio sits slightly above 1. Subtracting the offset from
+        # ev_c re-centres the baseline at exactly 1, making deviations pure
+        # demand pressure: >1 = call buyers / put sellers dominant,
+        # <1 = put buyers / call sellers dominant.
+        try:
+            _T_ev = max((datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date()
+                         - date.today()).days, 0) / 365.0
+        except Exception:
+            _T_ev = 3 / 365.0
+        _ev_bd["ev_c_adj"] = np.maximum(
+            0, _ev_bd["ev_c"] - _ev_bd["strike"] * (1 - np.exp(-RISK_FREE_RATE * _T_ev)))
+        _evr_raw_s = (_ev_bd["ev_c_adj"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
         _evr_oiw_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi"]) /
                       (_ev_bd["ev_p"] * _ev_bd["put_oi"]).replace(0, np.nan)).fillna(1.0)
 
@@ -6941,7 +6954,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
         with _s4_r3c2:
             f6 = _s4_evr_bar(_evr_raw_s,
-                             f"★ Raw CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV rich · Red<1=Put EV rich")
+                             f"★ Parity-Adj CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call buyers/Put sellers dominant · Red<1=Put buyers/Call sellers dominant")
             st.plotly_chart(f6, width='stretch', config={"displayModeBar":False})
 
         # ★ Strike-wise OI-CHANGE-Weighted CE/PE EV Ratio — per strike,
@@ -6962,13 +6975,24 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                              f"★ OI-Chg-Wtd CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×ΔOI rich · Red<1=Put EV×ΔOI rich")
             st.plotly_chart(f8, width='stretch', config={"displayModeBar":False})
 
-        # ★ v11: generic per-strike CE/PE ratio bar (baseline = 1) — same
-        # visual grammar as _s4_evr_bar but with caller-supplied x & y-title.
-        def _s4_ratio_bar(x_vals, vals, title, y_title):
-            _cols = [GREEN if v >= 1 else RED for v in vals]
-            f = go.Figure(go.Bar(x=x_vals, y=vals - 1.0, base=1.0,
-                                 marker_color=_cols, customdata=vals,
-                                 hovertemplate="Strike %{x}<br>CE/PE Ratio: %{customdata:.3f}<extra></extra>"))
+        # ★ v12: mask-aware per-strike CE/PE ratio bar (baseline = 1).
+        # Bars failing the liquidity floor are GREYED and pinned to baseline
+        # instead of being imputed as neutral 1.0 signals.
+        _LIQ_GREY = "#D1D5DB"
+        def _s4_ratio_bar(x_vals, vals, title, y_title, liq_ok=None):
+            vals = pd.Series(vals).astype(float).reset_index(drop=True)
+            if liq_ok is None:
+                liq_ok = pd.Series([True] * len(vals))
+            else:
+                liq_ok = pd.Series(list(liq_ok)).fillna(False).reset_index(drop=True)
+            _plot = vals.where(liq_ok, 1.0)
+            _cols = [_LIQ_GREY if not ok else (GREEN if v >= 1 else RED)
+                     for v, ok in zip(_plot, liq_ok)]
+            _cd   = [f"{v:.3f}" if ok else "illiquid — masked"
+                     for v, ok in zip(vals, liq_ok)]
+            f = go.Figure(go.Bar(x=list(x_vals), y=_plot - 1.0, base=1.0,
+                                 marker_color=_cols, customdata=_cd,
+                                 hovertemplate="Strike %{x}<br>CE/PE Ratio: %{customdata}<extra></extra>"))
             f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
                         annotation_text="Baseline 1.0", annotation_position="bottom right",
                         annotation_font=dict(size=9, color=MUTED))
@@ -6976,51 +7000,164 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             f.update_layout(title=dict(font=dict(size=11)))
             return f
 
-        # ★ v11 Pair 1 — Δ-weighted CE/PE OI ratio & Δ-weighted CE/PE
-        # OI-change ratio, per strike over the full structural band:
+        # ★ v12: four-quadrant OI-change ratio bar — colour encodes WHO is
+        # building vs unwinding, fixing the sign-ambiguity of ratio-only
+        # bars (build-vs-build and unwind-vs-unwind both print positive):
+        #   Red   = Call build + Put unwind  (bearish quadrant)
+        #   Green = Put build + Call unwind  (bullish quadrant)
+        #   Amber = both sides building      (contested — read ratio)
+        #   Slate = both sides unwinding     (de-risking — read ratio)
+        def _s4_quad_bar(x_vals, vals, doi_c, doi_p, title, y_title, liq_ok=None):
+            vals  = pd.Series(vals).astype(float).reset_index(drop=True)
+            doi_c = pd.Series(doi_c).astype(float).reset_index(drop=True)
+            doi_p = pd.Series(doi_p).astype(float).reset_index(drop=True)
+            if liq_ok is None:
+                liq_ok = pd.Series([True] * len(vals))
+            else:
+                liq_ok = pd.Series(list(liq_ok)).fillna(False).reset_index(drop=True)
+            def _quad(dc_, dp_):
+                if dc_ >= 0 and dp_ < 0:  return "#EF4444", "Call build + Put unwind (bearish)"
+                if dc_ < 0 and dp_ >= 0:  return "#22C55E", "Put build + Call unwind (bullish)"
+                if dc_ >= 0 and dp_ >= 0: return "#F59E0B", "Both building (contested)"
+                return "#64748B", "Both unwinding (de-risking)"
+            _plot = vals.where(liq_ok, 1.0)
+            _cols, _cd = [], []
+            for v, ok, dc_, dp_ in zip(vals, liq_ok, doi_c, doi_p):
+                if not ok:
+                    _cols.append(_LIQ_GREY); _cd.append("illiquid — masked")
+                else:
+                    _c, _lbl = _quad(dc_, dp_)
+                    _cols.append(_c); _cd.append(f"{_lbl} · ratio {v:.3f}")
+            f = go.Figure(go.Bar(x=list(x_vals), y=_plot - 1.0, base=1.0,
+                                 marker_color=_cols, customdata=_cd,
+                                 hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
+            f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
+                        annotation_text="Baseline 1.0", annotation_position="bottom right",
+                        annotation_font=dict(size=9, color=MUTED))
+            _s4_style(f, title, y_title)
+            f.update_layout(title=dict(font=dict(size=10)))
+            return f
+
+        # ★ v11/v12 Pair 1 — Δ-weighted CE/PE OI ratio & OI-change ratio.
         #   (Call OI × |Call Δ|) / (Put OI × |Put Δ|)
         #   (Call ΔOI × |Call Δ|) / (Put ΔOI × |Put Δ|)
+        # v12: f9 is normalised by the day's OPENING ratio profile — this
+        # cancels the static ITM/OTM delta gradient (below spot, ITM call
+        # deltas mechanically push the raw ratio >1 even with balanced OI).
+        # 1 = unchanged since open; >1 = call side GAINED Δ-weighted OI
+        # share intraday; <1 = put side gained. Illiquid strikes greyed.
         _dwr_oi_s  = ((df_band["call_oi"] * call_delta_abs) /
-                      (df_band["put_oi"]  * put_delta_abs).replace(0, np.nan)).fillna(1.0)
+                      (df_band["put_oi"]  * put_delta_abs).replace(0, np.nan))
         _dwr_chg_s = ((df_band["call_oi_chg"] * call_delta_abs) /
-                      (df_band["put_oi_chg"]  * put_delta_abs).replace(0, np.nan)).fillna(1.0)
+                      (df_band["put_oi_chg"]  * put_delta_abs).replace(0, np.nan))
+        _oi_floor  = 0.02 * max(float(df_band["call_oi"].max()),
+                                float(df_band["put_oi"].max()), 1.0)
+        _chg_floor = 0.02 * max(float(df_band["call_oi_chg"].abs().max()),
+                                float(df_band["put_oi_chg"].abs().max()), 1.0)
+        _liq_oi  = ((df_band["call_oi"] > _oi_floor) &
+                    (df_band["put_oi"]  > _oi_floor) & _dwr_oi_s.notna())
+        _liq_chg = ((df_band["call_oi_chg"].abs() > _chg_floor) &
+                    (df_band["put_oi_chg"].abs()  > _chg_floor) & _dwr_chg_s.notna())
 
-        # Row 5 — Δ-Wtd CE/PE OI Ratio | Δ-Wtd CE/PE OI-Chg Ratio
+        # v12: opening-baseline persistence (same JSON pattern as smile history)
+        _S4_BASE_FILE = os.path.join(_BASE_DIR, "nifty_s4_ratio_baseline.json")
+        _s4_key = f"{date.today().isoformat()}|{expiry}"
+        try:
+            with open(_S4_BASE_FILE) as _fh:
+                _s4_base = json.load(_fh)
+        except Exception:
+            _s4_base = {}
+        if _s4_base.get("key") != _s4_key:
+            _s4_base = {"key": _s4_key,
+                        "ratios": {str(int(k)): (float(v) if np.isfinite(v) else None)
+                                   for k, v in zip(x, _dwr_oi_s)}}
+            try:
+                _atomic_json_write(_S4_BASE_FILE, _s4_base)
+            except Exception:
+                pass
+        _s4_bmap  = _s4_base.get("ratios", {})
+        _dwr_base = pd.Series([_s4_bmap.get(str(int(k))) for k in x],
+                              index=_dwr_oi_s.index, dtype=float)
+        _dwr_norm = _dwr_oi_s / _dwr_base.replace(0, np.nan)
+        _liq_norm = _liq_oi & _dwr_norm.notna()
+
+        # Row 5 — Δ-Wtd CE/PE OI Ratio vs Open | Δ-Wtd CE/PE OI-Chg Ratio (quad)
         _s4_r5c1, _s4_r5c2 = st.columns(2)
         with _s4_r5c1:
-            f9 = _s4_ratio_bar(x, _dwr_oi_s,
-                               "★ Δ-Wtd CE/PE OI Ratio per Strike · Baseline=1 · Green>1=Call Δ×OI rich · Red<1=Put Δ×OI rich",
-                               "Δ×OI CE/PE Ratio")
+            f9 = _s4_ratio_bar(x, _dwr_norm.fillna(1.0),
+                               "★ Δ-Wtd CE/PE OI Ratio vs OPEN Baseline · 1=unchanged since open · Green>1=Call side gaining · Red<1=Put side gaining · Grey=illiquid",
+                               "Ratio vs Open", liq_ok=_liq_norm)
             st.plotly_chart(f9, width='stretch', config={"displayModeBar":False})
         with _s4_r5c2:
-            f10 = _s4_ratio_bar(x, _dwr_chg_s,
-                                "★ Δ-Wtd CE/PE OI-Chg Ratio per Strike · Baseline=1 · Green>1=Call Δ×ΔOI rich · Red<1=Put Δ×ΔOI rich",
-                                "Δ×ΔOI CE/PE Ratio")
+            f10 = _s4_quad_bar(x, _dwr_chg_s.fillna(1.0),
+                               df_band["call_oi_chg"], df_band["put_oi_chg"],
+                               "★ Δ-Wtd CE/PE OI-Chg Ratio · Red=C-build/P-unwind(bear) · Green=P-build/C-unwind(bull) · Amber=both build · Slate=both unwind",
+                               "Δ×ΔOI CE/PE Ratio", liq_ok=_liq_chg)
             st.plotly_chart(f10, width='stretch', config={"displayModeBar":False})
 
-        # ★ v11 Pair 2 — Δ- AND EV-weighted CE/PE ratios, per strike over the
-        # same ATM±vega_band_strikes band as the EV-Ratio charts (extrinsic
-        # value ≈ 0 far from ATM, so the ratio is only meaningful there):
+        # ★ v11/v12 Pair 2 — Δ- AND EV-weighted CE/PE ratios, per strike over
+        # the same ATM±vega_band_strikes band as the EV-Ratio charts:
         #   (Call OI × |Call Δ| × ev_c) / (Put OI × |Put Δ| × ev_p)
         #   (Call ΔOI × |Call Δ| × ev_c) / (Put ΔOI × |Put Δ| × ev_p)
+        # v12: strikes with extrinsic below ₹2 on either leg are masked
+        # (EV that small is noise); f12 uses four-quadrant colouring.
         _cda_ev = _ev_bd["call_delta"].abs(); _pda_ev = _ev_bd["put_delta"].abs()
         _devr_oi_s  = ((_ev_bd["call_oi"] * _cda_ev * _ev_bd["ev_c"]) /
-                       (_ev_bd["put_oi"]  * _pda_ev * _ev_bd["ev_p"]).replace(0, np.nan)).fillna(1.0)
+                       (_ev_bd["put_oi"]  * _pda_ev * _ev_bd["ev_p"]).replace(0, np.nan))
         _devr_chg_s = ((_ev_bd["call_oi_chg"] * _cda_ev * _ev_bd["ev_c"]) /
-                       (_ev_bd["put_oi_chg"]  * _pda_ev * _ev_bd["ev_p"]).replace(0, np.nan)).fillna(1.0)
+                       (_ev_bd["put_oi_chg"]  * _pda_ev * _ev_bd["ev_p"]).replace(0, np.nan))
+        _EV_FLOOR   = 2.0
+        _liq_ev     = (_ev_bd["ev_c"] > _EV_FLOOR) & (_ev_bd["ev_p"] > _EV_FLOOR)
+        _liq_ev_oi  = _liq_ev & _devr_oi_s.notna()
+        _liq_ev_chg = _liq_ev & _devr_chg_s.notna()
 
-        # Row 6 — Δ×EV-Wtd CE/PE OI Ratio | Δ×EV-Wtd CE/PE OI-Chg Ratio
+        # Row 6 — Δ×EV-Wtd CE/PE OI Ratio | Δ×EV-Wtd CE/PE OI-Chg Ratio (quad)
         _s4_r6c1, _s4_r6c2 = st.columns(2)
         with _s4_r6c1:
-            f11 = _s4_ratio_bar(_ev_bd["strike"], _devr_oi_s,
-                                f"★ Δ×EV-Wtd CE/PE OI Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call Δ×OI×EV rich · Red<1=Put side",
-                                "Δ×OI×EV CE/PE Ratio")
+            f11 = _s4_ratio_bar(_ev_bd["strike"], _devr_oi_s.fillna(1.0),
+                                f"★ Δ×EV-Wtd CE/PE OI Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call Δ×OI×EV rich · Red<1=Put side · Grey=illiquid",
+                                "Δ×OI×EV CE/PE Ratio", liq_ok=_liq_ev_oi)
             st.plotly_chart(f11, width='stretch', config={"displayModeBar":False})
         with _s4_r6c2:
-            f12 = _s4_ratio_bar(_ev_bd["strike"], _devr_chg_s,
-                                f"★ Δ×EV-Wtd CE/PE OI-Chg Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call Δ×ΔOI×EV rich · Red<1=Put side",
-                                "Δ×ΔOI×EV CE/PE Ratio")
+            f12 = _s4_quad_bar(_ev_bd["strike"], _devr_chg_s.fillna(1.0),
+                               _ev_bd["call_oi_chg"], _ev_bd["put_oi_chg"],
+                               f"★ Δ×EV-Wtd CE/PE OI-Chg Ratio (ATM±{_ev_band_n}) · Red=C-build/P-unwind(bear) · Green=P-build/C-unwind(bull) · Amber=both build · Slate=both unwind",
+                               "Δ×ΔOI×EV CE/PE Ratio", liq_ok=_liq_ev_chg)
             st.plotly_chart(f12, width='stretch', config={"displayModeBar":False})
+
+        # ★ v12: signal journal — one CSV row per refresh so the decision-
+        # matrix weights can be calibrated offline against forward returns.
+        # Positive score = bullish tilt. d1=structure(±1.5) d2=flow(±2)
+        # d3=parity-adj EV skew(±0.5).
+        try:
+            _atm_j = safe_num(m.get("atm", spot)); _jw = 3 * NIFTY_STEP
+            _jm  = df_band["strike"].between(_atm_j - _jw, _atm_j + _jw)
+            _d1  = round(-1.5 * float(dv[_jm].sum() / max(dv[_jm].abs().sum(), 1e-9)), 2)
+            _d2  = round(-2.0 * float(mv[_jm].sum() / max(mv[_jm].abs().sum(), 1e-9)), 2)
+            _e_mean = float(_evr_raw_s[_liq_ev].mean()) if bool(_liq_ev.any()) else 1.0
+            _d3  = 0.5 if _e_mean > 1.03 else (-0.5 if _e_mean < 0.97 else 0.0)
+            _jscore = round(_d1 + _d2 + _d3, 2)
+            _jgex = "positive" if float(gv[_jm].sum()) > 0 else "negative"
+            _J_FILE = os.path.join(_BASE_DIR, "nifty_s4_signal_journal.csv")
+            _jts  = str(payload.get("ts_ist", ""))
+            _jrow = (f"{_jts},{spot},{_d1},{_d2},{_d3},{_jscore},{_jgex},"
+                     f"{safe_num(m.get('gamma_flip', 0))}\n")
+            if not os.path.exists(_J_FILE):
+                with open(_J_FILE, "w") as _fh:
+                    _fh.write("ts,spot,d1_structure,d2_flow,d3_ev,score,gex_regime,gamma_flip\n")
+                    _fh.write(_jrow)
+            else:
+                with open(_J_FILE, "rb") as _fh:
+                    try:
+                        _fh.seek(-300, 2)
+                    except OSError:
+                        _fh.seek(0)
+                    _jlast = _fh.read().decode(errors="ignore").strip().splitlines()[-1]
+                if not (_jts and _jlast.startswith(_jts + ",")):
+                    with open(_J_FILE, "a") as _fh:
+                        _fh.write(_jrow)
+        except Exception as _je:
+            print(f"[s4-journal] {_je}", flush=True)
 
         # ── IV Smile Live Interpretation (full-width, powered by session history) ─
         # Maintain intraday rolling history for trend-aware classification
