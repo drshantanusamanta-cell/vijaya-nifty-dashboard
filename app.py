@@ -9,6 +9,8 @@
 ║  v8 — Cosmetic re-layout: S3→S4→S2→Gamma&Vega→S10 on top;          ║
 ║       Section-4 charts in 4 rows × 2; responsive + clearer labels  ║
 ║  v9 — Owner refresh dropdown: new 30-sec Turbo interval added      ║
+║  v10 — Enhanced NDM Buyer/Seller Matrix (per-strike EVR × Δ-Wtd    ║
+║        OI Chg Momentum) · 15-min verdict log · View under Sec-4    ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -62,7 +64,7 @@ def is_market_hours():
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Shantanu's Options Dashboard — NIFTY",   # H21 fix: was mojibake (\x97 where em-dash should be)
+    page_title="Shantanu's Options Dashboard — NIFTY · v10",   # H21 fix: was mojibake (\x97 where em-dash should be)
     page_icon="📊",   # H21 fix: was empty — browser showed default favicon
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -110,7 +112,7 @@ USE_DHAN          = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
 USE_DEMO_MODE     = not USE_DHAN
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50"
+APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v10"
 RISK_FREE_RATE   = 0.065
 STRUCTURAL_BAND  = 10
 SIGNAL_BAND      = 5
@@ -4927,6 +4929,7 @@ def _render_enhanced_bias_panel(eb, vwap_or, ts, vix, cd, spot_px, metrics):
 # ═══════════════════════════════════════════════════════════════════════════════
 _slot_s3    = st.container()   # Section 3 — Key Price Levels
 _slot_s4    = st.container()   # Section 4 — Strike-wise Charts (4 rows × 2)
+_slot_sv    = st.container()   # v10: Shantanu's View — renders just below Section 4
 _slot_s2    = st.container()   # Section 2 — Bias Engine · Strategy · Key Metrics
 _slot_gamma = st.container()   # Gamma & Vega Live Interpretation
 _slot_s10   = st.container()   # Section 10 — Basis Triangulation
@@ -6403,273 +6406,499 @@ with _ls_col3:
 
 # ══ END LEADING SIGNALS PANEL ════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Enhanced NDM v10 — per-strike Buyer/Seller Decision Matrix
+# Combines, PER STRIKE (full ±10 structural band), the exact data of the two
+# Section-4 charts:
+#   • EVR(k) — Raw CE/PE Extrinsic-Value ratio   = ev_c / ev_p
+#              (chart: "Raw CE/PE EV Ratio per Strike")
+#   • NDM(k) — Δ-Weighted OI Change Momentum     = CallOIChg×|Δc| − PutOIChg×|Δp|
+#              (chart: "Δ-Weighted OI Change Momentum")
+#
+# Matrix (bias from EVR, momentum strength from NDM):
+#   1. EVR>1 & NDM>0 → Call BUYERS  stronger than Put sellers  → BULLISH · STRONG upside
+#   2. EVR>1 & NDM<0 → Put SELLERS  stronger than Call buyers  → BULLISH · weak upside
+#   3. EVR<1 & NDM<0 → Put BUYERS   stronger than Call sellers → BEARISH · STRONG downside
+#   4. EVR<1 & NDM>0 → Call SELLERS stronger than Put buyers   → BEARISH · weak downside
+#
+# Aggregation:
+#   • Overall BIAS       = average per-strike raw EVR  (>1 bullish, <1 bearish)
+#   • MOMENTUM strength  = share of STRONG-buyer strikes (row 1 / row 3) in the
+#                          relevant OTM segment + ATM + up to 2 shallow-ITM strikes
+#   • RANGE override     = strong Put sellers below spot AND strong Call sellers
+#                          above spot → RANGE-BOUND, pinning the ATM
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _endm_verdict_history_append(store, verdict, bias, momentum, strikes_txt):
+    """Append current final verdict to the 15-minute history log.
+
+    A row is added only if the last row is ≥15 min old (or log empty).
+    Auto-resets on a new trading day. Returns display-ready rows (oldest→newest).
+    """
+    _now = now_ist()
+    if store.get("date") != _now.date():
+        store["date"] = _now.date()
+        store["rows"] = []
+    _rows = store["rows"]
+    if not _rows or (_now - _rows[-1]["_ts"]).total_seconds() >= 15 * 60:
+        _rows.append({"_ts": _now,
+                      "Time (IST)": _now.strftime("%H:%M:%S"),
+                      "Final Verdict": verdict,
+                      "Bias": bias,
+                      "Momentum": momentum,
+                      "Key Strikes": strikes_txt})
+    return [{k: v for k, v in r.items() if k != "_ts"} for r in _rows]
+
+
+def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None):
+    """Enhanced NDM v10 — per-strike Buyer/Seller matrix (see banner above)."""
+    _step = NIFTY_STEP
+    _atm  = round(spot / _step) * _step if spot else 0
+
+    _rows = []
+    for _r in df_band_records:
+        _strike  = float(_r.get("strike", 0) or 0)
+        _c_chg   = float(_r.get("call_oi_chg", 0) or 0)
+        _p_chg   = float(_r.get("put_oi_chg",  0) or 0)
+        _cd      = abs(float(_r.get("call_delta", 0) or 0))
+        _pdl     = abs(float(_r.get("put_delta",  0) or 0))
+        _c_ltp   = float(_r.get("call_ltp", 0) or 0)
+        _p_ltp   = float(_r.get("put_ltp",  0) or 0)
+
+        # Raw CE/PE EV ratio per strike — identical formula to the Section-4 chart
+        _ev_c = max(0.0, _c_ltp - max(0.0, spot - _strike))
+        _ev_p = max(0.0, _p_ltp - max(0.0, _strike - spot))
+        if _ev_p > 1e-9:
+            _evr = _ev_c / _ev_p
+        elif _ev_c > 1e-9:
+            _evr = float("inf")
+        else:
+            _evr = float("nan")
+
+        # Δ-weighted OI change momentum per strike — identical to Section-4 chart
+        _ndm = _c_chg * _cd - _p_chg * _pdl
+
+        # Matrix classification
+        if np.isnan(_evr) or abs(_evr - 1.0) < 1e-9 or (abs(_c_chg) < 1 and abs(_p_chg) < 1):
+            _row_id, _dom, _read = 0, "~ Neutral", "No dominant aggressor"
+        elif _evr > 1 and _ndm > 0:
+            _row_id, _dom, _read = 1, "Call buyers > Put sellers",  "BULLISH · STRONG upside"
+        elif _evr > 1:
+            _row_id, _dom, _read = 2, "Put sellers > Call buyers",  "BULLISH · weak upside"
+        elif _ndm < 0:
+            _row_id, _dom, _read = 3, "Put buyers > Call sellers",  "BEARISH · STRONG downside"
+        else:
+            _row_id, _dom, _read = 4, "Call sellers > Put buyers",  "BEARISH · weak downside"
+
+        # Per-strike Enhanced NDM — stance decided PER STRIKE by its own EVR:
+        #   EVR>1: call buying (+) and put writing (+) are BOTH bullish hedge flows
+        #   EVR<1: put buying (−) and call writing (−) are BOTH bearish hedge flows
+        if _row_id in (1, 2):
+            _endm_v = _c_chg * _cd + _p_chg * _pdl
+        elif _row_id in (3, 4):
+            _endm_v = -(_c_chg * _cd) - (_p_chg * _pdl)
+        else:
+            _endm_v = 0.0
+
+        _rows.append(dict(strike=int(_strike), evr=_evr, ndm=_ndm, endm=_endm_v,
+                          row_id=_row_id, dom=_dom, read=_read))
+
+    if not _rows:
+        return dict(df=pd.DataFrame(), enhanced_total=0, raw_total=0,
+                    verdict="➖ NO DATA", bias="NEUTRAL", mom_lbl="—",
+                    reason=[], evr_avg=1.0, history=[], sc="#6B7280", sbg="#F9FAFB")
+
+    _mx = pd.DataFrame(_rows)
+
+    # ── Aggregate: BIAS from average per-strike raw EVR ──────────────────────
+    _evr_fin  = _mx["evr"][np.isfinite(_mx["evr"])]
+    _evr_avg  = float(_evr_fin.mean()) if len(_evr_fin) else 1.0
+    if   _evr_avg > 1.0: _bias = "BULLISH"
+    elif _evr_avg < 1.0: _bias = "BEARISH"
+    else:                _bias = "NEUTRAL"
+
+    _tot_abs = float(_mx["ndm"].abs().sum()) or 1.0
+    _fmt_ks  = lambda arr: ", ".join(f"{int(k):,}" for k in arr) if len(arr) else "—"
+    def _top_strikes(sub, n=4):
+        if sub.empty: return []
+        return list(sub.reindex(sub["ndm"].abs().sort_values(ascending=False).index)["strike"].head(n))
+
+    # ── RANGE-BOUND override: strong opposite sellers on both sides of spot ──
+    _ps_below = _mx[(_mx["strike"] < spot) & (_mx["row_id"] == 2)]   # Put sellers below spot
+    _cs_above = _mx[(_mx["strike"] > spot) & (_mx["row_id"] == 4)]   # Call sellers above spot
+    _rb_share = (float(_ps_below["ndm"].abs().sum()) + float(_cs_above["ndm"].abs().sum())) / _tot_abs
+    _rangebound = (len(_ps_below) >= 2 and len(_cs_above) >= 2 and _rb_share >= 0.5)
+
+    # ── MOMENTUM strength: strong buyers at OTM + ATM + up to 2 shallow ITM ──
+    if _bias == "BULLISH":
+        _seg = _mx[_mx["strike"] >= spot - 2 * _step]        # shallow ITM + ATM + OTM calls
+        _strong_sub, _weak_sub = _seg[_seg["row_id"] == 1], _seg[_seg["row_id"] == 2]
+    elif _bias == "BEARISH":
+        _seg = _mx[_mx["strike"] <= spot + 2 * _step]        # shallow ITM + ATM + OTM puts
+        _strong_sub, _weak_sub = _seg[_seg["row_id"] == 3], _seg[_seg["row_id"] == 4]
+    else:
+        _seg = _mx.iloc[0:0]; _strong_sub = _seg; _weak_sub = _seg
+    _seg_abs      = float(_seg["ndm"].abs().sum()) or 1.0
+    _strong_share = float(_strong_sub["ndm"].abs().sum()) / _seg_abs
+    _strong_mom   = (_strong_share >= 0.5) and (len(_strong_sub) >= 1)
+    _strong_ks    = _top_strikes(_strong_sub)
+    _weak_ks      = _top_strikes(_weak_sub)
+
+    # ── Final verdict + plain-English reason ─────────────────────────────────
+    if _rangebound:
+        _pb_ks, _ca_ks = _top_strikes(_ps_below, 3), _top_strikes(_cs_above, 3)
+        _verdict = (f"🔒 RANGE-BOUND — pinning ATM {int(_atm):,} · Put sellers below spot "
+                    f"[{_fmt_ks(_pb_ks)}] vs Call sellers above spot [{_fmt_ks(_ca_ks)}]")
+        _mom_lbl = "RANGE / ATM PIN"
+        _sc, _sbg = "#D97706", "#FFFBEB"
+        _key_ks   = _fmt_ks(_pb_ks + _ca_ks)
+        _reason = [
+            f"Avg raw CE/PE EV ratio is {_evr_avg:.2f}, but strong SELLERS sit on both sides of spot.",
+            f"Put writers defend [{_fmt_ks(_pb_ks)}] below spot and call writers cap [{_fmt_ks(_ca_ks)}] above spot.",
+            f"Both sides are pressing price toward the middle → expect the market to stay pinned near ATM {int(_atm):,}.",
+        ]
+    elif _bias == "BULLISH" and _strong_mom:
+        _verdict = f"✅ BULLISH — STRONG upside momentum · Call buyers driving [{_fmt_ks(_strong_ks)}]"
+        _mom_lbl = "STRONG upside"
+        _sc, _sbg = "#059669", "#D1FAE5"
+        _key_ks   = _fmt_ks(_strong_ks)
+        _reason = [
+            f"Call premiums are richer than puts (avg raw CE/PE EV ratio {_evr_avg:.2f} > 1) → call buyers + put sellers → bullish bias.",
+            f"Net Δ-weighted OI change is POSITIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — call BUYERS are stronger than put sellers.",
+            "Buyers, not sellers, are driving the move → upside momentum is STRONG.",
+        ]
+    elif _bias == "BULLISH":
+        _verdict = f"⚠️ BULLISH bias — WEAK upside momentum · Put sellers dominate [{_fmt_ks(_weak_ks)}]"
+        _mom_lbl = "Weak upside"
+        _sc, _sbg = "#65A30D", "#F7FEE7"
+        _key_ks   = _fmt_ks(_weak_ks)
+        _reason = [
+            f"Call premiums are richer than puts (avg raw CE/PE EV ratio {_evr_avg:.2f} > 1) → bias stays bullish.",
+            f"But net Δ-weighted OI change is NEGATIVE at key strikes [{_fmt_ks(_weak_ks)}] — put SELLERS are stronger than call buyers.",
+            "The market is supported by sellers rather than driven by buyers → upside momentum is NOT strong.",
+        ]
+    elif _bias == "BEARISH" and _strong_mom:
+        _verdict = f"✅ BEARISH — STRONG downside momentum · Put buyers driving [{_fmt_ks(_strong_ks)}]"
+        _mom_lbl = "STRONG downside"
+        _sc, _sbg = "#DC2626", "#FEE2E2"
+        _key_ks   = _fmt_ks(_strong_ks)
+        _reason = [
+            f"Put premiums are richer than calls (avg raw CE/PE EV ratio {_evr_avg:.2f} < 1) → put buyers + call sellers → bearish bias.",
+            f"Net Δ-weighted OI change is NEGATIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — put BUYERS are stronger than call sellers.",
+            "Buyers of downside protection are driving → downside momentum is STRONG.",
+        ]
+    elif _bias == "BEARISH":
+        _verdict = f"⚠️ BEARISH bias — WEAK downside momentum · Call sellers dominate [{_fmt_ks(_weak_ks)}]"
+        _mom_lbl = "Weak downside"
+        _sc, _sbg = "#EA580C", "#FFF7ED"
+        _key_ks   = _fmt_ks(_weak_ks)
+        _reason = [
+            f"Put premiums are richer than calls (avg raw CE/PE EV ratio {_evr_avg:.2f} < 1) → bias stays bearish.",
+            f"But net Δ-weighted OI change is POSITIVE at key strikes [{_fmt_ks(_weak_ks)}] — call SELLERS are stronger than put buyers.",
+            "The upside is capped by sellers rather than pressed by buyers → downside momentum is NOT strong.",
+        ]
+    else:
+        _verdict = "➖ NEUTRAL — CE/PE extrinsic values balanced; no dominant aggressor side."
+        _mom_lbl = "—"
+        _sc, _sbg = "#6B7280", "#F9FAFB"
+        _key_ks   = "—"
+        _reason = [f"Avg raw CE/PE EV ratio is {_evr_avg:.2f} (≈1) — call and put premiums are balanced, so neither side has the edge."]
+
+    # ── 15-minute final-verdict history ──────────────────────────────────────
+    _hist = []
+    if hist_store is not None:
+        _hist = _endm_verdict_history_append(hist_store, _verdict, _bias, _mom_lbl, _key_ks)
+
+    # ── Display dataframe (descending strike) ────────────────────────────────
+    def _evr_fmt(v):
+        if not np.isfinite(v): return "∞" if v == float("inf") else "—"
+        return round(float(v), 3)
+    _disp = pd.DataFrame({
+        "Strike":       _mx["strike"],
+        "EVR":          _mx["evr"].map(_evr_fmt),
+        "NDM":          _mx["ndm"].round(0).astype(int),
+        "Enhanced NDM": _mx["endm"].round(0).astype(int),
+        "Dominant Side": _mx["dom"],
+        "Reading":      _mx["read"],
+    }).sort_values("Strike", ascending=False)
+
+    _et = int(_mx["endm"].sum())
+    _rt = int(_mx["ndm"].sum())
+
+    return dict(df=_disp, enhanced_total=_et, raw_total=_rt,
+                verdict=_verdict, bias=_bias, mom_lbl=_mom_lbl, reason=_reason,
+                evr_avg=round(_evr_avg, 4), history=_hist, sc=_sc, sbg=_sbg,
+                rangebound=_rangebound)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # SHANTANU'S VIEW — ND/NDM Decision Matrix (Institutional Framework)
 # Based on: Options Hedging Pressure & Market Movement Analysis PDF
 # Data sources: Section 4 (df_band), Section 2 (momentum), Greek Risk Framework
 # ═══════════════════════════════════════════════════════════════════
 
-st.markdown(
-    '<div style="font-size:20px;font-weight:900;color:#7C3AED;letter-spacing:0.5px;'    'padding:14px 0 6px 0;border-bottom:2px solid #7C3AED;margin-bottom:12px;">'    '🎯 Shantanu\'s View</div>',
-    unsafe_allow_html=True
-)
-
-# ── Compute per-strike ND and NDM from df_band_records ──────────────────────
-# ND  per strike = (Call OI × |Call Δ|) − (Put OI × |Put Δ|)
-# NDM per strike = (Call OI Chg × |Call Δ|) − (Put OI Chg × |Put Δ|)
-_sv_df = pd.DataFrame(df_band_records).copy() if df_band_records else pd.DataFrame()
-
-if not _sv_df.empty:
-    _sv_cd  = _sv_df["call_delta"].abs()
-    _sv_pd  = _sv_df["put_delta"].abs()
-    _sv_df["_nd"]  = (_sv_df["call_oi"]     * _sv_cd) - (_sv_df["put_oi"]     * _sv_pd)
-    _sv_df["_ndm"] = (_sv_df["call_oi_chg"] * _sv_cd) - (_sv_df["put_oi_chg"] * _sv_pd)
-
-    _sv_atm   = safe_num(m.get("atm", spot))
-    _sv_calls = _sv_df[_sv_df["strike"] > _sv_atm]
-    _sv_puts  = _sv_df[_sv_df["strike"] < _sv_atm]
-    _sv_atm_r = _sv_df[(_sv_df["strike"] >= _sv_atm - 25) & (_sv_df["strike"] <= _sv_atm + 25)]
-
-    otm_call_nd  = float(_sv_calls["_nd"].sum())
-    otm_call_ndm = float(_sv_calls["_ndm"].sum())
-    otm_put_nd   = float(_sv_puts["_nd"].sum())
-    otm_put_ndm  = float(_sv_puts["_ndm"].sum())
-    atm_nd       = float(_sv_atm_r["_nd"].sum())
-    atm_ndm      = float(_sv_atm_r["_ndm"].sum())
-    total_nd     = float(_sv_df["_nd"].sum())
-    total_ndm    = float(_sv_df["_ndm"].sum())
-
-    # Fix 1: Dynamic ATM NDM threshold — 0.5% of ATM OI (self-calibrates per expiry thickness)
-    _sv_atm_oi_total = float(_sv_atm_r["call_oi"].sum() + _sv_atm_r["put_oi"].sum())
-    _atm_ndm_thr = max(200.0, _sv_atm_oi_total * 0.005)
-
-    # Fix 6: ATM proximity weighting — inverse-distance weight by |call_Δ| + |put_Δ|
-    # Strikes near ATM with live delta carry more weight than deep OTM positions
-    _sv_df["_prox_w"]   = (abs(_sv_df["call_delta"]) + abs(_sv_df["put_delta"])).clip(lower=0.01)
-    _total_ndm_wtd      = float((_sv_df["_ndm"] * _sv_df["_prox_w"]).sum())
-    _total_prox_w       = float(_sv_df["_prox_w"].sum())
-    _ndm_wtd_norm       = _total_ndm_wtd / _total_prox_w if _total_prox_w > 0 else 0.0
-
-    # Fix 2: Session-range NDM percentile (uses today_history's call_dw_flow - put_dw_flow as NDM proxy)
-    _sv_hist_ndm = [
-        safe_num(h.get("call_dw_flow", 0)) - safe_num(h.get("put_dw_flow", 0))
-        for h in today_history
-    ]
-    if len(_sv_hist_ndm) >= 3:
-        _sv_ndm_min  = min(_sv_hist_ndm)
-        _sv_ndm_max  = _sv_hist_ndm[-1]   # current tick is last appended
-        _sv_ndm_rng  = max(_sv_ndm_max, max(_sv_hist_ndm)) - _sv_ndm_min
-        _sv_ndm_pct  = int(((total_ndm - _sv_ndm_min) / _sv_ndm_rng * 100)) if _sv_ndm_rng > 1 else 50
-        _sv_ndm_pct  = max(0, min(100, _sv_ndm_pct))
-        if _sv_ndm_pct >= 80:   _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th — TOP RANGE 🔝"
-        elif _sv_ndm_pct <= 20: _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th — BOTTOM RANGE 🔻"
-        else:                    _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th percentile"
-    else:
-        _sv_ndm_pct     = None
-        _sv_ndm_pct_lbl = "< 3 ticks — building"
-
-    _sv_df["_gex"] = (
-        (_sv_df["call_oi"] * _sv_df["call_gamma"]) -
-        (_sv_df["put_oi"]  * _sv_df["put_gamma"])
-    ) * (spot ** 2) * 0.01
-    _sv_gex_idx    = _sv_df["_gex"].abs().idxmax()
-    _sv_gex_strike = int(_sv_df.loc[_sv_gex_idx, "strike"])
-    _sv_ndm_at_gex = float(_sv_df.loc[_sv_gex_idx, "_ndm"])
-
-    try:
-        _sv_dte = (datetime.strptime(expiry, "%Y-%m-%d").date() - date.today()).days
-    except Exception:
-        _sv_dte = 5
-    _sv_near_expiry = _sv_dte <= 2
-
-    _sv_vix     = safe_num(_vix_raw)
-    _sv_vix_chg = _vix_data.get("vix_change") if _vix_data else None
-    _sv_pcr     = safe_num(m.get("pcr", 1.0))
-
-    _sv_bull_pts = 0.0
-    _sv_bear_pts = 0.0
-    _sv_criteria = []
-
-    # Criterion 1: OTM Call zone
-    if otm_call_nd > 0 and otm_call_ndm > 0:
-        _sv_bull_pts += 3
-        _sv_criteria.append(("✅", "OTM Call: ND ⊕  NDM ⊕",
-            "Strong bullish delta cascade — fresh call buying; dealers forced to buy futures",
-            "bull", 3))
-    elif otm_call_nd > 0 and otm_call_ndm < 0:
-        _sv_bear_pts += 2
-        _sv_criteria.append(("⚠️", "OTM Call: ND ⊕  NDM ⊖",
-            "Bullish structure cracking — call unwind in progress; EXIT LONGS signal",
-            "bear", 2))
-    elif otm_call_nd < 0 and otm_call_ndm < 0:
-        _sv_bear_pts += 1
-        _sv_criteria.append(("❌", "OTM Call: ND ⊖  NDM ⊖",
-            "Put dominance at upside strikes — no bullish call accumulation",
-            "bear", 1))
-    else:
-        _sv_criteria.append(("➖", "OTM Call: Mixed / Flat",
-            "No clear directional signal from OTM call zone", "neutral", 0))
-
-    # Criterion 2: OTM Put zone
-    if otm_put_nd < 0 and otm_put_ndm < 0:
-        _sv_bear_pts += 3
-        _sv_criteria.append(("✅", "OTM Put: ND ⊖  NDM ⊖",
-            "Strong bearish delta cascade — fresh put buying; dealers forced to sell futures",
-            "bear", 3))
-    elif otm_put_nd < 0 and otm_put_ndm > 0:
-        _sv_bull_pts += 2
-        _sv_criteria.append(("⚠️", "OTM Put: ND ⊖  NDM ⊕",
-            "Bearish structure cracking — put unwind; COVER SHORTS / potential squeeze up",
-            "bull", 2))
-    elif otm_put_nd > 0 and otm_put_ndm > 0:
-        _sv_bull_pts += 1
-        _sv_criteria.append(("🟢", "OTM Put: ND ⊕  NDM ⊕",
-            "Call dominance below spot — put writers stepping back; support building",
-            "bull", 1))
-    else:
-        _sv_criteria.append(("➖", "OTM Put: Mixed / Flat",
-            "No clear directional signal from OTM put zone", "neutral", 0))
-
-    # Criterion 3: ATM NDM (Golden Rule) — Fix 1: threshold is now session-relative
-    # _atm_ndm_thr = max(200, 0.5% of ATM OI) — auto-calibrates per expiry thickness
-    if atm_ndm > _atm_ndm_thr:
-        _sv_bull_pts += 1.5
-        _sv_criteria.append(("✅", f"ATM NDM ⊕  ({atm_ndm:+,.0f})",
-            f"Fresh bullish flow at ATM — max gamma zone; dealer buying (thr: {_atm_ndm_thr:,.0f})",
-            "bull", 1.5))
-    elif atm_ndm < -_atm_ndm_thr:
-        _sv_bear_pts += 1.5
-        _sv_criteria.append(("❌", f"ATM NDM ⊖  ({atm_ndm:+,.0f})",
-            f"Fresh bearish flow at ATM — max gamma zone; dealer selling (thr: {_atm_ndm_thr:,.0f})",
-            "bear", 1.5))
-    else:
-        _sv_criteria.append(("➖", f"ATM NDM Flat  ({atm_ndm:+,.0f}  |  thr ±{_atm_ndm_thr:,.0f})",
-            "No fresh conviction at ATM — await confirmation candle", "neutral", 0))
-
-    # Criterion 4: NDM at highest-GEX strike
-    if _sv_ndm_at_gex > 0:
-        _sv_bull_pts += 1
-        _sv_criteria.append(("✅", f"NDM ⊕ at Highest GEX ({_sv_gex_strike:,})",
-            "Expect velocity UP — NDM firing where dealer hedging is most explosive",
-            "bull", 1))
-    elif _sv_ndm_at_gex < 0:
-        _sv_bear_pts += 1
-        _sv_criteria.append(("❌", f"NDM ⊖ at Highest GEX ({_sv_gex_strike:,})",
-            "Expect velocity DOWN — NDM firing where dealer hedging is most explosive",
-            "bear", 1))
-    else:
-        _sv_criteria.append(("➖", f"NDM Flat at Highest GEX ({_sv_gex_strike:,})",
-            "No velocity signal at most explosive GEX concentration", "neutral", 0))
-
-    # Criterion 5: VIX + NDM
-    _sv_vix_up   = _sv_vix_chg is not None and _sv_vix_chg >= 0.3
-    _sv_vix_down = _sv_vix_chg is not None and _sv_vix_chg <= -0.3
-    if _sv_vix > 0:
-        if _sv_vix_up and total_ndm < 0:
-            _sv_bear_pts += 2
-            _sv_criteria.append(("❌", f"VIX Rising ({_sv_vix:.1f}, +{_sv_vix_chg:.2f}) + NDM ⊖",
-                "Institutional fear confirmed — REAL breakdown, not noise", "bear", 2))
-        elif _sv_vix_down and total_ndm > 0:
-            _sv_bull_pts += 1.5
-            _sv_criteria.append(("✅", f"VIX Falling ({_sv_vix:.1f}, {_sv_vix_chg:.2f}) + NDM ⊕",
-                "VIX deflating + bullish NDM — calm institutional accumulation", "bull", 1.5))
-        elif _sv_vix > 18 and total_ndm < 0:
-            _sv_bear_pts += 1
-            _sv_criteria.append(("⚠️", f"VIX Elevated ({_sv_vix:.1f}) + NDM ⊖",
-                "Elevated fear + bearish momentum — defensive posture warranted", "bear", 1))
-        elif _sv_vix < 13 and total_ndm > 0:
-            _sv_criteria.append(("⚠️", f"VIX Very Low ({_sv_vix:.1f}) + NDM ⊕",
-                "Complacency alert — do not chase bull signal blindly", "caution", 0))
-        else:
-            _sv_criteria.append(("➖", f"VIX {_sv_vix:.1f} — Neutral Context",
-                "No VIX amplification of NDM signal this session", "neutral", 0))
-    else:
-        _sv_criteria.append(("➖", "VIX Unavailable",
-            "India VIX feed not connected — cannot cross-confirm NDM", "neutral", 0))
-
-    # Criterion 6: Near expiry + NDM spike (Fix 1: use dynamic threshold)
-    if _sv_near_expiry and abs(total_ndm) > _atm_ndm_thr:
-        _sv_criteria.append(("⚡", f"Near Expiry ({_sv_dte}d) + NDM Spike ({total_ndm:+,.0f})",
-            "MAXIMUM IMPACT — gamma at peak; treat all signals with urgency", "amplify", 0))
-
-    # Criterion 7: PCR extreme + divergence
-    _sv_div = (total_nd > 0 and total_ndm < 0) or (total_nd < 0 and total_ndm > 0)
-    if (_sv_pcr > 1.5 or _sv_pcr < 0.7) and _sv_div:
-        _sv_criteria.append(("⚠️", f"PCR Extreme ({_sv_pcr:.2f}) + ND/NDM Divergence",
-            f"Classic mean-reversion setup — Max Pain gravity dominant ({int(m.get('max_pain', spot)):,})",
-            "reversal", 0))
-
-    # Final decision
-    _sv_net = _sv_bull_pts - _sv_bear_pts
-    if _sv_net >= 5:
-        _sv_dir="STRONG BULL";    _sv_dc="#059669"; _sv_dbg="#D1FAE5"
-        _sv_act="BUY / HOLD LONGS — Dealer hedge mechanical bid building"
-    elif _sv_net >= 2.5:
-        _sv_dir="MODERATE BULL";  _sv_dc="#10B981"; _sv_dbg="#ECFDF5"
-        _sv_act="Lean Long — Bullish bias with partial confirmation"
-    elif _sv_net <= -5:
-        _sv_dir="STRONG BEAR";    _sv_dc="#DC2626"; _sv_dbg="#FEE2E2"
-        _sv_act="SELL / HOLD SHORTS — Dealer hedge mechanical offer active"
-    elif _sv_net <= -2.5:
-        _sv_dir="MODERATE BEAR";  _sv_dc="#EF4444"; _sv_dbg="#FEF2F2"
-        _sv_act="Lean Short — Bearish bias with partial confirmation"
-    else:
-        _sv_dir="NEUTRAL / WAIT"; _sv_dc="#D97706"; _sv_dbg="#FFFBEB"
-        _sv_act="No clear edge — reduce size; await one more confirming criterion"
-
-    _sv_agree = (total_nd > 0 and total_ndm > 0) or (total_nd < 0 and total_ndm < 0)
-    _sv_nact  = sum(1 for c in _sv_criteria if c[3] not in ("neutral",))
-    if _sv_agree and abs(_sv_net) >= 5:
-        _sv_cf="HIGH";   _sv_cc="#059669"; _sv_cp=min(92, 70 + _sv_nact * 4)
-    elif _sv_agree and abs(_sv_net) >= 2.5:
-        _sv_cf="MEDIUM"; _sv_cc="#D97706"; _sv_cp=min(72, 52 + _sv_nact * 4)
-    elif not _sv_agree:
-        _sv_cf="LOW  (ND/NDM Diverge — Trust NDM)"; _sv_cc="#DC2626"; _sv_cp=max(22, 38 - _sv_nact * 3)
-    else:
-        _sv_cf="LOW";    _sv_cc="#DC2626"; _sv_cp=28
-
-    # Fix 3: Signal agreement meta-score across 5 independent sub-signals
-    def _sig(v): return 1 if v > 0 else (-1 if v < 0 else 0)
-    _sa_signals = {
-        "Raw NDM":      _sig(total_ndm),
-        "Δ-Wtd NDM":   _sig(_ndm_wtd_norm),
-        "OTM Calls":   _sig(otm_call_ndm),
-        "OTM Puts":    -_sig(otm_put_ndm),   # negative put NDM = bullish
-        "VIX+NDM":     (1 if (_sv_vix_down and total_ndm > 0) else
-                        -1 if (_sv_vix_up  and total_ndm < 0) else 0),
-    }
-    _sa_active  = {k: v for k, v in _sa_signals.items() if v != 0}
-    _sa_agree   = sum(_sa_active.values())
-    _sa_n       = len(_sa_active)
-    _sa_pct     = int(abs(_sa_agree) / _sa_n * 100) if _sa_n > 0 else 0
-    if _sa_agree > 0:
-        _sa_dir = "BULL"; _sa_dc = "#059669"; _sa_dbg = "#D1FAE5"
-    elif _sa_agree < 0:
-        _sa_dir = "BEAR"; _sa_dc = "#DC2626"; _sa_dbg = "#FEE2E2"
-    else:
-        _sa_dir = "SPLIT"; _sa_dc = "#D97706"; _sa_dbg = "#FFFBEB"
-    _sa_badge_parts = " · ".join(
-        f"<span style='color:{'#059669' if v>0 else '#DC2626' if v<0 else '#9CA3AF'}'>"
-        f"{'⊕' if v>0 else '⊖' if v<0 else '–'} {k}</span>"
-        for k, v in _sa_signals.items()
+with _slot_sv:   # v10: display Shantanu's View just below Section 4
+    st.markdown(
+        '<div style="font-size:20px;font-weight:900;color:#7C3AED;letter-spacing:0.5px;'    'padding:14px 0 6px 0;border-bottom:2px solid #7C3AED;margin-bottom:12px;">'    '🎯 Shantanu\'s View</div>',
+        unsafe_allow_html=True
     )
 
-    # Render criteria cards (4 per row)
-    for _sv_r0 in range(0, len(_sv_criteria), 4):
-        _sv_row  = _sv_criteria[_sv_r0: _sv_r0 + 4]
-        _sv_rcols = st.columns(len(_sv_row))
-        for _sv_col, (icon, label, expl, side, pts) in zip(_sv_rcols, _sv_row):
-            if side == "bull":
-                _cb = "#059669"; _cbg = "#F0FDF4"
-            elif side == "bear":
-                _cb = "#DC2626"; _cbg = "#FFF5F5"
-            elif side in ("caution", "reversal", "amplify"):
-                _cb = "#D97706"; _cbg = "#FFFBEB"
+    # ── Compute per-strike ND and NDM from df_band_records ──────────────────────
+    # ND  per strike = (Call OI × |Call Δ|) − (Put OI × |Put Δ|)
+    # NDM per strike = (Call OI Chg × |Call Δ|) − (Put OI Chg × |Put Δ|)
+    _sv_df = pd.DataFrame(df_band_records).copy() if df_band_records else pd.DataFrame()
+
+    if not _sv_df.empty:
+        _sv_cd  = _sv_df["call_delta"].abs()
+        _sv_pd  = _sv_df["put_delta"].abs()
+        _sv_df["_nd"]  = (_sv_df["call_oi"]     * _sv_cd) - (_sv_df["put_oi"]     * _sv_pd)
+        _sv_df["_ndm"] = (_sv_df["call_oi_chg"] * _sv_cd) - (_sv_df["put_oi_chg"] * _sv_pd)
+
+        _sv_atm   = safe_num(m.get("atm", spot))
+        _sv_calls = _sv_df[_sv_df["strike"] > _sv_atm]
+        _sv_puts  = _sv_df[_sv_df["strike"] < _sv_atm]
+        _sv_atm_r = _sv_df[(_sv_df["strike"] >= _sv_atm - 25) & (_sv_df["strike"] <= _sv_atm + 25)]
+
+        otm_call_nd  = float(_sv_calls["_nd"].sum())
+        otm_call_ndm = float(_sv_calls["_ndm"].sum())
+        otm_put_nd   = float(_sv_puts["_nd"].sum())
+        otm_put_ndm  = float(_sv_puts["_ndm"].sum())
+        atm_nd       = float(_sv_atm_r["_nd"].sum())
+        atm_ndm      = float(_sv_atm_r["_ndm"].sum())
+        total_nd     = float(_sv_df["_nd"].sum())
+        total_ndm    = float(_sv_df["_ndm"].sum())
+
+        # Fix 1: Dynamic ATM NDM threshold — 0.5% of ATM OI (self-calibrates per expiry thickness)
+        _sv_atm_oi_total = float(_sv_atm_r["call_oi"].sum() + _sv_atm_r["put_oi"].sum())
+        _atm_ndm_thr = max(200.0, _sv_atm_oi_total * 0.005)
+
+        # Fix 6: ATM proximity weighting — inverse-distance weight by |call_Δ| + |put_Δ|
+        # Strikes near ATM with live delta carry more weight than deep OTM positions
+        _sv_df["_prox_w"]   = (abs(_sv_df["call_delta"]) + abs(_sv_df["put_delta"])).clip(lower=0.01)
+        _total_ndm_wtd      = float((_sv_df["_ndm"] * _sv_df["_prox_w"]).sum())
+        _total_prox_w       = float(_sv_df["_prox_w"].sum())
+        _ndm_wtd_norm       = _total_ndm_wtd / _total_prox_w if _total_prox_w > 0 else 0.0
+
+        # Fix 2: Session-range NDM percentile (uses today_history's call_dw_flow - put_dw_flow as NDM proxy)
+        _sv_hist_ndm = [
+            safe_num(h.get("call_dw_flow", 0)) - safe_num(h.get("put_dw_flow", 0))
+            for h in today_history
+        ]
+        if len(_sv_hist_ndm) >= 3:
+            _sv_ndm_min  = min(_sv_hist_ndm)
+            _sv_ndm_max  = _sv_hist_ndm[-1]   # current tick is last appended
+            _sv_ndm_rng  = max(_sv_ndm_max, max(_sv_hist_ndm)) - _sv_ndm_min
+            _sv_ndm_pct  = int(((total_ndm - _sv_ndm_min) / _sv_ndm_rng * 100)) if _sv_ndm_rng > 1 else 50
+            _sv_ndm_pct  = max(0, min(100, _sv_ndm_pct))
+            if _sv_ndm_pct >= 80:   _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th — TOP RANGE 🔝"
+            elif _sv_ndm_pct <= 20: _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th — BOTTOM RANGE 🔻"
+            else:                    _sv_ndm_pct_lbl = f"{_sv_ndm_pct}th percentile"
+        else:
+            _sv_ndm_pct     = None
+            _sv_ndm_pct_lbl = "< 3 ticks — building"
+
+        _sv_df["_gex"] = (
+            (_sv_df["call_oi"] * _sv_df["call_gamma"]) -
+            (_sv_df["put_oi"]  * _sv_df["put_gamma"])
+        ) * (spot ** 2) * 0.01
+        _sv_gex_idx    = _sv_df["_gex"].abs().idxmax()
+        _sv_gex_strike = int(_sv_df.loc[_sv_gex_idx, "strike"])
+        _sv_ndm_at_gex = float(_sv_df.loc[_sv_gex_idx, "_ndm"])
+
+        try:
+            _sv_dte = (datetime.strptime(expiry, "%Y-%m-%d").date() - date.today()).days
+        except Exception:
+            _sv_dte = 5
+        _sv_near_expiry = _sv_dte <= 2
+
+        _sv_vix     = safe_num(_vix_raw)
+        _sv_vix_chg = _vix_data.get("vix_change") if _vix_data else None
+        _sv_pcr     = safe_num(m.get("pcr", 1.0))
+
+        _sv_bull_pts = 0.0
+        _sv_bear_pts = 0.0
+        _sv_criteria = []
+
+        # Criterion 1: OTM Call zone
+        if otm_call_nd > 0 and otm_call_ndm > 0:
+            _sv_bull_pts += 3
+            _sv_criteria.append(("✅", "OTM Call: ND ⊕  NDM ⊕",
+                "Strong bullish delta cascade — fresh call buying; dealers forced to buy futures",
+                "bull", 3))
+        elif otm_call_nd > 0 and otm_call_ndm < 0:
+            _sv_bear_pts += 2
+            _sv_criteria.append(("⚠️", "OTM Call: ND ⊕  NDM ⊖",
+                "Bullish structure cracking — call unwind in progress; EXIT LONGS signal",
+                "bear", 2))
+        elif otm_call_nd < 0 and otm_call_ndm < 0:
+            _sv_bear_pts += 1
+            _sv_criteria.append(("❌", "OTM Call: ND ⊖  NDM ⊖",
+                "Put dominance at upside strikes — no bullish call accumulation",
+                "bear", 1))
+        else:
+            _sv_criteria.append(("➖", "OTM Call: Mixed / Flat",
+                "No clear directional signal from OTM call zone", "neutral", 0))
+
+        # Criterion 2: OTM Put zone
+        if otm_put_nd < 0 and otm_put_ndm < 0:
+            _sv_bear_pts += 3
+            _sv_criteria.append(("✅", "OTM Put: ND ⊖  NDM ⊖",
+                "Strong bearish delta cascade — fresh put buying; dealers forced to sell futures",
+                "bear", 3))
+        elif otm_put_nd < 0 and otm_put_ndm > 0:
+            _sv_bull_pts += 2
+            _sv_criteria.append(("⚠️", "OTM Put: ND ⊖  NDM ⊕",
+                "Bearish structure cracking — put unwind; COVER SHORTS / potential squeeze up",
+                "bull", 2))
+        elif otm_put_nd > 0 and otm_put_ndm > 0:
+            _sv_bull_pts += 1
+            _sv_criteria.append(("🟢", "OTM Put: ND ⊕  NDM ⊕",
+                "Call dominance below spot — put writers stepping back; support building",
+                "bull", 1))
+        else:
+            _sv_criteria.append(("➖", "OTM Put: Mixed / Flat",
+                "No clear directional signal from OTM put zone", "neutral", 0))
+
+        # Criterion 3: ATM NDM (Golden Rule) — Fix 1: threshold is now session-relative
+        # _atm_ndm_thr = max(200, 0.5% of ATM OI) — auto-calibrates per expiry thickness
+        if atm_ndm > _atm_ndm_thr:
+            _sv_bull_pts += 1.5
+            _sv_criteria.append(("✅", f"ATM NDM ⊕  ({atm_ndm:+,.0f})",
+                f"Fresh bullish flow at ATM — max gamma zone; dealer buying (thr: {_atm_ndm_thr:,.0f})",
+                "bull", 1.5))
+        elif atm_ndm < -_atm_ndm_thr:
+            _sv_bear_pts += 1.5
+            _sv_criteria.append(("❌", f"ATM NDM ⊖  ({atm_ndm:+,.0f})",
+                f"Fresh bearish flow at ATM — max gamma zone; dealer selling (thr: {_atm_ndm_thr:,.0f})",
+                "bear", 1.5))
+        else:
+            _sv_criteria.append(("➖", f"ATM NDM Flat  ({atm_ndm:+,.0f}  |  thr ±{_atm_ndm_thr:,.0f})",
+                "No fresh conviction at ATM — await confirmation candle", "neutral", 0))
+
+        # Criterion 4: NDM at highest-GEX strike
+        if _sv_ndm_at_gex > 0:
+            _sv_bull_pts += 1
+            _sv_criteria.append(("✅", f"NDM ⊕ at Highest GEX ({_sv_gex_strike:,})",
+                "Expect velocity UP — NDM firing where dealer hedging is most explosive",
+                "bull", 1))
+        elif _sv_ndm_at_gex < 0:
+            _sv_bear_pts += 1
+            _sv_criteria.append(("❌", f"NDM ⊖ at Highest GEX ({_sv_gex_strike:,})",
+                "Expect velocity DOWN — NDM firing where dealer hedging is most explosive",
+                "bear", 1))
+        else:
+            _sv_criteria.append(("➖", f"NDM Flat at Highest GEX ({_sv_gex_strike:,})",
+                "No velocity signal at most explosive GEX concentration", "neutral", 0))
+
+        # Criterion 5: VIX + NDM
+        _sv_vix_up   = _sv_vix_chg is not None and _sv_vix_chg >= 0.3
+        _sv_vix_down = _sv_vix_chg is not None and _sv_vix_chg <= -0.3
+        if _sv_vix > 0:
+            if _sv_vix_up and total_ndm < 0:
+                _sv_bear_pts += 2
+                _sv_criteria.append(("❌", f"VIX Rising ({_sv_vix:.1f}, +{_sv_vix_chg:.2f}) + NDM ⊖",
+                    "Institutional fear confirmed — REAL breakdown, not noise", "bear", 2))
+            elif _sv_vix_down and total_ndm > 0:
+                _sv_bull_pts += 1.5
+                _sv_criteria.append(("✅", f"VIX Falling ({_sv_vix:.1f}, {_sv_vix_chg:.2f}) + NDM ⊕",
+                    "VIX deflating + bullish NDM — calm institutional accumulation", "bull", 1.5))
+            elif _sv_vix > 18 and total_ndm < 0:
+                _sv_bear_pts += 1
+                _sv_criteria.append(("⚠️", f"VIX Elevated ({_sv_vix:.1f}) + NDM ⊖",
+                    "Elevated fear + bearish momentum — defensive posture warranted", "bear", 1))
+            elif _sv_vix < 13 and total_ndm > 0:
+                _sv_criteria.append(("⚠️", f"VIX Very Low ({_sv_vix:.1f}) + NDM ⊕",
+                    "Complacency alert — do not chase bull signal blindly", "caution", 0))
             else:
-                _cb = "#D1D5DB"; _cbg = "#F9FAFB"
-            _ptxt = (f"<span style='float:right;font-size:11px;font-weight:700;color:{_cb};'>"
-                     f"+{pts:.0f}pt{'s' if pts != 1 else ''}</span>") if pts > 0 else ""
-            _sv_col.markdown(f"""
+                _sv_criteria.append(("➖", f"VIX {_sv_vix:.1f} — Neutral Context",
+                    "No VIX amplification of NDM signal this session", "neutral", 0))
+        else:
+            _sv_criteria.append(("➖", "VIX Unavailable",
+                "India VIX feed not connected — cannot cross-confirm NDM", "neutral", 0))
+
+        # Criterion 6: Near expiry + NDM spike (Fix 1: use dynamic threshold)
+        if _sv_near_expiry and abs(total_ndm) > _atm_ndm_thr:
+            _sv_criteria.append(("⚡", f"Near Expiry ({_sv_dte}d) + NDM Spike ({total_ndm:+,.0f})",
+                "MAXIMUM IMPACT — gamma at peak; treat all signals with urgency", "amplify", 0))
+
+        # Criterion 7: PCR extreme + divergence
+        _sv_div = (total_nd > 0 and total_ndm < 0) or (total_nd < 0 and total_ndm > 0)
+        if (_sv_pcr > 1.5 or _sv_pcr < 0.7) and _sv_div:
+            _sv_criteria.append(("⚠️", f"PCR Extreme ({_sv_pcr:.2f}) + ND/NDM Divergence",
+                f"Classic mean-reversion setup — Max Pain gravity dominant ({int(m.get('max_pain', spot)):,})",
+                "reversal", 0))
+
+        # Final decision
+        _sv_net = _sv_bull_pts - _sv_bear_pts
+        if _sv_net >= 5:
+            _sv_dir="STRONG BULL";    _sv_dc="#059669"; _sv_dbg="#D1FAE5"
+            _sv_act="BUY / HOLD LONGS — Dealer hedge mechanical bid building"
+        elif _sv_net >= 2.5:
+            _sv_dir="MODERATE BULL";  _sv_dc="#10B981"; _sv_dbg="#ECFDF5"
+            _sv_act="Lean Long — Bullish bias with partial confirmation"
+        elif _sv_net <= -5:
+            _sv_dir="STRONG BEAR";    _sv_dc="#DC2626"; _sv_dbg="#FEE2E2"
+            _sv_act="SELL / HOLD SHORTS — Dealer hedge mechanical offer active"
+        elif _sv_net <= -2.5:
+            _sv_dir="MODERATE BEAR";  _sv_dc="#EF4444"; _sv_dbg="#FEF2F2"
+            _sv_act="Lean Short — Bearish bias with partial confirmation"
+        else:
+            _sv_dir="NEUTRAL / WAIT"; _sv_dc="#D97706"; _sv_dbg="#FFFBEB"
+            _sv_act="No clear edge — reduce size; await one more confirming criterion"
+
+        _sv_agree = (total_nd > 0 and total_ndm > 0) or (total_nd < 0 and total_ndm < 0)
+        _sv_nact  = sum(1 for c in _sv_criteria if c[3] not in ("neutral",))
+        if _sv_agree and abs(_sv_net) >= 5:
+            _sv_cf="HIGH";   _sv_cc="#059669"; _sv_cp=min(92, 70 + _sv_nact * 4)
+        elif _sv_agree and abs(_sv_net) >= 2.5:
+            _sv_cf="MEDIUM"; _sv_cc="#D97706"; _sv_cp=min(72, 52 + _sv_nact * 4)
+        elif not _sv_agree:
+            _sv_cf="LOW  (ND/NDM Diverge — Trust NDM)"; _sv_cc="#DC2626"; _sv_cp=max(22, 38 - _sv_nact * 3)
+        else:
+            _sv_cf="LOW";    _sv_cc="#DC2626"; _sv_cp=28
+
+        # Fix 3: Signal agreement meta-score across 5 independent sub-signals
+        def _sig(v): return 1 if v > 0 else (-1 if v < 0 else 0)
+        _sa_signals = {
+            "Raw NDM":      _sig(total_ndm),
+            "Δ-Wtd NDM":   _sig(_ndm_wtd_norm),
+            "OTM Calls":   _sig(otm_call_ndm),
+            "OTM Puts":    -_sig(otm_put_ndm),   # negative put NDM = bullish
+            "VIX+NDM":     (1 if (_sv_vix_down and total_ndm > 0) else
+                            -1 if (_sv_vix_up  and total_ndm < 0) else 0),
+        }
+        _sa_active  = {k: v for k, v in _sa_signals.items() if v != 0}
+        _sa_agree   = sum(_sa_active.values())
+        _sa_n       = len(_sa_active)
+        _sa_pct     = int(abs(_sa_agree) / _sa_n * 100) if _sa_n > 0 else 0
+        if _sa_agree > 0:
+            _sa_dir = "BULL"; _sa_dc = "#059669"; _sa_dbg = "#D1FAE5"
+        elif _sa_agree < 0:
+            _sa_dir = "BEAR"; _sa_dc = "#DC2626"; _sa_dbg = "#FEE2E2"
+        else:
+            _sa_dir = "SPLIT"; _sa_dc = "#D97706"; _sa_dbg = "#FFFBEB"
+        _sa_badge_parts = " · ".join(
+            f"<span style='color:{'#059669' if v>0 else '#DC2626' if v<0 else '#9CA3AF'}'>"
+            f"{'⊕' if v>0 else '⊖' if v<0 else '–'} {k}</span>"
+            for k, v in _sa_signals.items()
+        )
+
+        # Render criteria cards (4 per row)
+        for _sv_r0 in range(0, len(_sv_criteria), 4):
+            _sv_row  = _sv_criteria[_sv_r0: _sv_r0 + 4]
+            _sv_rcols = st.columns(len(_sv_row))
+            for _sv_col, (icon, label, expl, side, pts) in zip(_sv_rcols, _sv_row):
+                if side == "bull":
+                    _cb = "#059669"; _cbg = "#F0FDF4"
+                elif side == "bear":
+                    _cb = "#DC2626"; _cbg = "#FFF5F5"
+                elif side in ("caution", "reversal", "amplify"):
+                    _cb = "#D97706"; _cbg = "#FFFBEB"
+                else:
+                    _cb = "#D1D5DB"; _cbg = "#F9FAFB"
+                _ptxt = (f"<span style='float:right;font-size:11px;font-weight:700;color:{_cb};'>"
+                         f"+{pts:.0f}pt{'s' if pts != 1 else ''}</span>") if pts > 0 else ""
+                _sv_col.markdown(f"""
             <div style="background:{_cbg};border-left:4px solid {_cb};border-radius:6px;
                         padding:10px 12px;min-height:84px;">
               <div style="font-size:12.5px;font-weight:800;color:#1A1A2E;line-height:1.3;">
@@ -6677,19 +6906,19 @@ if not _sv_df.empty:
               <div style="font-size:10.5px;color:#4B5563;margin-top:5px;line-height:1.4;">{expl}</div>
             </div>""", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
 
-    # Verdict banner
-    _sv_bc   = sum(1 for c in _sv_criteria if c[3] == "bull")
-    _sv_berc = sum(1 for c in _sv_criteria if c[3] == "bear")
-    _sv_nlbl = "⊕ BULLISH" if total_ndm > 0 else ("⊖ BEARISH" if total_ndm < 0 else "FLAT")
-    _sv_dlbl = "⊕ BULLISH" if total_nd  > 0 else ("⊖ BEARISH" if total_nd  < 0 else "FLAT")
-    _sv_atxt = "✅ Aligned" if _sv_agree else "⚠️ Diverging — Trust NDM"
-    _sv_acol = "#059669"   if _sv_agree else "#DC2626"
+        # Verdict banner
+        _sv_bc   = sum(1 for c in _sv_criteria if c[3] == "bull")
+        _sv_berc = sum(1 for c in _sv_criteria if c[3] == "bear")
+        _sv_nlbl = "⊕ BULLISH" if total_ndm > 0 else ("⊖ BEARISH" if total_ndm < 0 else "FLAT")
+        _sv_dlbl = "⊕ BULLISH" if total_nd  > 0 else ("⊖ BEARISH" if total_nd  < 0 else "FLAT")
+        _sv_atxt = "✅ Aligned" if _sv_agree else "⚠️ Diverging — Trust NDM"
+        _sv_acol = "#059669"   if _sv_agree else "#DC2626"
 
-    _vc1, _vc2, _vc3, _vc4 = st.columns([3, 2, 2, 2])
-    with _vc1:
-        st.markdown(f"""
+        _vc1, _vc2, _vc3, _vc4 = st.columns([3, 2, 2, 2])
+        with _vc1:
+            st.markdown(f"""
         <div style="background:{_sv_dbg};border:2px solid {_sv_dc};border-radius:10px;
                     padding:16px 18px;text-align:center;">
           <div style="font-size:11px;font-weight:700;color:{_sv_dc};text-transform:uppercase;
@@ -6697,8 +6926,8 @@ if not _sv_df.empty:
           <div style="font-size:26px;font-weight:900;color:{_sv_dc};line-height:1.1;">{_sv_dir}</div>
           <div style="font-size:12px;color:#374151;margin-top:8px;font-weight:600;">{_sv_act}</div>
         </div>""", unsafe_allow_html=True)
-    with _vc2:
-        st.markdown(f"""
+        with _vc2:
+            st.markdown(f"""
         <div class="card" style="text-align:center;padding:14px;">
           <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Confidence</div>
           <div style="font-size:17px;font-weight:900;color:{_sv_cc};margin:6px 0;">{_sv_cf}</div>
@@ -6708,11 +6937,11 @@ if not _sv_df.empty:
           <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">
             Bull criteria: {_sv_bc} · Bear criteria: {_sv_berc}</div>
         </div>""", unsafe_allow_html=True)
-    with _vc3:
-        # Fix 2 + Fix 6: ND/NDM card now shows session percentile and Δ-weighted NDM
-        _wtd_lbl  = "⊕" if _ndm_wtd_norm > 0 else ("⊖" if _ndm_wtd_norm < 0 else "~")
-        _wtd_col  = "#059669" if _ndm_wtd_norm > 0 else ("#DC2626" if _ndm_wtd_norm < 0 else "#6B7280")
-        st.markdown(f"""
+        with _vc3:
+            # Fix 2 + Fix 6: ND/NDM card now shows session percentile and Δ-weighted NDM
+            _wtd_lbl  = "⊕" if _ndm_wtd_norm > 0 else ("⊖" if _ndm_wtd_norm < 0 else "~")
+            _wtd_col  = "#059669" if _ndm_wtd_norm > 0 else ("#DC2626" if _ndm_wtd_norm < 0 else "#6B7280")
+            st.markdown(f"""
         <div class="card" style="padding:14px;">
           <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
                       margin-bottom:6px;">ND / NDM Dual Filter</div>
@@ -6730,9 +6959,9 @@ if not _sv_df.empty:
           <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">
             Golden Rule: when divergent, NDM overrides ND</div>
         </div>""", unsafe_allow_html=True)
-    with _vc4:
-        # Fix 3: Signal agreement meta-score
-        st.markdown(f"""
+        with _vc4:
+            # Fix 3: Signal agreement meta-score
+            st.markdown(f"""
         <div class="card" style="padding:14px;">
           <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
                       margin-bottom:6px;">Signal Agreement</div>
@@ -6746,129 +6975,57 @@ if not _sv_df.empty:
         </div>""", unsafe_allow_html=True)
 
 
-    # ── Enhanced NDM — Buyer/Writer Adjusted (Shantanu Framework Upgrade) ──────
-    st.markdown(
-        '<div style="font-size:16px;font-weight:900;color:#7C3AED;letter-spacing:0.4px;'
-        'padding:14px 0 6px 0;border-top:2px solid #E5E7EB;margin-top:16px;margin-bottom:8px;">'
-        '🔬 Enhanced NDM — Buyer / Writer Adjusted</div>',
-        unsafe_allow_html=True
-    )
-    st.caption(
-        "Raw NDM assumes ALL OI addition is buyer-driven. "
-        "Enhanced NDM corrects this using the raw Call/Put Extrinsic Value ratio: "
-        "EV ratio > 1 → Call buyer / Put writer; EV ratio < 1 → Put buyer / Call writer. "
-        "The MM takes the opposite side of the buyer, reversing the hedge direction. "
-        "If Enhanced NDM diverges from Raw NDM, the raw signal is unreliable."
-    )
-
-    # Build Enhanced NDM using the raw Call/Put Extrinsic Value ratio (the same
-    # ev_ratio_avg_strikewise metric driving the "Raw CE/PE EV Ratio" Z-Score
-    # chart) to decide the buyer/writer stance for THIS tick — replacing the
-    # previous per-strike prev-tick premium-direction comparison:
-    #   EV ratio > 1  -> Call buyer, Put seller/writer
-    #   EV ratio < 1  -> Put buyer, Call seller/writer
-    #   EV ratio == 1 -> no dominant side (neutral)
-    # This single stance applies uniformly to every strike in the band. All
-    # other reasoning — contribution formulas, Raw NDM, signal classification,
-    # suppression window — is unchanged.
-    _ev_ratio_now = float(m.get("ev_ratio_avg_strikewise", 0) or 0)
-    if _ev_ratio_now > 1:
-        _c_prem_dir_g, _p_prem_dir_g = 1, -1     # Call buyer / Put seller(writer)
-    elif _ev_ratio_now < 1:
-        _c_prem_dir_g, _p_prem_dir_g = -1, 1     # Put buyer / Call seller(writer)
-    else:
-        _c_prem_dir_g, _p_prem_dir_g = 0, 0      # EV ratio exactly 1 — no dominant side
-
-    _endm_rows = []
-    for _r in df_band_records:
-        _strike     = _r.get("strike", 0)
-        _c_oi_chg   = float(_r.get("call_oi_chg", 0) or 0)
-        _p_oi_chg   = float(_r.get("put_oi_chg",  0) or 0)
-        _c_delta    = abs(float(_r.get("call_delta", 0) or 0))
-        _p_delta    = abs(float(_r.get("put_delta",  0) or 0))
-
-        _c_prem_dir = _c_prem_dir_g
-        _p_prem_dir = _p_prem_dir_g
-
-        # EV ratio exactly 1 (rare) — no dominant side this tick.
-        if _c_prem_dir == 0 and _p_prem_dir == 0:
-            _raw_ndm_v = (_c_oi_chg * _c_delta) - (_p_oi_chg * _p_delta)
-            _endm_rows.append({
-                "Strike":        int(_strike),
-                "C OI Chg":      int(_c_oi_chg),
-                "C Prem Dir":    "~ Neutral",
-                "P OI Chg":      int(_p_oi_chg),
-                "P Prem Dir":    "~ Neutral",
-                "Enhanced NDM":  0,
-                "Raw NDM":       round(_raw_ndm_v),
-            })
-            continue
-
-        # Call: buyer aggressor → MM short call → buys futures → +delta
-        # Call: writer aggressor → MM long call  → sells futures → -delta
-        _c_contrib  = _c_oi_chg * _c_delta * _c_prem_dir
-
-        # Put: buyer aggressor → MM short put → sells futures → -delta  (prem_dir=+1 → negative)
-        # Put: writer aggressor → MM long put  → buys futures → +delta  (prem_dir=-1 → positive)
-        _p_contrib  = _p_oi_chg * _p_delta * (-_p_prem_dir)
-
-        _endm_val   = _c_contrib + _p_contrib
-        _raw_ndm_v  = (_c_oi_chg * _c_delta) - (_p_oi_chg * _p_delta)
-
-        _endm_rows.append({
-            "Strike":        int(_strike),
-            "C OI Chg":      int(_c_oi_chg),
-            "C Prem Dir":    "↑ Buyer" if _c_prem_dir == 1 else "↓ Writer",
-            "P OI Chg":      int(_p_oi_chg),
-            "P Prem Dir":    "↑ Buyer" if _p_prem_dir == 1 else "↓ Writer",
-            "Enhanced NDM":  round(_endm_val),
-            "Raw NDM":       round(_raw_ndm_v),
-        })
-
-    _endm_df        = pd.DataFrame(_endm_rows).sort_values("Strike", ascending=False)
-    _endm_total_e   = int(_endm_df["Enhanced NDM"].sum())
-    _endm_total_r   = int(_endm_df["Raw NDM"].sum())
-
-    # Signal classification
-    if _endm_total_e > 0 and _endm_total_r > 0:
-        _endm_signal = "✅ CONFIRMED BULLISH — Buyer-driven call pressure. MM hedge = buy futures."
-        _endm_sc     = "#059669"; _endm_sbg = "#D1FAE5"
-    elif _endm_total_e < 0 and _endm_total_r < 0:
-        _endm_signal = "✅ CONFIRMED BEARISH — Buyer-driven put pressure. MM hedge = sell futures."
-        _endm_sc     = "#DC2626"; _endm_sbg = "#FEE2E2"
-    elif _endm_total_e > 0 and _endm_total_r < 0:
-        _endm_signal = "⚠️ DIVERGENCE — Writer puts reversing raw signal → Lean BULLISH. Verify VIX + PCR."
-        _endm_sc     = "#D97706"; _endm_sbg = "#FFFBEB"
-    elif _endm_total_e < 0 and _endm_total_r > 0:
-        _endm_signal = "⚠️ DIVERGENCE — Writer calls reversing raw signal → Lean BEARISH. Verify VIX + PCR."
-        _endm_sc     = "#D97706"; _endm_sbg = "#FFFBEB"
-    else:
-        _endm_signal = "➖ NEUTRAL / MIXED — No dominant aggressor side."
-        _endm_sc     = "#6B7280"; _endm_sbg = "#F9FAFB"
-
-    _endm_rc = "#059669" if _endm_total_r > 0 else "#DC2626" if _endm_total_r < 0 else "#6B7280"
-
-    # Suppress note during first 15 min of session
-    _now_ist_sv = now_ist()
-    _endm_suppress = (_now_ist_sv.hour == 9 and _now_ist_sv.minute < 30)
-    if _endm_suppress:
-        st.warning(
-            "⚠️ Enhanced NDM suppressed during 09:15–09:30: gap-open premium spikes make "
-            "buyer/writer classification unreliable. Signal activates after 09:30."
+        # ── Enhanced NDM v10 — per-strike Buyer/Seller Matrix ─────────────────────
+        st.markdown(
+            '<div style="font-size:16px;font-weight:900;color:#7C3AED;letter-spacing:0.4px;'
+            'padding:14px 0 6px 0;border-top:2px solid #E5E7EB;margin-top:16px;margin-bottom:8px;">'
+            '🔬 Enhanced NDM v10 — Buyer / Seller Matrix (Raw CE/PE EVR × Δ-Wtd OI Change Momentum)</div>',
+            unsafe_allow_html=True
         )
-    else:
-        _ec1, _ec2, _ec3 = st.columns([1, 1, 2])
-        with _ec1:
-            st.markdown(f"""
+        st.caption(
+            "BIAS comes from the raw CE/PE Extrinsic-Value ratio per strike: >1 = Call buyers & Put sellers → BULLISH; "
+            "<1 = Put buyers & Call sellers → BEARISH. MOMENTUM comes from the Δ-weighted OI change per strike: "
+            "with EVR>1, positive NDM = Call BUYERS stronger → strong upside; negative NDM = Put SELLERS stronger → "
+            "bullish but weak. Exactly opposite for EVR<1. Strong opposite sellers on BOTH sides of spot → "
+            "range-bound, pinning the ATM."
+        )
+
+        if "_endm_hist_store" not in st.session_state:
+            st.session_state["_endm_hist_store"] = {"date": None, "rows": []}
+        _endm = _compute_enhanced_ndm(df_band_records, m, spot, st.session_state["_endm_hist_store"])
+        _endm_df      = _endm["df"]
+        _endm_total_e = _endm["enhanced_total"]
+        _endm_total_r = _endm["raw_total"]
+        _endm_sc      = _endm["sc"]
+        _endm_sbg     = _endm["sbg"]
+        _endm_rc = "#059669" if _endm_total_r > 0 else "#DC2626" if _endm_total_r < 0 else "#6B7280"
+        _endm_ec = "#059669" if _endm_total_e > 0 else "#DC2626" if _endm_total_e < 0 else "#6B7280"
+
+        # Suppress note during first 15 min of session
+        _now_ist_sv = now_ist()
+        _endm_suppress = (_now_ist_sv.hour == 9 and _now_ist_sv.minute < 30)
+        if _endm_suppress:
+            st.warning(
+                "⚠️ Enhanced NDM suppressed during 09:15–09:30: gap-open premium spikes make "
+                "buyer/seller classification unreliable. Signal activates after 09:30."
+            )
+        else:
+            _rsn_html = "".join(
+                f'<div style="font-size:11px;color:#374151;line-height:1.55;">&bull; {_r}</div>'
+                for _r in _endm.get("reason", [])
+            )
+            _ec1, _ec2, _ec3 = st.columns([1, 1, 2])
+            with _ec1:
+                st.markdown(f"""
             <div style="background:#F8F7FF;border:1.5px solid #7C3AED;border-radius:10px;
                         padding:14px 16px;text-align:center;">
               <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
                           letter-spacing:0.5px;margin-bottom:4px;">Enhanced NDM</div>
-              <div style="font-size:24px;font-weight:900;color:{_endm_sc};">{_endm_total_e:+,}</div>
-              <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Buyer/Writer Adjusted</div>
+              <div style="font-size:24px;font-weight:900;color:{_endm_ec};">{_endm_total_e:+,}</div>
+              <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Per-strike Buyer/Seller Adjusted</div>
             </div>""", unsafe_allow_html=True)
-        with _ec2:
-            st.markdown(f"""
+            with _ec2:
+                st.markdown(f"""
             <div style="background:#F9FAFB;border:1.5px solid #E5E7EB;border-radius:10px;
                         padding:14px 16px;text-align:center;">
               <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
@@ -6876,44 +7033,58 @@ if not _sv_df.empty:
               <div style="font-size:24px;font-weight:900;color:{_endm_rc};">{_endm_total_r:+,}</div>
               <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Standard Formula</div>
             </div>""", unsafe_allow_html=True)
-        with _ec3:
-            st.markdown(f"""
+            with _ec3:
+                st.markdown(f"""
             <div style="background:{_endm_sbg};border:1.5px solid {_endm_sc};border-radius:10px;
                         padding:14px 16px;">
               <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
-                          letter-spacing:0.5px;margin-bottom:6px;">Signal Interpretation</div>
+                          letter-spacing:0.5px;margin-bottom:6px;">Final Verdict — Matrix (avg EVR {_endm['evr_avg']:.3f})</div>
               <div style="font-size:13px;font-weight:800;color:{_endm_sc};line-height:1.5;">
-                {_endm_signal}</div>
-              <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">
-                Divergence = Raw NDM unreliable. Trust Enhanced NDM + cross-check VIX &amp; PCR.</div>
+                {_endm['verdict']}</div>
+              <div style="margin-top:6px;">{_rsn_html}</div>
             </div>""", unsafe_allow_html=True)
 
-        with st.expander("📊 Strike-by-Strike Enhanced NDM Breakdown", expanded=False):
-            st.caption(
-                f"Raw Call/Put EV ratio this tick: **{_ev_ratio_now:.3f}**. "
-                "↑ Buyer = this side is buyer-dominated per the EV ratio (MM hedges WITH the move). "
-                "↓ Writer = this side is writer-dominated (MM hedges AGAINST the move, flipping sign). "
-                "Stance is the same across every strike this tick; only OI change and delta vary "
-                "row to row."
-            )
+            # 15-minute Final Verdict history
+            if _endm.get("history"):
+                st.markdown(
+                    '<div style="font-size:12px;font-weight:800;color:#5C35CC;margin:12px 0 6px 0;">'
+                    '🕒 Final Verdict History — 15-min log (today)</div>', unsafe_allow_html=True)
+                st.dataframe(pd.DataFrame(_endm["history"]), use_container_width=True, hide_index=True)
 
-            def _endm_style(val):
-                if isinstance(val, (int, float)):
-                    if val > 0:
-                        return "color:#059669;font-weight:700"
-                    elif val < 0:
-                        return "color:#DC2626;font-weight:700"
-                return ""
+            with st.expander("📊 Strike-by-Strike Buyer/Seller Matrix Breakdown", expanded=False):
+                st.caption(
+                    f"Avg raw CE/PE EV ratio this tick: **{_endm['evr_avg']:.3f}** → bias **{_endm['bias']}**. "
+                    "Per strike: EVR>1 = bullish bias · EVR<1 = bearish bias. The NDM (Δ×ΔOI) sign then decides "
+                    "WHO is stronger at that strike — buyers (strong momentum) or sellers (weak momentum)."
+                )
 
-            st.dataframe(
-                _endm_df.style.map(_endm_style, subset=["Enhanced NDM", "Raw NDM"]),
-                use_container_width=True,
-                hide_index=True
-            )
-    # ── End Enhanced NDM ──────────────────────────────────────────────────────
+                def _endm_style(val):
+                    if isinstance(val, (int, float)):
+                        if val > 0:
+                            return "color:#059669;font-weight:700"
+                        elif val < 0:
+                            return "color:#DC2626;font-weight:700"
+                    return ""
 
-else:
-    st.info("⏳ Shantanu's View: Waiting for option chain data to initialise.")
+                def _endm_read_style(val):
+                    if isinstance(val, str):
+                        if "BULLISH" in val:
+                            return "color:#059669;font-weight:700"
+                        if "BEARISH" in val:
+                            return "color:#DC2626;font-weight:700"
+                    return ""
+
+                st.dataframe(
+                    _endm_df.rename(columns={"NDM": "NDM (Δ×ΔOI)", "EVR": "Raw CE/PE EVR"})
+                            .style.map(_endm_style, subset=["Enhanced NDM", "NDM (Δ×ΔOI)"])
+                            .map(_endm_read_style, subset=["Reading"]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+        # ── End Enhanced NDM ──────────────────────────────────────────────────────
+
+    else:
+        st.info("⏳ Shantanu's View: Waiting for option chain data to initialise.")
 
 # ══ END SHANTANU'S VIEW ═══════════════════════════════════════════════
 
