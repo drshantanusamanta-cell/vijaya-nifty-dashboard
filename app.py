@@ -64,7 +64,7 @@ def is_market_hours():
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Shantanu's Options Dashboard — NIFTY · v12",   # H21 fix: was mojibake (\x97 where em-dash should be)
+    page_title="Shantanu's Options Dashboard — NIFTY · v13",   # H21 fix: was mojibake (\x97 where em-dash should be)
     page_icon="📊",   # H21 fix: was empty — browser showed default favicon
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -112,7 +112,7 @@ USE_DHAN          = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
 USE_DEMO_MODE     = not USE_DHAN
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v12"
+APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v13"
 RISK_FREE_RATE   = 0.065
 STRUCTURAL_BAND  = 10
 SIGNAL_BAND      = 5
@@ -6927,6 +6927,9 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         _ev_bd["ev_c_adj"] = np.maximum(
             0, _ev_bd["ev_c"] - _ev_bd["strike"] * (1 - np.exp(-RISK_FREE_RATE * _T_ev)))
         _evr_raw_s = (_ev_bd["ev_c_adj"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
+        # ★ v13: per-strike initiation map — >1.05 call buyers/put sellers
+        # dominant (bullish), <0.95 put buyers/call sellers dominant (bearish).
+        _s4_evmap = {int(k): float(v) for k, v in zip(_ev_bd["strike"], _evr_raw_s)}
         _evr_oiw_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi"]) /
                       (_ev_bd["ev_p"] * _ev_bd["put_oi"]).replace(0, np.nan)).fillna(1.0)
 
@@ -7007,10 +7010,12 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         #   Green = Put build + Call unwind  (bullish quadrant)
         #   Amber = both sides building      (contested — read ratio)
         #   Slate = both sides unwinding     (de-risking — read ratio)
-        def _s4_quad_bar(x_vals, vals, doi_c, doi_p, title, y_title, liq_ok=None):
+        def _s4_quad_bar(x_vals, vals, doi_c, doi_p, title, y_title,
+                         liq_ok=None, ev_map=None):
             vals  = pd.Series(vals).astype(float).reset_index(drop=True)
             doi_c = pd.Series(doi_c).astype(float).reset_index(drop=True)
             doi_p = pd.Series(doi_p).astype(float).reset_index(drop=True)
+            _xs   = list(x_vals)
             if liq_ok is None:
                 liq_ok = pd.Series([True] * len(vals))
             else:
@@ -7020,16 +7025,45 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                 if dc_ < 0 and dp_ >= 0:  return "#22C55E", "Put build + Call unwind (bullish)"
                 if dc_ >= 0 and dp_ >= 0: return "#F59E0B", "Both building (contested)"
                 return "#64748B", "Both unwinding (de-risking)"
+            # ★ v13: EV initiation cross-check — parity-adjusted premium
+            # pressure decides WHO drives the flow. Conflicts (quadrant says
+            # writer-driven, premium says buyer-driven) get a black outline.
             _plot = vals.where(liq_ok, 1.0)
-            _cols, _cd = [], []
-            for v, ok, dc_, dp_ in zip(vals, liq_ok, doi_c, doi_p):
+            _cols, _cd, _lcols, _lws = [], [], [], []
+            for _k, v, ok, dc_, dp_ in zip(_xs, vals, liq_ok, doi_c, doi_p):
                 if not ok:
                     _cols.append(_LIQ_GREY); _cd.append("illiquid — masked")
+                    _lcols.append(_LIQ_GREY); _lws.append(0)
+                    continue
+                _c, _lbl = _quad(dc_, dp_)
+                _evr = (ev_map or {}).get(int(_k))
+                _conf = False
+                if _evr is None:
+                    _evt = "EV: n/a (outside ATM band)"
+                elif _evr > 1.05:
+                    _evt = f"EV {_evr:.2f}: call buyers / put sellers pressing (bullish)"
+                    _conf = (_c == "#EF4444")
+                    if _c in ("#F59E0B", "#64748B"):
+                        _evt += " → lean bullish"
+                elif _evr < 0.95:
+                    _evt = f"EV {_evr:.2f}: put buyers / call sellers pressing (bearish)"
+                    _conf = (_c == "#22C55E")
+                    if _c in ("#F59E0B", "#64748B"):
+                        _evt += " → lean bearish"
                 else:
-                    _c, _lbl = _quad(dc_, dp_)
-                    _cols.append(_c); _cd.append(f"{_lbl} · ratio {v:.3f}")
-            f = go.Figure(go.Bar(x=list(x_vals), y=_plot - 1.0, base=1.0,
-                                 marker_color=_cols, customdata=_cd,
+                    _evt = f"EV {_evr:.2f}: balanced initiation"
+                _txt = f"{_lbl} · ratio {v:.3f}<br>{_evt}"
+                if _conf:
+                    _txt += ("<br>⚠ flow/premium CONFLICT — premium says "
+                             + ("call BUYERS drive this build (bullish)" if _evr > 1.05
+                                else "put BUYERS drive this build (bearish)"))
+                _cols.append(_c); _cd.append(_txt)
+                _lcols.append("#111827" if _conf else _c)
+                _lws.append(1.8 if _conf else 0)
+            f = go.Figure(go.Bar(x=_xs, y=_plot - 1.0, base=1.0,
+                                 marker=dict(color=_cols,
+                                             line=dict(color=_lcols, width=_lws)),
+                                 customdata=_cd,
                                  hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
             f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
                         annotation_text="Baseline 1.0", annotation_position="bottom right",
@@ -7091,8 +7125,8 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         with _s4_r5c2:
             f10 = _s4_quad_bar(x, _dwr_chg_s.fillna(1.0),
                                df_band["call_oi_chg"], df_band["put_oi_chg"],
-                               "★ Δ-Wtd CE/PE OI-Chg Ratio · Red=C-build/P-unwind(bear) · Green=P-build/C-unwind(bull) · Amber=both build · Slate=both unwind",
-                               "Δ×ΔOI CE/PE Ratio", liq_ok=_liq_chg)
+                               "★ Δ-Wtd CE/PE OI-Chg Ratio · Red=C-build/P-unwind(bear) · Green=P-build/C-unwind(bull) · Amber=both build · Slate=both unwind · Black outline=EV conflict",
+                               "Δ×ΔOI CE/PE Ratio", liq_ok=_liq_chg, ev_map=_s4_evmap)
             st.plotly_chart(f10, width='stretch', config={"displayModeBar":False})
 
         # ★ v11/v12 Pair 2 — Δ- AND EV-weighted CE/PE ratios, per strike over
@@ -7121,8 +7155,8 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         with _s4_r6c2:
             f12 = _s4_quad_bar(_ev_bd["strike"], _devr_chg_s.fillna(1.0),
                                _ev_bd["call_oi_chg"], _ev_bd["put_oi_chg"],
-                               f"★ Δ×EV-Wtd CE/PE OI-Chg Ratio (ATM±{_ev_band_n}) · Red=C-build/P-unwind(bear) · Green=P-build/C-unwind(bull) · Amber=both build · Slate=both unwind",
-                               "Δ×ΔOI×EV CE/PE Ratio", liq_ok=_liq_ev_chg)
+                               f"★ Δ×EV-Wtd CE/PE OI-Chg Ratio (ATM±{_ev_band_n}) · Red=C-build/P-unwind(bear) · Green=P-build/C-unwind(bull) · Amber=both build · Slate=both unwind · Black outline=EV conflict",
+                               "Δ×ΔOI×EV CE/PE Ratio", liq_ok=_liq_ev_chg, ev_map=_s4_evmap)
             st.plotly_chart(f12, width='stretch', config={"displayModeBar":False})
 
         # ★ v12: signal journal — one CSV row per refresh so the decision-
@@ -7158,6 +7192,75 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                         _fh.write(_jrow)
         except Exception as _je:
             print(f"[s4-journal] {_je}", flush=True)
+
+        # ★ v13: Combined Flow × Premium initiation read — merges each ATM
+        # strike's OI-change quadrant (WHO is building/unwinding) with the
+        # parity-adjusted EV pressure (WHO initiates: buyers paying up vs
+        # writers pressing premium). Premium pressure overrides the quadrant
+        # where they disagree. Rolling 15-tick (~15 min) history persisted
+        # to JSON exactly like the smile history. Rendered into Shantanu's View.
+        try:
+            _vsum = _wsum = 0.0
+            _sub = _ev_bd[_liq_ev_chg]
+            for _, _r in _sub.iterrows():
+                _dcx, _dpx = float(_r["call_oi_chg"]), float(_r["put_oi_chg"])
+                _evr_k = _s4_evmap.get(int(_r["strike"]))
+                if _evr_k is not None and _evr_k > 1.05:
+                    _v = 1
+                elif _evr_k is not None and _evr_k < 0.95:
+                    _v = -1
+                elif _dcx >= 0 and _dpx < 0:
+                    _v = -1
+                elif _dcx < 0 and _dpx >= 0:
+                    _v = 1
+                else:
+                    _v = 0
+                _w = (abs(_dcx) * abs(float(_r["call_delta"])) * float(_r["ev_c"]) +
+                      abs(_dpx) * abs(float(_r["put_delta"]))  * float(_r["ev_p"]))
+                _vsum += _v * _w; _wsum += _w
+            _ifrac  = _vsum / max(_wsum, 1e-9)
+            _ilabel = ("BULLISH" if _ifrac > 0.3 else
+                       ("BEARISH" if _ifrac < -0.3 else "NEUTRAL / CONTESTED"))
+            _S4I_FILE = os.path.join(_BASE_DIR, "nifty_s4_interp_history.json")
+            try:
+                with open(_S4I_FILE) as _fh:
+                    _ihist = json.load(_fh)
+            except Exception:
+                _ihist = []
+            _its = str(payload.get("ts_ist", ""))
+            if not _ihist or _ihist[-1].get("ts") != _its:
+                _ihist.append({"ts": _its, "label": _ilabel, "frac": round(_ifrac, 2)})
+                _ihist = _ihist[-15:]
+                try:
+                    _atomic_json_write(_S4I_FILE, _ihist)
+                except Exception:
+                    pass
+            _amap   = {"BULLISH": "▲", "BEARISH": "▼"}
+            _arrows = " ".join(_amap.get(e.get("label"), "•") for e in _ihist)
+            _nb = sum(1 for e in _ihist if e.get("label") == "BULLISH")
+            _ns = sum(1 for e in _ihist if e.get("label") == "BEARISH")
+            _icol = {"BULLISH": "#22C55E", "BEARISH": "#EF4444"}.get(_ilabel, "#F59E0B")
+            with _slot_sv:
+                st.markdown(
+                    f'<div style="background:#F9FAFB;border:1.5px solid {_icol};'
+                    f'border-radius:10px;padding:12px 16px;margin-top:10px;">'
+                    f'<div style="display:flex;align-items:center;flex-wrap:wrap;margin-bottom:6px;">'
+                    f'<span style="font-size:11px;font-weight:700;color:#6B7280;'
+                    f'text-transform:uppercase;margin-right:8px;">🧭 Combined Flow × Premium Read (Section 4)</span>'
+                    f'<span style="background:{_icol};color:#fff;border-radius:5px;'
+                    f'padding:2px 10px;font-size:12px;font-weight:800;">{_ilabel} · {_ifrac:+.2f}</span></div>'
+                    f'<div style="font-size:11.5px;color:#374151;margin-bottom:6px;">'
+                    f'In plain English: for every ATM strike we ask two questions — WHO is adding or '
+                    f'removing positions (the OI-change quadrant), and WHO is setting the price '
+                    f'(parity-adjusted premium pressure: buyers paying up, or writers pressing it down). '
+                    f'When the two disagree, premium pressure wins, because it reveals the aggressive side. '
+                    f'The verdict is the premium-weighted sum of those per-strike answers '
+                    f'(−1 fully bearish … +1 fully bullish).</div>'
+                    f'<div style="font-size:11px;color:#6B7280;font-family:monospace;">'
+                    f'Last 15 min ({len(_ihist)} ticks): {_arrows} &nbsp;·&nbsp; {_nb}▲ / {_ns}▼</div></div>',
+                    unsafe_allow_html=True)
+        except Exception as _ie:
+            print(f"[s4-interp] {_ie}", flush=True)
 
         # ── IV Smile Live Interpretation (full-width, powered by session history) ─
         # Maintain intraday rolling history for trend-aware classification
