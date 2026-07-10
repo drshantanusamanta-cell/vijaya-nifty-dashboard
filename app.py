@@ -64,7 +64,7 @@ def is_market_hours():
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Shantanu's Options Dashboard — NIFTY · v10",   # H21 fix: was mojibake (\x97 where em-dash should be)
+    page_title="Shantanu's Options Dashboard — NIFTY · v11",   # H21 fix: was mojibake (\x97 where em-dash should be)
     page_icon="📊",   # H21 fix: was empty — browser showed default favicon
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -112,7 +112,7 @@ USE_DHAN          = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
 USE_DEMO_MODE     = not USE_DHAN
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v10"
+APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v11"
 RISK_FREE_RATE   = 0.065
 STRUCTURAL_BAND  = 10
 SIGNAL_BAND      = 5
@@ -6869,7 +6869,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             )
             return f
 
-        # ── v8 layout: 8 charts in 4 rows × 2 columns ────────────────────────────
+        # ── v11 layout: 12 charts in 6 rows × 2 columns ──────────────────────────
         # Row 1 — Δ-Weighted Net OI | Δ-Weighted OI Change Momentum
         _s4_r1c1, _s4_r1c2 = st.columns(2)
         with _s4_r1c1:
@@ -6961,6 +6961,66 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             f8 = _s4_evr_bar(_evr_oic_s,
                              f"★ OI-Chg-Wtd CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×ΔOI rich · Red<1=Put EV×ΔOI rich")
             st.plotly_chart(f8, width='stretch', config={"displayModeBar":False})
+
+        # ★ v11: generic per-strike CE/PE ratio bar (baseline = 1) — same
+        # visual grammar as _s4_evr_bar but with caller-supplied x & y-title.
+        def _s4_ratio_bar(x_vals, vals, title, y_title):
+            _cols = [GREEN if v >= 1 else RED for v in vals]
+            f = go.Figure(go.Bar(x=x_vals, y=vals - 1.0, base=1.0,
+                                 marker_color=_cols, customdata=vals,
+                                 hovertemplate="Strike %{x}<br>CE/PE Ratio: %{customdata:.3f}<extra></extra>"))
+            f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
+                        annotation_text="Baseline 1.0", annotation_position="bottom right",
+                        annotation_font=dict(size=9, color=MUTED))
+            _s4_style(f, title, y_title)
+            f.update_layout(title=dict(font=dict(size=11)))
+            return f
+
+        # ★ v11 Pair 1 — Δ-weighted CE/PE OI ratio & Δ-weighted CE/PE
+        # OI-change ratio, per strike over the full structural band:
+        #   (Call OI × |Call Δ|) / (Put OI × |Put Δ|)
+        #   (Call ΔOI × |Call Δ|) / (Put ΔOI × |Put Δ|)
+        _dwr_oi_s  = ((df_band["call_oi"] * call_delta_abs) /
+                      (df_band["put_oi"]  * put_delta_abs).replace(0, np.nan)).fillna(1.0)
+        _dwr_chg_s = ((df_band["call_oi_chg"] * call_delta_abs) /
+                      (df_band["put_oi_chg"]  * put_delta_abs).replace(0, np.nan)).fillna(1.0)
+
+        # Row 5 — Δ-Wtd CE/PE OI Ratio | Δ-Wtd CE/PE OI-Chg Ratio
+        _s4_r5c1, _s4_r5c2 = st.columns(2)
+        with _s4_r5c1:
+            f9 = _s4_ratio_bar(x, _dwr_oi_s,
+                               "★ Δ-Wtd CE/PE OI Ratio per Strike · Baseline=1 · Green>1=Call Δ×OI rich · Red<1=Put Δ×OI rich",
+                               "Δ×OI CE/PE Ratio")
+            st.plotly_chart(f9, width='stretch', config={"displayModeBar":False})
+        with _s4_r5c2:
+            f10 = _s4_ratio_bar(x, _dwr_chg_s,
+                                "★ Δ-Wtd CE/PE OI-Chg Ratio per Strike · Baseline=1 · Green>1=Call Δ×ΔOI rich · Red<1=Put Δ×ΔOI rich",
+                                "Δ×ΔOI CE/PE Ratio")
+            st.plotly_chart(f10, width='stretch', config={"displayModeBar":False})
+
+        # ★ v11 Pair 2 — Δ- AND EV-weighted CE/PE ratios, per strike over the
+        # same ATM±vega_band_strikes band as the EV-Ratio charts (extrinsic
+        # value ≈ 0 far from ATM, so the ratio is only meaningful there):
+        #   (Call OI × |Call Δ| × ev_c) / (Put OI × |Put Δ| × ev_p)
+        #   (Call ΔOI × |Call Δ| × ev_c) / (Put ΔOI × |Put Δ| × ev_p)
+        _cda_ev = _ev_bd["call_delta"].abs(); _pda_ev = _ev_bd["put_delta"].abs()
+        _devr_oi_s  = ((_ev_bd["call_oi"] * _cda_ev * _ev_bd["ev_c"]) /
+                       (_ev_bd["put_oi"]  * _pda_ev * _ev_bd["ev_p"]).replace(0, np.nan)).fillna(1.0)
+        _devr_chg_s = ((_ev_bd["call_oi_chg"] * _cda_ev * _ev_bd["ev_c"]) /
+                       (_ev_bd["put_oi_chg"]  * _pda_ev * _ev_bd["ev_p"]).replace(0, np.nan)).fillna(1.0)
+
+        # Row 6 — Δ×EV-Wtd CE/PE OI Ratio | Δ×EV-Wtd CE/PE OI-Chg Ratio
+        _s4_r6c1, _s4_r6c2 = st.columns(2)
+        with _s4_r6c1:
+            f11 = _s4_ratio_bar(_ev_bd["strike"], _devr_oi_s,
+                                f"★ Δ×EV-Wtd CE/PE OI Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call Δ×OI×EV rich · Red<1=Put side",
+                                "Δ×OI×EV CE/PE Ratio")
+            st.plotly_chart(f11, width='stretch', config={"displayModeBar":False})
+        with _s4_r6c2:
+            f12 = _s4_ratio_bar(_ev_bd["strike"], _devr_chg_s,
+                                f"★ Δ×EV-Wtd CE/PE OI-Chg Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call Δ×ΔOI×EV rich · Red<1=Put side",
+                                "Δ×ΔOI×EV CE/PE Ratio")
+            st.plotly_chart(f12, width='stretch', config={"displayModeBar":False})
 
         # ── IV Smile Live Interpretation (full-width, powered by session history) ─
         # Maintain intraday rolling history for trend-aware classification
