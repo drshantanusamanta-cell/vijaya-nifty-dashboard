@@ -64,7 +64,7 @@ def is_market_hours():
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Shantanu's Options Dashboard — NIFTY · v13",   # H21 fix: was mojibake (\x97 where em-dash should be)
+    page_title="Shantanu's Options Dashboard — NIFTY · v15",   # H21 fix: was mojibake (\x97 where em-dash should be)
     page_icon="📊",   # H21 fix: was empty — browser showed default favicon
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -78,25 +78,23 @@ st.set_page_config(
 # Registering early guarantees the page re-runs every 60s regardless of any
 # downstream st.stop() or exception.
 #
-# H18 FOLLOW-UP (not applied in this pass): migrating from `streamlit_autorefresh`
-# to native `st.fragment(run_every=60.0)` (Streamlit ≥1.33) would cut per-rerun
-# work by ~80% — only the data-fetch + history-append logic would re-execute,
-# not the entire 7000-line script. This is a larger refactor (requires wrapping
-# the fetch logic in a fragment function and reading results from
-# st.session_state in the main body) and should be done as a separate PR.
-# For now, st_autorefresh at the top is the safe fix that preserves all existing
-# behavior while solving the st.stop() recovery problem.
-#
-# v9: the page rerun cadence follows the owner data-refresh setting when it is
-# FASTER than 60s (the new "30 sec Turbo" option) — otherwise freshly fetched
-# data would sit unseen until the next 60s rerun. All other choices keep 60s.
-try:
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "nifty_settings.json"), "r") as _arf:
-        _ar_secs = int(json.load(_arf).get("refresh_interval", 60))
-except Exception:
-    _ar_secs = 60
-st_autorefresh(interval=(30_000 if _ar_secs < 60 else 60_000), key="nifty_autorefresh")
+# H18 FOLLOW-UP — SUPERSEDED (v15): the fixed-cadence rerun described above has
+# been replaced. `st_autorefresh` now polls at a short, fixed cadence
+# (`_UI_POLL_MS`) that is decoupled from the owner's data-refresh interval — it
+# no longer determines how often the page visibly updates. A background thread
+# (started once per process — see `_start_background_data_refresher()` further
+# down, right after `get_server_data()` is defined) fetches + computes on the
+# owner's configured cadence completely independent of any visitor's browser.
+# Each poll tick, the script checks the server cache's `last_fetch_ts`: if it
+# hasn't advanced since this session's last render AND the tick was caused by
+# the timer (not a genuine user interaction, e.g. a sidebar click), the script
+# calls `st.stop()` immediately — before any chart/section rendering — so nei-
+# ther the browser nor the CPU do any real work until new data actually lands.
+# The net effect: the page now visibly refreshes only when a new data snapshot
+# has been fetched and its metrics computed in the background, not on a blind
+# timer. See the gating block right after `get_server_data(sel_expiry)` below.
+_UI_POLL_MS = 3_000   # v15: fast UI check-in; actual redraw is data-gated, not time-gated
+_ar_tick = st_autorefresh(interval=_UI_POLL_MS, key="nifty_autorefresh")
 
 
 # ─── Credentials ──────────────────────────────────────────────────────────────
@@ -354,7 +352,9 @@ def _render_owner_sidebar(expiry_list):
     return sel_expiry, manual_refresh_clicked
 
 # Resolve effective data-refresh  reads owner-controlled value from server settings.
-# NOTE: page auto-refresh is always 60 s for ALL visitors regardless of this value.
+# v15: this is now the TRUE page-refresh cadence too  the browser polls every
+# _UI_POLL_MS (3s) but only redraws when the background refresher lands a new
+# snapshot on this interval (see the DATA-FRESHNESS RENDER GATE below).
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_settings.json"), "r") as _sf:
         _effective_refresh = json.load(_sf).get("refresh_interval", REFRESH_SECONDS)
@@ -3790,6 +3790,58 @@ def get_server_data(expiry_override=None):
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# v15: BACKGROUND DATA REFRESHER — decouples data fetch + calculation from any
+# visitor's page render. A single daemon thread (one per server PROCESS, not
+# per browser session/tab) proactively calls get_server_data() on the owner's
+# configured cadence, so _srv_cache is kept warm by the server itself instead
+# of relying on some visitor's autorefresh tick to opportunistically trigger a
+# fetch. Every function this thread touches (get_server_data →
+# _raw_fetch_and_compute → get_option_chain → compute_metrics →
+# fetch_futures_ltp → compute_synthetic_future → _load_owner_settings) is pure
+# Python/pandas/requests logic with no Streamlit UI or st.session_state calls,
+# so it is safe to run outside a Streamlit ScriptRunContext. Visitor page
+# reruns then just read the (already fresh) cache and compare its
+# last_fetch_ts to decide whether anything actually changed — see the
+# render-gate right after `get_server_data(sel_expiry)` in the main body.
+# ═══════════════════════════════════════════════════════════════════════════
+def _background_data_refresher_loop():
+    """Runs forever in a daemon thread: keeps _srv_cache warm on the owner's
+    configured cadence, independent of visitor traffic. Reuses the exact same
+    fetch + compute + cache path (get_server_data) that visitor reruns use, so
+    there is only one code path for "how does new data get into the cache" —
+    this thread just calls it proactively instead of waiting for a visitor.
+    """
+    while True:
+        interval = REFRESH_SECONDS
+        try:
+            settings = _load_owner_settings()
+            interval = settings.get("refresh_interval", REFRESH_SECONDS)
+            get_server_data(settings.get("selected_expiry"))
+        except Exception as _bg_err:
+            print(f"[bg-refresher] {_bg_err}", flush=True)
+        # Wake up more often than the configured interval so a mid-cycle
+        # interval change (owner picks a faster option) takes effect
+        # promptly, without hammering the API when the interval is long.
+        time.sleep(max(5, min(interval, 15)))
+
+
+@st.cache_resource(show_spinner=False)
+def _start_background_data_refresher():
+    """Starts the background refresher thread exactly ONCE per server
+    process, no matter how many browser sessions/tabs are open or how many
+    times this script reruns. `st.cache_resource` is the idiomatic Streamlit
+    pattern for "run this singleton background job": the factory body below
+    executes a single time per process; every session/rerun after that just
+    reuses the same cached thread handle without starting a second thread.
+    """
+    _t = threading.Thread(target=_background_data_refresher_loop,
+                          name="nifty-bg-data-refresher", daemon=True)
+    _t.start()
+    return _t
+# ═══ END BACKGROUND DATA REFRESHER (started below, after _load_owner_settings) ══
+
+
 def _force_server_refresh(expiry_override=None):
     """Owner-only: clear ALL caches so the next get_server_data() fetches fresh data.
 
@@ -3924,6 +3976,13 @@ def _save_owner_settings(settings):
     # H25 fix: invalidate the TTL cache so the next read picks up the new value
     _owner_settings_cache["data"] = None
     _owner_settings_cache["ts"]   = 0.0
+
+# v15: start the background data refresher now — every function it touches
+# (get_server_data, _load_owner_settings) is defined above this line, so the
+# thread can safely call them the moment it starts running. Cheap + idempotent
+# on every rerun: st.cache_resource only actually starts the thread once per
+# server process.
+_start_background_data_refresher()
 
 # ── S3/4 Bias chart history (persisted so mid-session joiners see full chart) ─
 def _load_bias_history():
@@ -4218,6 +4277,39 @@ if _needs_fetch_h24:
         payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
 else:
     payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
+
+# ─────────────────────────────────────────────────────────────────────────
+# v15: DATA-FRESHNESS RENDER GATE
+# The browser polls every _UI_POLL_MS (3s), but the page should only
+# visibly redraw when the background refresher (see
+# `_start_background_data_refresher()` above) has actually landed a new
+# data snapshot. `_ar_tick` (captured at the very top of the script) only
+# changes when st_autorefresh's own JS timer fires; it stays the same
+# across reruns caused by genuine user interaction (sidebar clicks, widget
+# changes, the owner's "Refresh Now" -> st.rerun()). So: skip the entire
+# (expensive) dashboard body only when BOTH (a) this rerun was caused by
+# the timer, not a user action, AND (b) last_fetch_ts hasn't advanced
+# since the last time THIS session actually rendered. Error states
+# (payload is None) are never gated — they always render so a genuine API
+# outage stays visible instead of being silently swallowed.
+# ─────────────────────────────────────────────────────────────────────────
+_prev_ar_tick     = st.session_state.get("_ar_tick_seen")
+_is_timer_tick    = (_prev_ar_tick is not None) and (_ar_tick != _prev_ar_tick)
+st.session_state["_ar_tick_seen"] = _ar_tick
+
+_prev_rendered_ts = st.session_state.get("_last_rendered_fetch_ts")
+_no_new_data      = (payload is not None and _prev_rendered_ts is not None
+                      and _payload_fetch_ts == _prev_rendered_ts)
+
+if _is_timer_tick and _no_new_data:
+    # Nothing new since this session's last render — stop before drawing
+    # anything so neither the browser nor the server does real work this
+    # tick. The next background-refresher fetch bumps last_fetch_ts and
+    # this gate lets the render through again automatically.
+    st.stop()
+
+if payload is not None:
+    st.session_state["_last_rendered_fetch_ts"] = _payload_fetch_ts
 
 # CI #10 fix: render the data-status banner HERE (after fetch) so it can inspect
 # `data_source` and distinguish a real API ERROR from genuine DEMO MODE.
@@ -6240,6 +6332,19 @@ with _slot_gamma:   # v8: render into top-of-dashboard slot (display order only)
                    if _has_ext_wall else "")
             )
 
+            # v14: snapshot the already-computed GEX/Vega key levels (Call Wall,
+            # Put Wall, Gamma Flip, IV Gravity, IV Kindling) so Shantanu's View's
+            # 15-min log can stamp each row with these levels instead of "Key
+            # Strikes". Session-state so the value survives into later sections
+            # of this same script run (and across reruns as a fallback).
+            st.session_state["_gv_key_levels"] = {
+                "call_wall":   _call_wall_k,
+                "put_wall":    _put_wall_k,
+                "gamma_flip":  _flip_str,
+                "iv_gravity":  _max_neg_vega_k,
+                "iv_kindling": _max_pos_vega_k,
+            }
+
             _actions_html = "".join(
                 f"<div style='margin:4px 0;font-size:13px;color:#1A1A2E'>{a}</div>" for a in _action_lines
             )
@@ -6465,13 +6570,37 @@ def _endm_hist_file_save(_store):
         pass
 
 
-def _endm_verdict_history_append(store, verdict, bias, momentum, strikes_txt):
+def _fmt_gv_levels(gv):
+    """Format the GEX/Vega key-levels snapshot (Call Wall, Put Wall, Gamma
+    Flip, IV Gravity, IV Kindling) for the 15-min log's level column.
+
+    v14: this replaces the old "Key Strikes" column, which used to show the
+    strongest buyer/seller strikes from the NDM matrix. Now every 15-min row
+    stamps the already-computed GEX+Vega Live Interpretation levels instead.
+    """
+    if not gv:
+        return "—"
+    def _n(v):
+        try:
+            return f"{int(v):,}"
+        except Exception:
+            return "N/A"
+    return (f"CW {_n(gv.get('call_wall'))} · PW {_n(gv.get('put_wall'))} · "
+            f"GF {gv.get('gamma_flip') or 'N/A'} · "
+            f"IVG {_n(gv.get('iv_gravity'))} · IVK {_n(gv.get('iv_kindling'))}")
+
+
+def _endm_verdict_history_append(store, verdict, bias, momentum, levels_txt):
     """Append current final verdict to the 15-minute history log.
 
     v10.1: the log is persisted to a JSON file next to the app script, so it
     survives browser refreshes, is shared across every device/tab hitting the
     same server, and survives app restarts. Auto-resets on a new trading day.
     (The in-memory `store` argument is kept only for signature compatibility.)
+
+    v14: the logged column is "Key Levels (CW/PW/GF/IVG/IVK)" — the GEX+Vega
+    Call Wall / Put Wall / Gamma Flip / IV Gravity / IV Kindling snapshot —
+    replacing the old "Key Strikes" (strongest buyer/seller strikes) column.
     """
     _now = now_ist()
     if _now.hour == 9 and _now.minute < 30:
@@ -6493,13 +6622,18 @@ def _endm_verdict_history_append(store, verdict, bias, momentum, strikes_txt):
                           "Final Verdict": verdict,
                           "Bias": bias,
                           "Momentum": momentum,
-                          "Key Strikes": strikes_txt})
+                          "Key Levels (CW/PW/GF/IVG/IVK)": levels_txt})
             _endm_hist_file_save(_disk)
     return [{k: v for k, v in r.items() if k != "_ts"} for r in _rows]
 
 
-def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None):
-    """Enhanced NDM v10 — per-strike Buyer/Seller matrix (see banner above)."""
+def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=None):
+    """Enhanced NDM v10 — per-strike Buyer/Seller matrix (see banner above).
+
+    v14: `gv_levels` is the Call Wall / Put Wall / Gamma Flip / IV Gravity /
+    IV Kindling snapshot from the GEX+Vega Live Interpretation section — it
+    is stamped into the 15-min log in place of the old "Key Strikes" column.
+    """
     _step = NIFTY_STEP
     _atm  = round(spot / _step) * _step if spot else 0
 
@@ -6659,9 +6793,14 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None):
         _reason = [f"Avg raw CE/PE EV ratio is {_evr_avg:.2f} (≈1) — call and put premiums are balanced, so neither side has the edge."]
 
     # ── 15-minute final-verdict history ──────────────────────────────────────
+    # v14: the log's level column is now the GEX+Vega key-levels snapshot
+    # (Call Wall / Put Wall / Gamma Flip / IV Gravity / IV Kindling), not the
+    # old NDM "Key Strikes". `_key_ks` above is still used inline in the
+    # verdict/reason text and is left untouched.
+    _levels_txt = _fmt_gv_levels(gv_levels)
     _hist = []
     if hist_store is not None:
-        _hist = _endm_verdict_history_append(hist_store, _verdict, _bias, _mom_lbl, _key_ks)
+        _hist = _endm_verdict_history_append(hist_store, _verdict, _bias, _mom_lbl, _levels_txt)
 
     # ── Display dataframe (descending strike) ────────────────────────────────
     def _evr_fmt(v):
@@ -6710,7 +6849,8 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
 
         if "_endm_hist_store" not in st.session_state:
             st.session_state["_endm_hist_store"] = {"date": None, "rows": []}
-        _endm = _compute_enhanced_ndm(df_band_records, m, spot, st.session_state["_endm_hist_store"])
+        _endm = _compute_enhanced_ndm(df_band_records, m, spot, st.session_state["_endm_hist_store"],
+                                       gv_levels=st.session_state.get("_gv_key_levels"))
         _endm_df      = _endm["df"]
         _endm_total_e = _endm["enhanced_total"]
         _endm_total_r = _endm["raw_total"]
@@ -6936,8 +7076,11 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         _ev_bd["ev_c_adj"] = np.maximum(
             0, _ev_bd["ev_c"] - _ev_bd["strike"] * (1 - np.exp(-RISK_FREE_RATE * _T_ev)))
         _evr_raw_s = (_ev_bd["ev_c_adj"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
-        # ★ v13: per-strike initiation map — >1.05 call buyers/put sellers
-        # dominant (bullish), <0.95 put buyers/call sellers dominant (bearish).
+        # ★ v13: per-strike initiation map (parity-adjusted EVR — built from
+        # ev_c_adj above, not raw EVR). v14: thresholds realigned to the
+        # Shantanu's View matrix criteria — >1.0 call buyers/put sellers
+        # dominant (bullish), <0.7 put buyers/call sellers dominant (bearish),
+        # 0.7-1.0 neutral. Consumed by the Combined Flow × Premium Read section.
         _s4_evmap = {int(k): float(v) for k, v in zip(_ev_bd["strike"], _evr_raw_s)}
         _evr_oiw_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi"]) /
                       (_ev_bd["ev_p"] * _ev_bd["put_oi"]).replace(0, np.nan)).fillna(1.0)
@@ -7212,15 +7355,19 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         # writers pressing premium). Premium pressure overrides the quadrant
         # where they disagree. Rolling 15-tick (~15 min) history persisted
         # to JSON exactly like the smile history. Rendered into Shantanu's View.
+        # v14: EVR thresholds realigned to the Shantanu's View matrix criteria —
+        # EVR>1 = call side (bullish), EVR<0.7 = put side (bearish), and the
+        # 0.7-1.0 band is now NEUTRAL (falls through to the OI-quadrant read)
+        # instead of the old symmetric 0.95/1.05 band that treated it as bearish.
         try:
             _vsum = _wsum = 0.0
             _sub = _ev_bd[_liq_ev_chg]
             for _, _r in _sub.iterrows():
                 _dcx, _dpx = float(_r["call_oi_chg"]), float(_r["put_oi_chg"])
                 _evr_k = _s4_evmap.get(int(_r["strike"]))
-                if _evr_k is not None and _evr_k > 1.05:
+                if _evr_k is not None and _evr_k > 1.0:
                     _v = 1
-                elif _evr_k is not None and _evr_k < 0.95:
+                elif _evr_k is not None and _evr_k < 0.7:
                     _v = -1
                 elif _dcx >= 0 and _dpx < 0:
                     _v = -1
