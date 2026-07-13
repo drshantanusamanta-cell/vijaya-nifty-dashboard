@@ -64,7 +64,7 @@ def is_market_hours():
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Shantanu's Options Dashboard — NIFTY · v15",   # H21 fix: was mojibake (\x97 where em-dash should be)
+    page_title="Shantanu's Options Dashboard — NIFTY · v16",   # H21 fix: was mojibake (\x97 where em-dash should be)
     page_icon="📊",   # H21 fix: was empty — browser showed default favicon
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -2615,35 +2615,33 @@ def compute_vwap_opening_range(candles):
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_back_expiry_atm_iv(back_expiry: str):
     """
-    Fetch the back-month option chain and return ATM IV only.
-    Runs concurrently with the main front-expiry fetch; same Dhan endpoint.
-    Rate limit note: 1 unique request per 3s — this is a different expiry
-    so qualifies as a unique request per Dhan docs.
+    Derive ATM IV for the back-month expiry from the SAME shared, cached
+    chain fetch used by fetch_back_expiry_oi_band() and the inter-expiry
+    roll signal (both call fetch_dhan_option_chain_cached(back_expiry)).
+
+    v16 fix: this function used to fire its OWN independent POST to
+    /v2/optionchain for the back expiry, and fetch_back_expiry_oi_band()
+    fired ANOTHER independent POST with the exact same payload
+    (UnderlyingScrip/UnderlyingSeg/Expiry=back_expiry) moments later in the
+    same script run — plus a third near-identical call from the roll-signal
+    section further down. Dhan's option-chain endpoint rate-limits at
+    roughly 1 unique request per 3s; three identical requests fired
+    back-to-back in the same render is exactly what produced the repeated
+    "too many 429 error responses" errors. All three back-expiry consumers
+    now share the ONE @st.cache_data-cached fetch_dhan_option_chain_cached()
+    call — only one real network request goes out, the other two callers
+    reuse the cached DataFrame for free.
     """
     if not USE_DHAN or not back_expiry:
         return None
-    sec = DHAN_SECURITY["NIFTY"]
     try:
-        # H1+H2+H3 fix: shared helper.
-        resp = _dhan_post(
-            "https://api.dhan.co/v2/optionchain",
-            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
-             "Expiry": back_expiry},
-            timeout=15,
-        )
-        data = resp.get("data", {}) or {}
-        spot = float(data.get("last_price") or data.get("ltp") or 0)
-        oc   = data.get("oc", {}) or {}
-        if spot <= 0 or not oc:
+        df_back, spot_back, _ = fetch_dhan_option_chain_cached(back_expiry)
+        if df_back.empty or spot_back <= 0:
             return None
-        # Find ATM strike
-        strikes = [safe_num(k) for k in oc.keys() if safe_num(k) > 0]
-        if not strikes:
-            return None
-        atm_k = min(strikes, key=lambda x: abs(x - spot))
-        chain = oc.get(str(float(atm_k)), oc.get(f"{atm_k:.6f}", {})) or {}
-        ce_iv = safe_num((chain.get("ce", {}) or {}).get("implied_volatility", 0))
-        pe_iv = safe_num((chain.get("pe", {}) or {}).get("implied_volatility", 0))
+        idx = (df_back["strike"] - spot_back).abs().idxmin()
+        row = df_back.loc[idx]
+        ce_iv = safe_num(row.get("call_iv", 0))
+        pe_iv = safe_num(row.get("put_iv", 0))
         atm_iv_back = 0.0
         if ce_iv > 0.5 and pe_iv > 0.5:
             atm_iv_back = (ce_iv + pe_iv) / 2.0
@@ -2652,7 +2650,7 @@ def fetch_back_expiry_atm_iv(back_expiry: str):
         elif pe_iv > 0.5:
             atm_iv_back = pe_iv
         return round(atm_iv_back, 2) if atm_iv_back > 0 else None
-    except (DhanAPIError, Exception) as e:
+    except Exception as e:
         try:
             print(f"[fetch_back_expiry_atm_iv] error: {e}", flush=True)
         except Exception:
@@ -2664,56 +2662,27 @@ def fetch_back_expiry_atm_iv(back_expiry: str):
 @st.cache_data(ttl=300, show_spinner=False)  # Fix #5: was ttl=60; 5-min matches fetch_back_expiry_atm_iv and avoids rate-limit pressure
 def fetch_back_expiry_oi_band(back_expiry: str):
     """
-    Fetch strike-level OI + OI change for the back expiry — lightweight version.
-    Returns only the columns needed for roll detection:
+    Strike-level OI + OI change for the back expiry — lightweight subset:
         strike, call_oi, put_oi, call_oi_chg, put_oi_chg
-    Unlike fetch_back_expiry_atm_iv(), this fetches the FULL OI band so we can
-    compare OI changes at shared strikes between front and back expiry.
+
+    v16 fix: derives from the SAME shared, cached fetch_dhan_option_chain_cached()
+    call used by fetch_back_expiry_atm_iv() and the inter-expiry roll signal,
+    instead of firing its own duplicate POST to /v2/optionchain with the
+    identical (UnderlyingScrip/UnderlyingSeg/Expiry=back_expiry) payload.
+    Three independent back-expiry fetches landing in the same script run —
+    all requesting the exact same data — is what tripped Dhan's ~1-req/3s
+    rate limit and produced the repeated 429 errors. See the note in
+    fetch_back_expiry_atm_iv() for the full explanation.
     """
     if not USE_DHAN or not back_expiry:
         return pd.DataFrame()
-    sec = DHAN_SECURITY["NIFTY"]
     try:
-        # H1+H2+H3 fix: shared helper.
-        resp = _dhan_post(
-            "https://api.dhan.co/v2/optionchain",
-            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
-             "Expiry": back_expiry},
-            timeout=15,
-        )
-        data = resp.get("data", {}) or {}
-        oc   = data.get("oc", {}) or {}
-        if not oc:
+        df_back, _, _ = fetch_dhan_option_chain_cached(back_expiry)
+        if df_back.empty:
             return pd.DataFrame()
-        # H6 fix: use int(float(...)) for OI parsing
-        def _safe_int(v):
-            try:
-                return int(float(v or 0))
-            except (TypeError, ValueError):
-                return 0
-        rows = []
-        for strike_str, chain in oc.items():
-            K  = safe_num(strike_str, 0)
-            if K <= 0:
-                continue
-            ce = (chain or {}).get("ce", {}) or {}
-            pe = (chain or {}).get("pe", {}) or {}
-            c_oi      = _safe_int(ce.get("oi", 0))
-            c_prev_oi = _safe_int(ce.get("previous_oi", 0))
-            p_oi      = _safe_int(pe.get("oi", 0))
-            p_prev_oi = _safe_int(pe.get("previous_oi", 0))
-            rows.append({
-                "strike":      K,
-                "call_oi":     c_oi,
-                "put_oi":      p_oi,
-                "call_oi_chg": c_oi - c_prev_oi,
-                "put_oi_chg":  p_oi - p_prev_oi,
-            })
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows)
-        return df.sort_values("strike").reset_index(drop=True)
-    except (DhanAPIError, Exception) as e:
+        cols = ["strike", "call_oi", "put_oi", "call_oi_chg", "put_oi_chg"]
+        return df_back[cols].sort_values("strike").reset_index(drop=True)
+    except Exception as e:
         try:
             print(f"[fetch_back_expiry_oi_band] error: {e}", flush=True)
         except Exception:
