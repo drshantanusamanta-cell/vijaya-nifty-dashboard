@@ -92,9 +92,51 @@ st.set_page_config(
 # ther the browser nor the CPU do any real work until new data actually lands.
 # The net effect: the page now visibly refreshes only when a new data snapshot
 # has been fetched and its metrics computed in the background, not on a blind
-# timer. See the gating block right after `get_server_data(sel_expiry)` below.
+# timer. See the DATA-FRESHNESS RENDER GATE immediately below.
 _UI_POLL_MS = 3_000   # v15: fast UI check-in; actual redraw is data-gated, not time-gated
 _ar_tick = st_autorefresh(interval=_UI_POLL_MS, key="nifty_autorefresh")
+
+# v15: server-side data cache — declared here, before ANY rendering (sidebar
+# included), so the render gate right below can check `_srv_cache` before
+# drawing so much as the sidebar. This is the SAME cache object
+# `get_server_data()` (defined further down) reads from and writes to —
+# Python module globals are shared process-wide regardless of where in the
+# file they're declared, so relocating the declaration here is safe and
+# changes no behavior other than making it available earlier.
+_srv_cache_lock        = threading.Lock()
+_srv_cache             = {"payload": None, "source": None, "last_fetch_ts": 0.0}
+_srv_fetch_in_progress = False     # CI #7 fix: single-flight flag
+
+# ─────────────────────────────────────────────────────────────────────────
+# v15: DATA-FRESHNESS RENDER GATE
+# Fix: this used to sit further down, AFTER the sidebar/banner had already
+# rendered — so even on a "nothing new" poll tick, the sidebar (and its
+# "Data refresh / Page refresh" info box) still visibly redrew every 3s,
+# which is what looked like "the page refreshing every 3 seconds." Moving
+# the gate here means a stale tick calls st.stop() before ANYTHING is drawn.
+#
+# `_ar_tick` only changes when st_autorefresh's own JS timer fires; it stays
+# the same across reruns caused by genuine user interaction (sidebar clicks,
+# widget changes, "Refresh Now" -> st.rerun()). So: stop immediately only
+# when BOTH (a) this rerun was caused by the timer, not a user action, AND
+# (b) the shared cache's last_fetch_ts hasn't advanced since this session
+# last rendered. The background refresher (defined later, started once per
+# process) is what actually advances last_fetch_ts on the owner's cadence.
+# ─────────────────────────────────────────────────────────────────────────
+_prev_ar_tick  = st.session_state.get("_ar_tick_seen")
+_is_timer_tick = (_prev_ar_tick is not None) and (_ar_tick != _prev_ar_tick)
+st.session_state["_ar_tick_seen"] = _ar_tick
+
+_prev_rendered_ts = st.session_state.get("_last_rendered_fetch_ts")
+_no_new_data_yet  = (_srv_cache.get("payload") is not None
+                     and _prev_rendered_ts is not None
+                     and _srv_cache.get("last_fetch_ts", 0.0) == _prev_rendered_ts)
+
+if _is_timer_tick and _no_new_data_yet:
+    # Nothing new since this session's last render — stop before drawing
+    # anything (sidebar included) so neither the browser nor the server
+    # does real work this tick.
+    st.stop()
 
 
 # ─── Credentials ──────────────────────────────────────────────────────────────
@@ -3685,9 +3727,10 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
 #     release lock, do the fetch, re-acquire lock, store payload, clear flag.
 #   - If cache stale AND fetch already in progress → return stale payload
 #     (stale-while-revalidate).
-_srv_cache_lock      = threading.Lock()
-_srv_cache           = {"payload": None, "source": None, "last_fetch_ts": 0.0}
-_srv_fetch_in_progress = False     # CI #7 fix: single-flight flag
+# v15: _srv_cache / _srv_cache_lock / _srv_fetch_in_progress now live near the
+# TOP of the file (right after the constants block) so the render gate can
+# check `_srv_cache["last_fetch_ts"]` before rendering ANYTHING — sidebar
+# included. See the gate right after `st_autorefresh()` near the top.
 
 def _raw_fetch_and_compute(expiry_override=None, history=None):
     """Actual Dhan API fetch — never called directly by visitors."""
@@ -4290,36 +4333,13 @@ if _needs_fetch_h24:
 else:
     payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
 
-# ─────────────────────────────────────────────────────────────────────────
-# v15: DATA-FRESHNESS RENDER GATE
-# The browser polls every _UI_POLL_MS (3s), but the page should only
-# visibly redraw when the background refresher (see
-# `_start_background_data_refresher()` above) has actually landed a new
-# data snapshot. `_ar_tick` (captured at the very top of the script) only
-# changes when st_autorefresh's own JS timer fires; it stays the same
-# across reruns caused by genuine user interaction (sidebar clicks, widget
-# changes, the owner's "Refresh Now" -> st.rerun()). So: skip the entire
-# (expensive) dashboard body only when BOTH (a) this rerun was caused by
-# the timer, not a user action, AND (b) last_fetch_ts hasn't advanced
-# since the last time THIS session actually rendered. Error states
-# (payload is None) are never gated — they always render so a genuine API
-# outage stays visible instead of being silently swallowed.
-# ─────────────────────────────────────────────────────────────────────────
-_prev_ar_tick     = st.session_state.get("_ar_tick_seen")
-_is_timer_tick    = (_prev_ar_tick is not None) and (_ar_tick != _prev_ar_tick)
-st.session_state["_ar_tick_seen"] = _ar_tick
-
-_prev_rendered_ts = st.session_state.get("_last_rendered_fetch_ts")
-_no_new_data      = (payload is not None and _prev_rendered_ts is not None
-                      and _payload_fetch_ts == _prev_rendered_ts)
-
-if _is_timer_tick and _no_new_data:
-    # Nothing new since this session's last render — stop before drawing
-    # anything so neither the browser nor the server does real work this
-    # tick. The next background-refresher fetch bumps last_fetch_ts and
-    # this gate lets the render through again automatically.
-    st.stop()
-
+# v15: the actual gate now runs at the very TOP of the script (right after
+# st_autorefresh), before the sidebar/banner/anything else is drawn — see
+# the DATA-FRESHNESS RENDER GATE near line 111. If we reached this point,
+# either this is a genuine render (new data, first load, or a real user
+# interaction) or an error state; either way it's meant to be shown. Just
+# record what this session actually rendered so the top-of-script gate can
+# compare against it on the next poll tick.
 if payload is not None:
     st.session_state["_last_rendered_fetch_ts"] = _payload_fetch_ts
 
