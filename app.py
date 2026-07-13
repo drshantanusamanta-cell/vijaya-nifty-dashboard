@@ -7132,17 +7132,15 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             f.update_layout(title=dict(font=dict(size=11)))
             return f
 
-        # Row 3 — Raw CE/PE EV Ratio per Strike | Parity-Adj CE/PE EV Ratio per Strike
+        # Row 3 — Call vs Put OI | Raw CE/PE EV Ratio per Strike
         _s4_r3c1, _s4_r3c2 = st.columns(2)
         with _s4_r3c1:
-            # v16: was "Call vs Put OI" — replaced with the RAW (not
-            # parity-adjusted) strike-wise CE/PE EV ratio, using the same
-            # >1 green / 0.7-1 amber / <0.7 red threshold coloring as the
-            # Parity-Adj chart alongside it (via _s4_evr_bar, bear_thresh=0.7).
-            _evr_true_raw_s = (_ev_bd["ev_c"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
-            f4 = _s4_evr_bar(_evr_true_raw_s,
-                             f"★ Raw CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green≥1=Call buyers/Put sellers dominant · Amber 0.7-1=Neutral · Red<0.7=Put buyers/Call sellers dominant",
-                             bear_thresh=0.7)
+            f4 = go.Figure([
+                go.Bar(x=x, y=df_band["call_oi"], name="Call OI", marker_color="#38BDF8"),
+                go.Bar(x=x, y=df_band["put_oi"],  name="Put OI",  marker_color="#FB7185"),
+            ])
+            f4.update_layout(barmode="group")
+            _s4_style(f4, "Call vs Put OI · Blue=Call · Rose=Put", "Open Interest", legend_h=True)
             st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
         with _s4_r3c2:
             f6 = _s4_evr_bar(_evr_raw_s,
