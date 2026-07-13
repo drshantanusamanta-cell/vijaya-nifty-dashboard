@@ -241,8 +241,13 @@ def _render_owner_sidebar(expiry_list):
                 st.session_state.refresh_seconds = new_interval
             mins = new_interval // 60
             _ref_lbl  = f"{mins} min" if new_interval >= 60 else f"{new_interval} sec"
-            _page_lbl = "30s (follows Turbo)" if new_interval < 60 else "60s"
-            st.info(f"Data refresh: **{new_interval}s** ({_ref_lbl})\nPage refresh: **{_page_lbl}**")
+            # v15: page refresh no longer follows a fixed 30s/60s timer — the
+            # dashboard now redraws exactly when the background refresher
+            # lands new data (checked every _UI_POLL_MS, but only actually
+            # redrawn on a genuine data change). Label updated to match.
+            st.info(f"Data refresh: **{new_interval}s** ({_ref_lbl})\n"
+                    f"Page refresh: **follows data** — redraws the moment new "
+                    f"data lands (checked every {_UI_POLL_MS // 1000}s in the background)")
 
             st.divider()
 
@@ -937,11 +942,13 @@ def fetch_dhan_option_chain(expiry=None):
 
 
 # CI #8 fix: cached wrapper around fetch_dhan_option_chain for callers that
-# fetch the BACK expiry every 60s visitor refresh (e.g., the v4 #6 Inter-Expiry
-# Roll Signal at ~L4630). The bare function has no caching — every visitor
-# triggered a fresh Dhan POST, violating the ~1-req/3s rate limit and doubling
-# API spend. 5-min TTL is sufficient because roll-detection doesn't need
-# per-minute granularity.
+# fetch the BACK expiry on every genuine dashboard render (e.g., the v4 #6
+# Inter-Expiry Roll Signal at ~L4630). The bare function has no caching —
+# every visitor triggered a fresh Dhan POST, violating the ~1-req/3s rate
+# limit and doubling API spend. 5-min TTL is sufficient because roll-detection
+# doesn't need per-minute granularity. (v15: genuine renders are now gated to
+# roughly the data-refresh cadence anyway — see the render gate — but this
+# cache still protects against multiple concurrent visitors.)
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_dhan_option_chain_cached(expiry=None):
     return fetch_dhan_option_chain(expiry)
@@ -3727,7 +3734,9 @@ def get_server_data(expiry_override=None):
     """
     Returns (payload, source, last_fetch_ts) for ALL visitors.
     Only calls Dhan API when the owner-configured refresh interval has elapsed.
-    Visitor page-refreshes (every 60 s) NEVER trigger a new API call.
+    Visitor page polls (every _UI_POLL_MS, 3s) NEVER trigger a new API call by
+    themselves — the background refresher (v15) is what actually keeps this
+    cache warm on the configured interval; visitor polls just read it.
     last_fetch_ts is the Unix timestamp of the most recent Dhan fetch — used by
     callers to dedup history entries so one data snapshot → exactly one entry.
 
@@ -3891,14 +3900,17 @@ _persist_lock = threading.Lock()
 
 # H25 fix: TTL cache for _load_owner_settings. The function was being called
 # 2-3× per rerun from multiple sites (sidebar, get_server_data, banner) and
-# each call did an `open + json.load`. With N visitors refreshing every 60s,
-# that's 2-3N disk reads/minute for a file that changes only when the owner
-# toggles a setting. 5s TTL coalesces reads within a single rerun.
+# each call did an `open + json.load`. The sidebar (which calls this) renders
+# on every visitor poll — v15: that's now every _UI_POLL_MS (3s), not 60s —
+# so without this TTL, N visitors would mean 2-3N disk reads every 3 seconds
+# for a file that changes only when the owner toggles a setting. 5s TTL
+# coalesces reads within a single poll tick (and across nearby ticks).
 _owner_settings_cache = {"data": None, "ts": 0.0}
 _OWNER_SETTINGS_TTL = 5.0   # seconds
 
 # H26 fix: mtime check for _load_bias_history. The function reads the entire
-# JSON file from disk every rerun (60s) per visitor for cross-visitor dedup.
+# JSON file from disk on every genuine (data-gated) render per visitor, for
+# cross-visitor dedup.
 # With mtime check, we only re-read when the file actually changed.
 _bias_history_cache = {"data": None, "mtime": -1.0}
 
