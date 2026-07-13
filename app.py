@@ -1079,12 +1079,35 @@ def get_option_chain(expiry=None):
 _fut_master_df   = None
 _fut_id_cache    = {}
 _fut_master_lock = threading.Lock()
+_fut_master_fail_ts = 0.0          # v16 fix: last-failure timestamp for cooldown
+_FUT_MASTER_FAIL_COOLDOWN = 60.0   # seconds — see note below
 
 def _load_dhan_instrument_master():
-    global _fut_master_df
+    """Loads (and caches forever, once successful) the Dhan instrument master
+    CSV used to resolve the NIFTY futures security ID and the India VIX
+    security ID.
+
+    v16 fix: this function is called on EVERY fetch_futures_ltp(),
+    fetch_nifty_intraday_candles(), and fetch_india_vix_ltp() invocation
+    UNTIL it succeeds once — there was previously no cooldown after a failed
+    attempt. During a Dhan/network outage, that meant every single one of
+    those calls re-triggered a fresh CSV download attempt, each of which can
+    internally retry up to 3× (see _get_dhan_session's urllib3 Retry) with a
+    25s timeout per attempt — i.e. a single failed call could block for over
+    a minute. Repeated across every caller, every fetch cycle (including the
+    background refresher, which now polls unconditionally regardless of
+    visitor traffic), this is almost certainly what made the app slow/unre-
+    sponsive enough to fail health checks during the outage. A 60s cooldown
+    after a failure means we fail FAST (return None immediately) instead of
+    re-attempting the same slow, doomed network call on every single caller.
+    """
+    global _fut_master_df, _fut_master_fail_ts
     with _fut_master_lock:
         if _fut_master_df is not None:
             return _fut_master_df
+        now = time.time()
+        if now - _fut_master_fail_ts < _FUT_MASTER_FAIL_COOLDOWN:
+            return None
         try:
             import io
             # H1+H3 fix: use the shared session (with retry/backoff) via _dhan_get_csv.
@@ -1094,6 +1117,7 @@ def _load_dhan_instrument_master():
             _fut_master_df = df
             return _fut_master_df
         except (DhanAPIError, Exception) as e:
+            _fut_master_fail_ts = now
             try:
                 print(f"[_load_dhan_instrument_master] error: {e}", flush=True)
             except Exception:
@@ -1137,6 +1161,17 @@ _fut_ltp_cache = {"ltp": 0.0, "ts": 0.0}
 _FUT_CACHE_SEC = 58
 
 def fetch_futures_ltp(near_expiry_str=None):
+    """
+    v16 fix: _fut_ltp_cache["ts"] used to only get updated on a SUCCESSFUL
+    fetch. During a sustained Dhan outage, that meant every single call to
+    this function (there can be several per data-fetch cycle, plus the
+    background refresher polling independently) re-attempted the network
+    call with zero backoff — the exact "same error happening with other
+    active APIs" retry-storm pattern also fixed in get_server_data() and
+    _load_dhan_instrument_master(). Now every exit path — success, no
+    security ID resolved, or a network/API error — updates "ts" so the
+    _FUT_CACHE_SEC cooldown applies uniformly, not just after a success.
+    """
     if not USE_DHAN:
         return 0.0
     now = time.time()
@@ -1146,6 +1181,7 @@ def fetch_futures_ltp(near_expiry_str=None):
     if not cached:
         sec_id, exp_dt = _resolve_futures_id(near_expiry_str)
         if not sec_id:
+            _fut_ltp_cache["ts"] = now   # v16 fix: cooldown even when ID resolution fails
             return 0.0
         _fut_id_cache["NIFTY"] = {"id": sec_id, "expiry": exp_dt}
         cached = _fut_id_cache["NIFTY"]
@@ -1169,6 +1205,7 @@ def fetch_futures_ltp(near_expiry_str=None):
             print(f"[fetch_futures_ltp] error: {e}", flush=True)
         except Exception:
             pass
+    _fut_ltp_cache["ts"] = now   # v16 fix: cooldown on failure / no valid LTP too
     return _fut_ltp_cache.get("ltp", 0.0)
 
 
@@ -2936,14 +2973,24 @@ def fetch_india_vix_ltp():
     """
     Fetch India VIX LTP via Dhan /v2/marketfeed/ltp using the VIX security ID.
     Falls back to 0.0 if unavailable (graceful — VIX not a required signal).
+
+    v16 fix: the cooldown check used to require `ltp > 0` in addition to the
+    TTL, so if VIX had NEVER been fetched successfully (ltp stuck at 0.0),
+    the cooldown never engaged at all — every single call re-attempted the
+    network request, no backoff, even seconds apart. And like
+    fetch_futures_ltp, "ts" was only bumped on success, so a sustained outage
+    meant every call retried immediately. Now every exit path (success, no
+    VIX ID resolved, or a network/API error) updates "ts", and the cooldown
+    check no longer requires a prior success.
     """
     if not USE_DHAN:
         return 0.0
     now = time.time()
-    if now - _vix_ltp_cache_v7["ts"] < _VIX_CACHE_SEC and _vix_ltp_cache_v7["ltp"] > 0:
+    if now - _vix_ltp_cache_v7["ts"] < _VIX_CACHE_SEC:
         return _vix_ltp_cache_v7["ltp"]
     vix_id = _resolve_india_vix_id()
     if not vix_id:
+        _vix_ltp_cache_v7["ts"] = now   # v16 fix: cooldown even when VIX ID resolution fails
         return 0.0
     try:
         # H1+H2+H3 fix: shared helper.
@@ -2964,6 +3011,7 @@ def fetch_india_vix_ltp():
             print(f"[fetch_india_vix_ltp] error: {e}", flush=True)
         except Exception:
             pass
+    _vix_ltp_cache_v7["ts"] = now   # v16 fix: cooldown on failure / no valid LTP too
     return _vix_ltp_cache_v7.get("ltp", 0.0)
 
 
