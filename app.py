@@ -6416,13 +6416,14 @@ with _ls_col3:
 #              (chart: "Δ-Weighted OI Change Momentum")
 #
 # Matrix (bias from EVR, momentum strength from NDM):
-#   1. EVR>1 & NDM>0 → Call BUYERS  stronger than Put sellers  → BULLISH · STRONG upside
-#   2. EVR>1 & NDM<0 → Put SELLERS  stronger than Call buyers  → BULLISH · weak upside
-#   3. EVR<1 & NDM<0 → Put BUYERS   stronger than Call sellers → BEARISH · STRONG downside
-#   4. EVR<1 & NDM>0 → Call SELLERS stronger than Put buyers   → BEARISH · weak downside
+#   1. EVR>1     & NDM>0 → Call BUYERS  stronger than Put sellers  → BULLISH · STRONG upside
+#   2. EVR>1     & NDM<0 → Put SELLERS  stronger than Call buyers  → BULLISH · weak upside
+#   3. EVR<0.7   & NDM<0 → Put BUYERS   stronger than Call sellers → BEARISH · STRONG downside
+#   4. EVR<0.7   & NDM>0 → Call SELLERS stronger than Put buyers   → BEARISH · weak downside
+#   • 0.7 ≤ EVR ≤ 1 is now a NEUTRAL zone (v14: bearish requires EVR<0.7, not just <1)
 #
 # Aggregation:
-#   • Overall BIAS       = average per-strike raw EVR  (>1 bullish, <1 bearish)
+#   • Overall BIAS       = average per-strike raw EVR  (>1 bullish, <0.7 bearish, else neutral)
 #   • MOMENTUM strength  = share of STRONG-buyer strikes (row 1 / row 3) in the
 #                          relevant OTM segment + ATM + up to 2 shallow-ITM strikes
 #   • RANGE override     = strong Put sellers below spot AND strong Call sellers
@@ -6526,16 +6527,21 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None):
         _ndm = _c_chg * _cd - _p_chg * _pdl
 
         # Matrix classification
+        # v14: bearish rows (3/4) now require EVR < 0.7 — strikes with EVR
+        # between 0.7 and 1.0 no longer default to bearish; they fall
+        # through to neutral (row 0) instead.
         if np.isnan(_evr) or abs(_evr - 1.0) < 1e-9 or (abs(_c_chg) < 1 and abs(_p_chg) < 1):
             _row_id, _dom, _read = 0, "~ Neutral", "No dominant aggressor"
         elif _evr > 1 and _ndm > 0:
             _row_id, _dom, _read = 1, "Call buyers > Put sellers",  "BULLISH · STRONG upside"
         elif _evr > 1:
             _row_id, _dom, _read = 2, "Put sellers > Call buyers",  "BULLISH · weak upside"
-        elif _ndm < 0:
+        elif _evr < 0.7 and _ndm < 0:
             _row_id, _dom, _read = 3, "Put buyers > Call sellers",  "BEARISH · STRONG downside"
-        else:
+        elif _evr < 0.7:
             _row_id, _dom, _read = 4, "Call sellers > Put buyers",  "BEARISH · weak downside"
+        else:
+            _row_id, _dom, _read = 0, "~ Neutral", "EVR 0.7–1.0 — neutral zone, no dominant aggressor"
 
         # Per-strike Enhanced NDM — stance decided PER STRIKE by its own EVR:
         #   EVR>1: call buying (+) and put writing (+) are BOTH bullish hedge flows
@@ -6560,8 +6566,9 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None):
     # ── Aggregate: BIAS from average per-strike raw EVR ──────────────────────
     _evr_fin  = _mx["evr"][np.isfinite(_mx["evr"])]
     _evr_avg  = float(_evr_fin.mean()) if len(_evr_fin) else 1.0
+    # v14: bearish only below 0.7 (was <1.0); 0.7-1.0 now reads NEUTRAL.
     if   _evr_avg > 1.0: _bias = "BULLISH"
-    elif _evr_avg < 1.0: _bias = "BEARISH"
+    elif _evr_avg < 0.7: _bias = "BEARISH"
     else:                _bias = "NEUTRAL"
 
     _tot_abs = float(_mx["ndm"].abs().sum()) or 1.0
@@ -6694,9 +6701,10 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
         # ── Enhanced NDM v10 — per-strike Buyer/Seller Matrix ─────────────────────
         st.caption(
             "BIAS comes from the raw CE/PE Extrinsic-Value ratio per strike: >1 = Call buyers & Put sellers → BULLISH; "
-            "<1 = Put buyers & Call sellers → BEARISH. MOMENTUM comes from the Δ-weighted OI change per strike: "
+            "<0.7 = Put buyers & Call sellers → BEARISH (0.7-1.0 is a NEUTRAL zone — no longer treated as bearish). "
+            "MOMENTUM comes from the Δ-weighted OI change per strike: "
             "with EVR>1, positive NDM = Call BUYERS stronger → strong upside; negative NDM = Put SELLERS stronger → "
-            "bullish but weak. Exactly opposite for EVR<1. Strong opposite sellers on BOTH sides of spot → "
+            "bullish but weak. Exactly opposite for EVR<0.7. Strong opposite sellers on BOTH sides of spot → "
             "range-bound, pinning the ATM."
         )
 
@@ -6764,7 +6772,8 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
             with st.expander("📊 Strike-by-Strike Buyer/Seller Matrix Breakdown", expanded=False):
                 st.caption(
                     f"Avg raw CE/PE EV ratio this tick: **{_endm['evr_avg']:.3f}** → bias **{_endm['bias']}**. "
-                    "Per strike: EVR>1 = bullish bias · EVR<1 = bearish bias. The NDM (Δ×ΔOI) sign then decides "
+                    "Per strike: EVR>1 = bullish bias · EVR<0.7 = bearish bias · 0.7-1.0 = neutral (no dominant "
+                    "aggressor). The NDM (Δ×ΔOI) sign then decides "
                     "WHO is stronger at that strike — buyers (strong momentum) or sellers (weak momentum)."
                 )
 
@@ -6933,8 +6942,11 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         _evr_oiw_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi"]) /
                       (_ev_bd["ev_p"] * _ev_bd["put_oi"]).replace(0, np.nan)).fillna(1.0)
 
-        def _s4_evr_bar(vals, title):
-            _cols = [GREEN if v >= 1 else RED for v in vals]
+        def _s4_evr_bar(vals, title, bear_thresh=1.0):
+            # v14: bearish (red) fires only below `bear_thresh`. Values that
+            # dip under 1.0 but stay at/above `bear_thresh` are shown amber
+            # (neutral) rather than red — they're no longer read as bearish.
+            _cols = [GREEN if v >= 1 else (RED if v < bear_thresh else AMBER) for v in vals]
             f = go.Figure(go.Bar(x=_ev_bd["strike"], y=vals - 1.0, base=1.0,
                                  marker_color=_cols, customdata=vals,
                                  hovertemplate="Strike %{x}<br>CE/PE EV Ratio: %{customdata:.3f}<extra></extra>"))
@@ -6957,7 +6969,8 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
         with _s4_r3c2:
             f6 = _s4_evr_bar(_evr_raw_s,
-                             f"★ Parity-Adj CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call buyers/Put sellers dominant · Red<1=Put buyers/Call sellers dominant")
+                             f"★ Parity-Adj CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green≥1=Call buyers/Put sellers dominant · Amber 0.7-1=Neutral · Red<0.7=Put buyers/Call sellers dominant",
+                             bear_thresh=0.7)
             st.plotly_chart(f6, width='stretch', config={"displayModeBar":False})
 
         # ★ Strike-wise OI-CHANGE-Weighted CE/PE EV Ratio — per strike,
