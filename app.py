@@ -3829,10 +3829,19 @@ def get_server_data(expiry_override=None):
             _srv_cache["source"]  = source
             _srv_cache["last_fetch_ts"] = time.time()
         # If payload is None (fetch failed), keep the previous stale payload
-        # but bump last_fetch_ts by a short cooldown to prevent retry storms.
-        # CI #4 / H7 fix: was 0.0 → every subsequent visitor retried the failed
-        # fetch with no backoff.
-        elif _srv_cache["payload"] is not None:
+        # (if any) but bump last_fetch_ts by a short cooldown to prevent
+        # retry storms. CI #4 / H7 fix: was 0.0 → every subsequent visitor
+        # retried the failed fetch with no backoff.
+        # v16 fix: this cooldown used to only apply when `_srv_cache["payload"]`
+        # was already non-None (i.e., at least one fetch had ever succeeded).
+        # On a fresh deploy/restart — or any outage that started before the
+        # very first successful fetch — last_fetch_ts stayed at its untouched
+        # value, so EVERY subsequent caller (including the background
+        # refresher, which now polls unconditionally every ~15s regardless of
+        # visitor traffic) retried immediately with NO cooldown, hammering a
+        # down/unreachable Dhan endpoint back-to-back. The cooldown now
+        # applies on every failure, with or without a prior payload.
+        else:
             _srv_cache["last_fetch_ts"] = time.time() - max(0, interval - 30)  # 30s cooldown
 
     return (
@@ -3863,19 +3872,38 @@ def _background_data_refresher_loop():
     fetch + compute + cache path (get_server_data) that visitor reruns use, so
     there is only one code path for "how does new data get into the cache" —
     this thread just calls it proactively instead of waiting for a visitor.
+
+    v16: exponential backoff on consecutive failures. get_server_data()'s own
+    30s cooldown (see the Phase 3 fix above) already stops a single caller
+    from retrying instantly, but this thread polls unconditionally every
+    ~15s regardless of visitor traffic — during a real Dhan outage (e.g. the
+    "Max retries exceeded" / HTTPSConnectionPool errors seen when api.dhan.co
+    is unreachable) that's still a fetch attempt roughly every 30-45s, all
+    day, forever. Backing off further on repeated failures (capped at 5 min)
+    keeps this thread from compounding a network outage into a resource/CPU
+    problem that could make the whole app unresponsive.
     """
+    _consecutive_failures = 0
     while True:
         interval = REFRESH_SECONDS
+        _ok = False
         try:
             settings = _load_owner_settings()
             interval = settings.get("refresh_interval", REFRESH_SECONDS)
             get_server_data(settings.get("selected_expiry"))
+            _ok = _srv_cache.get("payload") is not None
         except Exception as _bg_err:
             print(f"[bg-refresher] {_bg_err}", flush=True)
-        # Wake up more often than the configured interval so a mid-cycle
-        # interval change (owner picks a faster option) takes effect
-        # promptly, without hammering the API when the interval is long.
-        time.sleep(max(5, min(interval, 15)))
+        _consecutive_failures = 0 if _ok else (_consecutive_failures + 1)
+        # Base cadence: wake up more often than the configured interval so a
+        # mid-cycle interval change (owner picks a faster option) takes
+        # effect promptly, without hammering the API when the interval is
+        # long. On repeated failures, back off exponentially (30s → 1m → 2m
+        # → 4m → capped at 5m) instead of retrying at the base cadence.
+        _base_wait = max(5, min(interval, 15))
+        _wait = min(_base_wait * (2 ** min(_consecutive_failures, 5)), 300) \
+                if _consecutive_failures else _base_wait
+        time.sleep(_wait)
 
 
 @st.cache_resource(show_spinner=False)
@@ -7132,15 +7160,17 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             f.update_layout(title=dict(font=dict(size=11)))
             return f
 
-        # Row 3 — Call vs Put OI | Raw CE/PE EV Ratio per Strike
+        # Row 3 — Raw CE/PE EV Ratio per Strike | Parity-Adj CE/PE EV Ratio per Strike
         _s4_r3c1, _s4_r3c2 = st.columns(2)
         with _s4_r3c1:
-            f4 = go.Figure([
-                go.Bar(x=x, y=df_band["call_oi"], name="Call OI", marker_color="#38BDF8"),
-                go.Bar(x=x, y=df_band["put_oi"],  name="Put OI",  marker_color="#FB7185"),
-            ])
-            f4.update_layout(barmode="group")
-            _s4_style(f4, "Call vs Put OI · Blue=Call · Rose=Put", "Open Interest", legend_h=True)
+            # v16: was "Call vs Put OI" — replaced with the RAW (not
+            # parity-adjusted) strike-wise CE/PE EV ratio, using the same
+            # >1 green / 0.7-1 amber / <0.7 red threshold coloring as the
+            # Parity-Adj chart alongside it (via _s4_evr_bar, bear_thresh=0.7).
+            _evr_true_raw_s = (_ev_bd["ev_c"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
+            f4 = _s4_evr_bar(_evr_true_raw_s,
+                             f"★ Raw CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green≥1=Call buyers/Put sellers dominant · Amber 0.7-1=Neutral · Red<0.7=Put buyers/Call sellers dominant",
+                             bear_thresh=0.7)
             st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
         with _s4_r3c2:
             f6 = _s4_evr_bar(_evr_raw_s,
