@@ -3793,6 +3793,7 @@ def get_server_data(expiry_override=None):
     expiry_to_use = expiry_override or settings.get("selected_expiry")
 
     # ── Phase 1: brief lock to check cache freshness ──
+    _claimed_fetch = False
     with _srv_cache_lock:
         now = time.time()
         cache_expired = (now - _srv_cache["last_fetch_ts"]) >= interval
@@ -3805,14 +3806,51 @@ def get_server_data(expiry_override=None):
             )
         # Cache stale — check if another thread is already fetching
         if _srv_fetch_in_progress:
-            # Stale-while-revalidate: return what we have, let the other thread finish
-            return (
-                _srv_cache.get("payload"),
-                _srv_cache.get("source", "N/A"),
-                _srv_cache.get("last_fetch_ts", 0.0),
-            )
-        # Claim the fetch slot
-        _srv_fetch_in_progress = True
+            if _srv_cache["payload"] is not None:
+                # Stale-while-revalidate: we have SOMETHING to show while the
+                # other thread (almost always the v15 background refresher,
+                # which claims the fetch slot before any visitor's own render
+                # reaches this point) finishes. Safe to return immediately.
+                return (
+                    _srv_cache.get("payload"),
+                    _srv_cache.get("source", "N/A"),
+                    _srv_cache.get("last_fetch_ts", 0.0),
+                )
+            # COLD START BUG FIX: no payload has EVER been cached yet (fresh
+            # deploy/restart) and another thread already claimed the fetch
+            # slot. The old code returned None here immediately, which the
+            # caller then surfaced as "Could not fetch option chain data" —
+            # even though a fetch was actively in flight and about to
+            # succeed a moment later. This didn't happen in v14 because
+            # there was no background refresher racing the visitor's own
+            # request for the very first fetch. Fall through to WAIT for
+            # the in-progress fetch instead of bailing out with nothing.
+        else:
+            # Claim the fetch slot
+            _srv_fetch_in_progress = True
+            _claimed_fetch = True
+
+    if not _claimed_fetch:
+        # Poll briefly for the in-progress fetch (claimed by another thread)
+        # to land, instead of racing it and returning an empty result.
+        _wait_deadline = time.time() + 12.0   # generous timeout for a cold-start fetch
+        while time.time() < _wait_deadline:
+            time.sleep(0.25)
+            with _srv_cache_lock:
+                if _srv_cache["payload"] is not None or not _srv_fetch_in_progress:
+                    return (
+                        _srv_cache.get("payload"),
+                        _srv_cache.get("source", "N/A"),
+                        _srv_cache.get("last_fetch_ts", 0.0),
+                    )
+        # Timed out waiting — return whatever's there (may still be None on a
+        # genuine, prolonged Dhan outage; the caller's existing error path
+        # handles that correctly).
+        return (
+            _srv_cache.get("payload"),
+            _srv_cache.get("source", "N/A"),
+            _srv_cache.get("last_fetch_ts", 0.0),
+        )
 
     # ── Phase 2: do the network call WITHOUT holding the lock ──
     try:
