@@ -6722,9 +6722,15 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _hist = _endm_verdict_history_append(hist_store, _verdict, _bias, _mom_lbl, _levels_txt)
 
     # ── Display dataframe (descending strike) ────────────────────────────────
+    # Bug fix (pre-existing, surfaced by live data): this must always return a
+    # str. Previously it returned a str for non-finite values but a float
+    # otherwise, producing a mixed-type "object" column that pyarrow cannot
+    # serialize to Arrow (ArrowTypeError: "Expected bytes, got a 'float'
+    # object" on the "Raw CE/PE EVR" column) whenever any strike actually hit
+    # a non-finite EVR.
     def _evr_fmt(v):
         if not np.isfinite(v): return "∞" if v == float("inf") else "—"
-        return round(float(v), 3)
+        return str(round(float(v), 3))
     _disp = pd.DataFrame({
         "Strike":       _mx["strike"],
         "EVR":          _mx["evr"].map(_evr_fmt),
