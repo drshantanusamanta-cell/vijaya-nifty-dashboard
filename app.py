@@ -4927,6 +4927,7 @@ def _render_enhanced_bias_panel(eb, vwap_or, ts, vix, cd, spot_px, metrics):
 # WITHOUT moving any code: every section still computes exactly where it always
 # did — it just renders into its reserved slot. Zero calculation changes.
 # ═══════════════════════════════════════════════════════════════════════════════
+_slot_summary = st.container()   # NEW: Intraday Market Sum Up — very top of dashboard
 _slot_sv    = st.container()   # v10: Shantanu's View — renders at the very top of the dashboard
 _slot_s3    = st.container()   # Section 3 — Key Price Levels
 _slot_s4    = st.container()   # Section 4 — Strike-wise Charts (4 rows × 2)
@@ -7530,6 +7531,49 @@ if s:
     st.caption(f"{s['pos_caption']} | Based on last {s['n_ticks']} ticks | Vega=IV z-score · Theta=GEX z-score · OI=PCR z-score · Strength=Net-Delta z-score")
 else:
     st.info("Collecting data need at least 3 ticks for Market Sentiments.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTRADAY MARKET SUM UP  (surgical addition — renders into the reserved top
+# slot. No new calculations: Spot / Max Pain / Net GEX are the same values
+# from Section 3; Put Wall / Call Wall / Gamma Flip are the same snapshot
+# from the GEX+Vega Live Interpretation section; the chart is the same
+# Parity-Adj CE/PE EV Ratio figure (f6) — chart #6 of Section 4, reused as-is.
+# ─────────────────────────────────────────────────────────────────────────────
+with _slot_summary:
+    st.markdown('<div class="section-header">&#128204; Intraday Market Sum Up</div>', unsafe_allow_html=True)
+
+    _sum_cw  = _gv_levels_snapshot.get("call_wall")  if _gv_levels_snapshot else None
+    _sum_pw  = _gv_levels_snapshot.get("put_wall")   if _gv_levels_snapshot else None
+    _sum_gfl = _gv_levels_snapshot.get("gamma_flip") if _gv_levels_snapshot else gflip_str
+
+    _sum_items = [
+        ("Spot",       f"{spot:,.2f}",              GREEN if spot_vs_atm >= 0 else RED, f"vs ATM {spot_vs_atm:+.1f}"),
+        ("Max Pain",   f"{int(m['max_pain']):,}",   PINK,                               "Writer equilibrium"),
+        ("Net GEX",    f"{gex_val:,.0f}",           GREEN if gex_val > 0 else RED,      "+ve=pin / -ve=trend"),
+        ("Put Wall",   f"{_sum_pw:,}" if _sum_pw is not None else "N/A",   GREEN,       "GEX support floor"),
+        ("Call Wall",  f"{_sum_cw:,}" if _sum_cw is not None else "N/A",   RED,         "GEX resistance ceiling"),
+        ("Gamma Flip", _sum_gfl if _sum_gfl else "N/A",
+                        RED if (gflip and spot < gflip) else GREEN,
+                        ("Short-γ zone" if gflip and spot < gflip else "Above flip")),
+    ]
+    _sum_cols = st.columns(6)
+    for col, (label, val, color, tip) in zip(_sum_cols, _sum_items):
+        col.markdown(f"""
+        <div class="card" style="text-align:center;border-bottom:3px solid {color};">
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">{label}</div>
+          <div style="font-size:22px;font-weight:800;color:{color};">{val}</div>
+          <div style="font-size:11px;color:#374151;margin-top:2px;">{tip}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div style="font-size:12px;font-weight:700;color:#6B7280;'
+        'text-transform:uppercase;margin:14px 0 4px;">'
+        'Parity-Adj CE/PE EV Ratio per Strike (Section 4, chart 6)</div>',
+        unsafe_allow_html=True)
+    st.plotly_chart(f6, width='stretch', config={"displayModeBar": False},
+                     key="summary_parity_evr_chart")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
