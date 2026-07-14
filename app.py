@@ -4934,6 +4934,12 @@ _slot_s2    = st.container()   # Section 2 — Bias Engine · Strategy · Key Me
 _slot_gamma = st.container()   # Gamma & Vega Live Interpretation
 _slot_s10   = st.container()   # Section 10 — Basis Triangulation
 
+# v14 (ported from Dash v15): module-level default so Shantanu's View can
+# safely reference the GEX/Vega key-levels snapshot even if the Gamma & Vega
+# section above hasn't run yet (e.g. _gd_src unavailable this tick). Set for
+# real inside the "with _slot_gamma:" block below.
+_gv_levels_snapshot = None
+
 
 # ── Render the Enhanced Bias Panel at the top of the dashboard ───────────────
 _render_enhanced_bias_panel(
@@ -5920,6 +5926,10 @@ with _slot_gamma:   # v8: render into top-of-dashboard slot (display order only)
         # "Vega" here means Net OI-weighted Vega Exposure (ΣOI×Vega), not raw unit vega.
         # Refreshes with every data tick — no extra API calls needed.
         # ═════════════════════════════════════════════════════════════════════════
+        # v14 (ported from Dash v15): snapshot of the already-computed GEX/Vega
+        # key levels, threaded into Shantanu's View's 15-min log below (replacing
+        # the old "Key Strikes" column). Defaults to None if this block errors.
+        _gv_levels_snapshot = None
         try:
             _atm_mask    = (_gd_src["strike"] - spot).abs() <= 3 * NIFTY_STEP
             _above_mask  = _gd_src["strike"] > spot
@@ -6240,6 +6250,17 @@ with _slot_gamma:   # v8: render into top-of-dashboard slot (display order only)
                    if _has_ext_wall else "")
             )
 
+            # v14 (ported from Dash v15): snapshot the already-computed GEX/Vega
+            # key levels so Shantanu's View can thread them into its 15-min log
+            # (replacing the old "Key Strikes" column).
+            _gv_levels_snapshot = {
+                "call_wall":   _call_wall_k,
+                "put_wall":    _put_wall_k,
+                "gamma_flip":  _flip_str,
+                "iv_gravity":  _max_neg_vega_k,
+                "iv_kindling": _max_pos_vega_k,
+            }
+
             _actions_html = "".join(
                 f"<div style='margin:4px 0;font-size:13px;color:#1A1A2E'>{a}</div>" for a in _action_lines
             )
@@ -6465,13 +6486,39 @@ def _endm_hist_file_save(_store):
         pass
 
 
-def _endm_verdict_history_append(store, verdict, bias, momentum, strikes_txt):
+def _fmt_gv_levels(gv):
+    """Format the GEX/Vega key-levels snapshot (Call Wall, Put Wall, Gamma
+    Flip, IV Gravity, IV Kindling) for the 15-min log's level column.
+
+    v14 (ported from Dash v15): this replaces the old "Key Strikes" column,
+    which used to show the strongest buyer/seller strikes from the NDM
+    matrix. Now every 15-min row stamps the already-computed GEX+Vega Live
+    Interpretation levels instead.
+    """
+    if not gv:
+        return "—"
+    def _n(v):
+        try:
+            return f"{int(v):,}"
+        except Exception:
+            return "N/A"
+    return (f"CW {_n(gv.get('call_wall'))} · PW {_n(gv.get('put_wall'))} · "
+            f"GF {gv.get('gamma_flip') or 'N/A'} · "
+            f"IVG {_n(gv.get('iv_gravity'))} · IVK {_n(gv.get('iv_kindling'))}")
+
+
+def _endm_verdict_history_append(store, verdict, bias, momentum, levels_txt):
     """Append current final verdict to the 15-minute history log.
 
     v10.1: the log is persisted to a JSON file next to the app script, so it
     survives browser refreshes, is shared across every device/tab hitting the
     same server, and survives app restarts. Auto-resets on a new trading day.
     (The in-memory `store` argument is kept only for signature compatibility.)
+
+    v14 (ported from Dash v15): the logged column is "Key Levels
+    (CW/PW/GF/IVG/IVK)" — the GEX+Vega Call Wall / Put Wall / Gamma Flip /
+    IV Gravity / IV Kindling snapshot — replacing the old "Key Strikes"
+    (strongest buyer/seller strikes) column.
     """
     _now = now_ist()
     if _now.hour == 9 and _now.minute < 30:
@@ -6493,13 +6540,19 @@ def _endm_verdict_history_append(store, verdict, bias, momentum, strikes_txt):
                           "Final Verdict": verdict,
                           "Bias": bias,
                           "Momentum": momentum,
-                          "Key Strikes": strikes_txt})
+                          "Key Levels (CW/PW/GF/IVG/IVK)": levels_txt})
             _endm_hist_file_save(_disk)
     return [{k: v for k, v in r.items() if k != "_ts"} for r in _rows]
 
 
-def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None):
-    """Enhanced NDM v10 — per-strike Buyer/Seller matrix (see banner above)."""
+def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=None):
+    """Enhanced NDM v10 — per-strike Buyer/Seller matrix (see banner above).
+
+    v14 (ported from Dash v15): `gv_levels` is the Call Wall / Put Wall /
+    Gamma Flip / IV Gravity / IV Kindling snapshot from the GEX+Vega Live
+    Interpretation section — it is stamped into the 15-min log in place of
+    the old "Key Strikes" column.
+    """
     _step = NIFTY_STEP
     _atm  = round(spot / _step) * _step if spot else 0
 
@@ -6659,9 +6712,14 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None):
         _reason = [f"Avg raw CE/PE EV ratio is {_evr_avg:.2f} (≈1) — call and put premiums are balanced, so neither side has the edge."]
 
     # ── 15-minute final-verdict history ──────────────────────────────────────
+    # v14 (ported from Dash v15): the log's level column is now the GEX+Vega
+    # key-levels snapshot (Call Wall / Put Wall / Gamma Flip / IV Gravity /
+    # IV Kindling), not the old NDM "Key Strikes". `_key_ks` above is still
+    # used inline in the verdict/reason text and is left untouched.
+    _levels_txt = _fmt_gv_levels(gv_levels)
     _hist = []
     if hist_store is not None:
-        _hist = _endm_verdict_history_append(hist_store, _verdict, _bias, _mom_lbl, _key_ks)
+        _hist = _endm_verdict_history_append(hist_store, _verdict, _bias, _mom_lbl, _levels_txt)
 
     # ── Display dataframe (descending strike) ────────────────────────────────
     def _evr_fmt(v):
@@ -6710,7 +6768,8 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
 
         if "_endm_hist_store" not in st.session_state:
             st.session_state["_endm_hist_store"] = {"date": None, "rows": []}
-        _endm = _compute_enhanced_ndm(df_band_records, m, spot, st.session_state["_endm_hist_store"])
+        _endm = _compute_enhanced_ndm(df_band_records, m, spot, st.session_state["_endm_hist_store"],
+                                       gv_levels=_gv_levels_snapshot)
         _endm_df      = _endm["df"]
         _endm_total_e = _endm["enhanced_total"]
         _endm_total_r = _endm["raw_total"]
@@ -6957,15 +7016,17 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             f.update_layout(title=dict(font=dict(size=11)))
             return f
 
-        # Row 3 — Call vs Put OI | Raw CE/PE EV Ratio per Strike
+        # Row 3 — Raw CE/PE EV Ratio per Strike | Parity-Adj CE/PE EV Ratio per Strike
+        # v16 (ported from Dash v15): f4 was "Call vs Put OI" — replaced with the
+        # RAW (not parity-adjusted) strike-wise CE/PE EV ratio, using the same
+        # >1 green / 0.7-1 amber / <0.7 red threshold coloring as the Parity-Adj
+        # chart alongside it (via _s4_evr_bar, bear_thresh=0.7).
+        _evr_true_raw_s = (_ev_bd["ev_c"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
         _s4_r3c1, _s4_r3c2 = st.columns(2)
         with _s4_r3c1:
-            f4 = go.Figure([
-                go.Bar(x=x, y=df_band["call_oi"], name="Call OI", marker_color="#38BDF8"),
-                go.Bar(x=x, y=df_band["put_oi"],  name="Put OI",  marker_color="#FB7185"),
-            ])
-            f4.update_layout(barmode="group")
-            _s4_style(f4, "Call vs Put OI · Blue=Call · Rose=Put", "Open Interest", legend_h=True)
+            f4 = _s4_evr_bar(_evr_true_raw_s,
+                             f"★ Raw CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green≥1=Call buyers/Put sellers dominant · Amber 0.7-1=Neutral · Red<0.7=Put buyers/Call sellers dominant",
+                             bear_thresh=0.7)
             st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
         with _s4_r3c2:
             f6 = _s4_evr_bar(_evr_raw_s,
