@@ -7597,6 +7597,7 @@ with _slot_summary:
         _bs_atm  = int(float(m.get("atm", 0) or 0))
         _bs_step = int(NIFTY_STEP)
         _bs_ts   = str(payload.get("ts_ist", ""))
+        _bs_mp   = int(float(m["max_pain"])) if m.get("max_pain") else None
 
         def _bs_cls(_v):
             if _v is None or not np.isfinite(_v): return None
@@ -7628,6 +7629,7 @@ with _slot_summary:
         _prev_pw, _prev_cw = _bs_prev.get("put_wall"), _bs_prev.get("call_wall")
         _prev_lo, _prev_hi = _bs_prev.get("neu_lo"),   _bs_prev.get("neu_hi")
         _prev_bias         = _bs_prev.get("bias", "SIDEWAYS")
+        _prev_mp           = _bs_prev.get("max_pain")
 
         _near_pw  = _bs_pw is not None and spot <= _bs_pw + _bs_step
         _near_cw  = _bs_cw is not None and spot >= _bs_cw - _bs_step
@@ -7715,11 +7717,15 @@ with _slot_summary:
             if _bs_cw is not None and _prev_cw is not None and _bs_cw != _prev_cw:
                 _bs_lines.append(f"RESISTANCE (Call Wall) moving {'UP' if _bs_cw > _prev_cw else 'DOWN'} — {_prev_cw:,} → {_bs_cw:,} vs previous data refresh.")
 
+        # v17.2: one-line Max Pain movement note vs the previous data refresh.
+        if _bs_mp is not None and _prev_mp is not None and _bs_mp != _prev_mp:
+            _bs_lines.append(f"MAX PAIN moved {'UP' if _bs_mp > _prev_mp else 'DOWN'} — {_prev_mp:,} → {_bs_mp:,} vs previous data refresh.")
+
         if _bs_prev.get("ts") != _bs_ts:   # persist once per data tick (not per rerender)
             _atomic_json_write(_bs_file, {
                 "date": _bs_today, "ts": _bs_ts, "put_wall": _bs_pw, "call_wall": _bs_cw,
                 "neu_lo": _bs_neu_lo, "neu_hi": _bs_neu_hi, "neutral_count": _bs_neu,
-                "bias": _bs_bias})
+                "bias": _bs_bias, "max_pain": _bs_mp})
         _bs_bullets = ''.join(
             f'<div style="font-size:13px;color:#111;margin-top:3px;">• {_l}</div>'
             for _l in _bs_lines)
