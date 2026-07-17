@@ -7707,6 +7707,14 @@ with _slot_summary:
                     "Default stance stays sideways until the wall-shift + ATM±1 criteria fire.",
                 ]
 
+        # v17.1: under SIDEWAYS bias, flag wall movement vs the previous data
+        # refresh — Put Wall = SUPPORT, Call Wall = RESISTANCE.
+        if _bs_bias == "SIDEWAYS":
+            if _bs_pw is not None and _prev_pw is not None and _bs_pw != _prev_pw:
+                _bs_lines.append(f"SUPPORT (Put Wall) moving {'UP' if _bs_pw > _prev_pw else 'DOWN'} — {_prev_pw:,} → {_bs_pw:,} vs previous data refresh.")
+            if _bs_cw is not None and _prev_cw is not None and _bs_cw != _prev_cw:
+                _bs_lines.append(f"RESISTANCE (Call Wall) moving {'UP' if _bs_cw > _prev_cw else 'DOWN'} — {_prev_cw:,} → {_bs_cw:,} vs previous data refresh.")
+
         if _bs_prev.get("ts") != _bs_ts:   # persist once per data tick (not per rerender)
             _atomic_json_write(_bs_file, {
                 "date": _bs_today, "ts": _bs_ts, "put_wall": _bs_pw, "call_wall": _bs_cw,
