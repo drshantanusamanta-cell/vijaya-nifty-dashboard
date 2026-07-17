@@ -385,8 +385,8 @@ BIAS_WEIGHTS = {
     "expansion_building":       6,
     "persistence":             10,
     "skew_slope_threshold":  0.15,
-    "ev_ratio_bull":         1.05,
-    "ev_ratio_bear":         0.95,
+    "ev_ratio_bull":         1.20,   # v17: bullish only above 1.2 (sideways 0.7-1.2)
+    "ev_ratio_bear":         0.70,   # v17: bearish only below 0.7
     "momentum_gex_threshold":500,
     "near_oi_min":           0.55,
     "near_oichg_min":        0.50,
@@ -423,6 +423,7 @@ METRIC_EXPLAIN = {
 GREEN  = "#059669"
 RED    = "#DC2626"
 AMBER  = "#D97706"
+SKY    = "#38BDF8"   # v17: sky blue — neutral/sideways EVR zone (was orange/amber)
 BLUE   = "#2563EB"
 CYAN   = "#0891B2"
 PINK   = "#9333EA"
@@ -4927,7 +4928,7 @@ def _render_enhanced_bias_panel(eb, vwap_or, ts, vix, cd, spot_px, metrics):
 # WITHOUT moving any code: every section still computes exactly where it always
 # did — it just renders into its reserved slot. Zero calculation changes.
 # ═══════════════════════════════════════════════════════════════════════════════
-_slot_summary = st.container()   # NEW: Intraday Market Sum Up — very top of dashboard
+_slot_summary = st.container()   # Shantanu's Final Decision Matrix — very top of dashboard
 _slot_sv    = st.container()   # v10: Shantanu's View — renders at the very top of the dashboard
 _slot_s3    = st.container()   # Section 3 — Key Price Levels
 _slot_s4    = st.container()   # Section 4 — Strike-wise Charts (4 rows × 2)
@@ -6438,14 +6439,14 @@ with _ls_col3:
 #              (chart: "Δ-Weighted OI Change Momentum")
 #
 # Matrix (bias from EVR, momentum strength from NDM):
-#   1. EVR>1     & NDM>0 → Call BUYERS  stronger than Put sellers  → BULLISH · STRONG upside
-#   2. EVR>1     & NDM<0 → Put SELLERS  stronger than Call buyers  → BULLISH · weak upside
+#   1. EVR>1.2   & NDM>0 → Call BUYERS  stronger than Put sellers  → BULLISH · STRONG upside
+#   2. EVR>1.2   & NDM<0 → Put SELLERS  stronger than Call buyers  → BULLISH · weak upside
 #   3. EVR<0.7   & NDM<0 → Put BUYERS   stronger than Call sellers → BEARISH · STRONG downside
 #   4. EVR<0.7   & NDM>0 → Call SELLERS stronger than Put buyers   → BEARISH · weak downside
-#   • 0.7 ≤ EVR ≤ 1 is now a NEUTRAL zone (v14: bearish requires EVR<0.7, not just <1)
+#   • 0.7 ≤ EVR ≤ 1.2 is now a NEUTRAL zone (v17: bullish requires EVR>1.2, bearish EVR<0.7)
 #
 # Aggregation:
-#   • Overall BIAS       = average per-strike raw EVR  (>1 bullish, <0.7 bearish, else neutral)
+#   • Overall BIAS       = average per-strike raw EVR  (>1.2 bullish, <0.7 bearish, else neutral)
 #   • MOMENTUM strength  = share of STRONG-buyer strikes (row 1 / row 3) in the
 #                          relevant OTM segment + ATM + up to 2 shallow-ITM strikes
 #   • RANGE override     = strong Put sellers below spot AND strong Call sellers
@@ -6581,21 +6582,21 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _ndm = _c_chg * _cd - _p_chg * _pdl
 
         # Matrix classification
-        # v14: bearish rows (3/4) now require EVR < 0.7 — strikes with EVR
-        # between 0.7 and 1.0 no longer default to bearish; they fall
-        # through to neutral (row 0) instead.
+        # v17: neutral zone widened to 0.7–1.2 — bullish rows (1/2) now
+        # require EVR > 1.2, bearish rows (3/4) require EVR < 0.7; strikes
+        # in between fall through to neutral (row 0) instead.
         if np.isnan(_evr) or abs(_evr - 1.0) < 1e-9 or (abs(_c_chg) < 1 and abs(_p_chg) < 1):
             _row_id, _dom, _read = 0, "~ Neutral", "No dominant aggressor"
-        elif _evr > 1 and _ndm > 0:
+        elif _evr > 1.2 and _ndm > 0:
             _row_id, _dom, _read = 1, "Call buyers > Put sellers",  "BULLISH · STRONG upside"
-        elif _evr > 1:
+        elif _evr > 1.2:
             _row_id, _dom, _read = 2, "Put sellers > Call buyers",  "BULLISH · weak upside"
         elif _evr < 0.7 and _ndm < 0:
             _row_id, _dom, _read = 3, "Put buyers > Call sellers",  "BEARISH · STRONG downside"
         elif _evr < 0.7:
             _row_id, _dom, _read = 4, "Call sellers > Put buyers",  "BEARISH · weak downside"
         else:
-            _row_id, _dom, _read = 0, "~ Neutral", "EVR 0.7–1.0 — neutral zone, no dominant aggressor"
+            _row_id, _dom, _read = 0, "~ Neutral", "EVR 0.7–1.2 — neutral zone, no dominant aggressor"
 
         # Per-strike Enhanced NDM — stance decided PER STRIKE by its own EVR:
         #   EVR>1: call buying (+) and put writing (+) are BOTH bullish hedge flows
@@ -6620,8 +6621,8 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
     # ── Aggregate: BIAS from average per-strike raw EVR ──────────────────────
     _evr_fin  = _mx["evr"][np.isfinite(_mx["evr"])]
     _evr_avg  = float(_evr_fin.mean()) if len(_evr_fin) else 1.0
-    # v14: bearish only below 0.7 (was <1.0); 0.7-1.0 now reads NEUTRAL.
-    if   _evr_avg > 1.0: _bias = "BULLISH"
+    # v17: neutral 0.7-1.2 — bullish only above 1.2, bearish only below 0.7.
+    if   _evr_avg > 1.2: _bias = "BULLISH"
     elif _evr_avg < 0.7: _bias = "BEARISH"
     else:                _bias = "NEUTRAL"
 
@@ -6671,7 +6672,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#059669", "#D1FAE5"
         _key_ks   = _fmt_ks(_strong_ks)
         _reason = [
-            f"Call premiums are richer than puts (avg raw CE/PE EV ratio {_evr_avg:.2f} > 1) → call buyers + put sellers → bullish bias.",
+            f"Call premiums are richer than puts (avg raw CE/PE EV ratio {_evr_avg:.2f} > 1.2) → call buyers + put sellers → bullish bias.",
             f"Net Δ-weighted OI change is POSITIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — call BUYERS are stronger than put sellers.",
             "Buyers, not sellers, are driving the move → upside momentum is STRONG.",
         ]
@@ -6681,7 +6682,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#65A30D", "#F7FEE7"
         _key_ks   = _fmt_ks(_weak_ks)
         _reason = [
-            f"Call premiums are richer than puts (avg raw CE/PE EV ratio {_evr_avg:.2f} > 1) → bias stays bullish.",
+            f"Call premiums are richer than puts (avg raw CE/PE EV ratio {_evr_avg:.2f} > 1.2) → bias stays bullish.",
             f"But net Δ-weighted OI change is NEGATIVE at key strikes [{_fmt_ks(_weak_ks)}] — put SELLERS are stronger than call buyers.",
             "The market is supported by sellers rather than driven by buyers → upside momentum is NOT strong.",
         ]
@@ -6691,7 +6692,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#DC2626", "#FEE2E2"
         _key_ks   = _fmt_ks(_strong_ks)
         _reason = [
-            f"Put premiums are richer than calls (avg raw CE/PE EV ratio {_evr_avg:.2f} < 1) → put buyers + call sellers → bearish bias.",
+            f"Put premiums are richer than calls (avg raw CE/PE EV ratio {_evr_avg:.2f} < 0.7) → put buyers + call sellers → bearish bias.",
             f"Net Δ-weighted OI change is NEGATIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — put BUYERS are stronger than call sellers.",
             "Buyers of downside protection are driving → downside momentum is STRONG.",
         ]
@@ -6701,7 +6702,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#EA580C", "#FFF7ED"
         _key_ks   = _fmt_ks(_weak_ks)
         _reason = [
-            f"Put premiums are richer than calls (avg raw CE/PE EV ratio {_evr_avg:.2f} < 1) → bias stays bearish.",
+            f"Put premiums are richer than calls (avg raw CE/PE EV ratio {_evr_avg:.2f} < 0.7) → bias stays bearish.",
             f"But net Δ-weighted OI change is POSITIVE at key strikes [{_fmt_ks(_weak_ks)}] — call SELLERS are stronger than put buyers.",
             "The upside is capped by sellers rather than pressed by buyers → downside momentum is NOT strong.",
         ]
@@ -6710,7 +6711,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _mom_lbl = "—"
         _sc, _sbg = "#6B7280", "#F9FAFB"
         _key_ks   = "—"
-        _reason = [f"Avg raw CE/PE EV ratio is {_evr_avg:.2f} (≈1) — call and put premiums are balanced, so neither side has the edge."]
+        _reason = [f"Avg raw CE/PE EV ratio is {_evr_avg:.2f} (neutral zone 0.7–1.2) — call and put premiums are balanced, so neither side has the edge."]
 
     # ── 15-minute final-verdict history ──────────────────────────────────────
     # v14 (ported from Dash v15): the log's level column is now the GEX+Vega
@@ -6765,10 +6766,10 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
     if df_band_records:
         # ── Enhanced NDM v10 — per-strike Buyer/Seller Matrix ─────────────────────
         st.caption(
-            "BIAS comes from the raw CE/PE Extrinsic-Value ratio per strike: >1 = Call buyers & Put sellers → BULLISH; "
-            "<0.7 = Put buyers & Call sellers → BEARISH (0.7-1.0 is a NEUTRAL zone — no longer treated as bearish). "
+            "BIAS comes from the raw CE/PE Extrinsic-Value ratio per strike: >1.2 = Call buyers & Put sellers → BULLISH; "
+            "<0.7 = Put buyers & Call sellers → BEARISH (0.7-1.2 is a NEUTRAL zone — no longer treated as bearish). "
             "MOMENTUM comes from the Δ-weighted OI change per strike: "
-            "with EVR>1, positive NDM = Call BUYERS stronger → strong upside; negative NDM = Put SELLERS stronger → "
+            "with EVR>1.2, positive NDM = Call BUYERS stronger → strong upside; negative NDM = Put SELLERS stronger → "
             "bullish but weak. Exactly opposite for EVR<0.7. Strong opposite sellers on BOTH sides of spot → "
             "range-bound, pinning the ATM."
         )
@@ -6838,7 +6839,7 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
             with st.expander("📊 Strike-by-Strike Buyer/Seller Matrix Breakdown", expanded=False):
                 st.caption(
                     f"Avg raw CE/PE EV ratio this tick: **{_endm['evr_avg']:.3f}** → bias **{_endm['bias']}**. "
-                    "Per strike: EVR>1 = bullish bias · EVR<0.7 = bearish bias · 0.7-1.0 = neutral (no dominant "
+                    "Per strike: EVR>1.2 = bullish bias · EVR<0.7 = bearish bias · 0.7-1.2 = neutral (no dominant "
                     "aggressor). The NDM (Δ×ΔOI) sign then decides "
                     "WHO is stronger at that strike — buyers (strong momentum) or sellers (weak momentum)."
                 )
@@ -7002,17 +7003,18 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         _ev_bd["ev_c_adj"] = np.maximum(
             0, _ev_bd["ev_c"] - _ev_bd["strike"] * (1 - np.exp(-RISK_FREE_RATE * _T_ev)))
         _evr_raw_s = (_ev_bd["ev_c_adj"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
-        # ★ v13: per-strike initiation map — >1.05 call buyers/put sellers
-        # dominant (bullish), <0.95 put buyers/call sellers dominant (bearish).
+        # ★ v17: per-strike initiation map — >1.2 call buyers/put sellers
+        # dominant (bullish), <0.7 put buyers/call sellers dominant (bearish),
+        # 0.7-1.2 neutral/sideways.
         _s4_evmap = {int(k): float(v) for k, v in zip(_ev_bd["strike"], _evr_raw_s)}
         _evr_oiw_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi"]) /
                       (_ev_bd["ev_p"] * _ev_bd["put_oi"]).replace(0, np.nan)).fillna(1.0)
 
-        def _s4_evr_bar(vals, title, bear_thresh=1.0):
-            # v14: bearish (red) fires only below `bear_thresh`. Values that
-            # dip under 1.0 but stay at/above `bear_thresh` are shown amber
-            # (neutral) rather than red — they're no longer read as bearish.
-            _cols = [GREEN if v >= 1 else (RED if v < bear_thresh else AMBER) for v in vals]
+        def _s4_evr_bar(vals, title, bear_thresh=1.0, bull_thresh=1.0):
+            # v17: bullish (green) fires only at/above `bull_thresh`, bearish
+            # (red) only below `bear_thresh`. Values in between are the
+            # neutral/sideways zone — shown SKY BLUE (light blue, was orange).
+            _cols = [GREEN if v >= bull_thresh else (RED if v < bear_thresh else SKY) for v in vals]
             f = go.Figure(go.Bar(x=_ev_bd["strike"], y=vals - 1.0, base=1.0,
                                  marker_color=_cols, customdata=vals,
                                  hovertemplate="Strike %{x}<br>CE/PE EV Ratio: %{customdata:.3f}<extra></extra>"))
@@ -7026,19 +7028,19 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         # Row 3 — Raw CE/PE EV Ratio per Strike | Parity-Adj CE/PE EV Ratio per Strike
         # v16 (ported from Dash v15): f4 was "Call vs Put OI" — replaced with the
         # RAW (not parity-adjusted) strike-wise CE/PE EV ratio, using the same
-        # >1 green / 0.7-1 amber / <0.7 red threshold coloring as the Parity-Adj
-        # chart alongside it (via _s4_evr_bar, bear_thresh=0.7).
+        # >1.2 green / 0.7-1.2 sky blue / <0.7 red threshold coloring as the Parity-Adj
+        # chart alongside it (via _s4_evr_bar, bear_thresh=0.7, bull_thresh=1.2).
         _evr_true_raw_s = (_ev_bd["ev_c"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
         _s4_r3c1, _s4_r3c2 = st.columns(2)
         with _s4_r3c1:
             f4 = _s4_evr_bar(_evr_true_raw_s,
-                             f"★ Raw CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green≥1=Call buyers/Put sellers dominant · Amber 0.7-1=Neutral · Red<0.7=Put buyers/Call sellers dominant",
-                             bear_thresh=0.7)
+                             f"★ Raw CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1.2=Call buyers/Put sellers dominant · Sky Blue 0.7-1.2=Neutral/Sideways · Red<0.7=Put buyers/Call sellers dominant",
+                             bear_thresh=0.7, bull_thresh=1.2)
             st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
         with _s4_r3c2:
             f6 = _s4_evr_bar(_evr_raw_s,
-                             f"★ Parity-Adj CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green≥1=Call buyers/Put sellers dominant · Amber 0.7-1=Neutral · Red<0.7=Put buyers/Call sellers dominant",
-                             bear_thresh=0.7)
+                             f"★ Parity-Adj CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1.2=Call buyers/Put sellers dominant · Sky Blue 0.7-1.2=Neutral/Sideways · Red<0.7=Put buyers/Call sellers dominant",
+                             bear_thresh=0.7, bull_thresh=1.2)
             st.plotly_chart(f6, width='stretch', config={"displayModeBar":False})
 
         # ★ Strike-wise OI-CHANGE-Weighted CE/PE EV Ratio — per strike,
@@ -7121,12 +7123,12 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                 _conf = False
                 if _evr is None:
                     _evt = "EV: n/a (outside ATM band)"
-                elif _evr > 1.05:
+                elif _evr > 1.2:
                     _evt = f"EV {_evr:.2f}: call buyers / put sellers pressing (bullish)"
                     _conf = (_c == "#EF4444")
                     if _c in ("#F59E0B", "#64748B"):
                         _evt += " → lean bullish"
-                elif _evr < 0.95:
+                elif _evr < 0.7:
                     _evt = f"EV {_evr:.2f}: put buyers / call sellers pressing (bearish)"
                     _conf = (_c == "#22C55E")
                     if _c in ("#F59E0B", "#64748B"):
@@ -7136,7 +7138,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                 _txt = f"{_lbl} · ratio {v:.3f}<br>{_evt}"
                 if _conf:
                     _txt += ("<br>⚠ flow/premium CONFLICT — premium says "
-                             + ("call BUYERS drive this build (bullish)" if _evr > 1.05
+                             + ("call BUYERS drive this build (bullish)" if _evr > 1.2
                                 else "put BUYERS drive this build (bearish)"))
                 _cols.append(_c); _cd.append(_txt)
                 _lcols.append("#111827" if _conf else _c)
@@ -7286,9 +7288,9 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             for _, _r in _sub.iterrows():
                 _dcx, _dpx = float(_r["call_oi_chg"]), float(_r["put_oi_chg"])
                 _evr_k = _s4_evmap.get(int(_r["strike"]))
-                if _evr_k is not None and _evr_k > 1.05:
+                if _evr_k is not None and _evr_k > 1.2:
                     _v = 1
-                elif _evr_k is not None and _evr_k < 0.95:
+                elif _evr_k is not None and _evr_k < 0.7:
                     _v = -1
                 elif _dcx >= 0 and _dpx < 0:
                     _v = -1
@@ -7534,14 +7536,14 @@ else:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INTRADAY MARKET SUM UP  (surgical addition — renders into the reserved top
+# SHANTANU'S FINAL DECISION MATRIX  (surgical addition — renders into the reserved top
 # slot. No new calculations: Spot / Max Pain / Net GEX are the same values
 # from Section 3; Put Wall / Call Wall / Gamma Flip are the same snapshot
 # from the GEX+Vega Live Interpretation section; the chart is the same
 # Parity-Adj CE/PE EV Ratio figure (f6) — chart #6 of Section 4, reused as-is.
 # ─────────────────────────────────────────────────────────────────────────────
 with _slot_summary:
-    st.markdown('<div class="section-header">&#128204; Intraday Market Sum Up</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">&#128204; Shantanu&#39;s Final Decision Matrix</div>', unsafe_allow_html=True)
 
     _sum_cw  = _gv_levels_snapshot.get("call_wall")  if _gv_levels_snapshot else None
     _sum_pw  = _gv_levels_snapshot.get("put_wall")   if _gv_levels_snapshot else None
@@ -7574,6 +7576,155 @@ with _slot_summary:
         unsafe_allow_html=True)
     st.plotly_chart(f6, width='stretch', config={"displayModeBar": False},
                      key="summary_parity_evr_chart")
+
+    # ── Bias Summary (v17) — plain-English verdict with sticky alert state ──────
+    # Classifies every strike between the Put Wall and Call Wall using the SAME
+    # parity-adjusted CE/PE EV ratio map as the chart above (_s4_evmap):
+    # neutral/sideways 0.7-1.2 · bullish >1.2 · bearish <0.7.
+    #   • SIDEWAYS BIAS STRONG    — ≥70% of wall-to-wall strikes in the neutral band
+    #   • SIDEWAYS BIAS WEAKENING — neutral count shrinking vs the previous reading
+    #                               on one or both sides of ATM
+    #   • BREAKDOWN ALERT (RED)   — ALL of: spot within 1 strike of the Put Wall,
+    #     ATM bearish (<0.7) plus one/both ATM±1 bearish, and the Put Wall shifted
+    #     DOWN vs the previous reading
+    #   • BREAKOUT ALERT (DEEP GREEN) — exact mirror at the Call Wall
+    #   • Alert bias is STICKY — held until ATM and BOTH ATM±1 strikes return to
+    #     the neutral band, then reverts to SIDEWAYS.
+    try:
+        _bs_file = os.path.join(_BASE_DIR, "bias_summary_state_streamlit.json")
+        _bs_pw   = int(_sum_pw) if _sum_pw is not None else None
+        _bs_cw   = int(_sum_cw) if _sum_cw is not None else None
+        _bs_atm  = int(float(m.get("atm", 0) or 0))
+        _bs_step = int(NIFTY_STEP)
+        _bs_ts   = str(payload.get("ts_ist", ""))
+
+        def _bs_cls(_v):
+            if _v is None or not np.isfinite(_v): return None
+            return 1 if _v > 1.2 else (-1 if _v < 0.7 else 0)
+
+        _bs_map = {int(_k): _bs_cls(float(_v)) for _k, _v in _s4_evmap.items()}
+        if _bs_pw is not None and _bs_cw is not None:
+            _bs_ks = sorted(_k for _k in _bs_map if _bs_pw <= _k <= _bs_cw)
+            if not _bs_ks:                      # walls beyond the EV band — use all
+                _bs_ks = sorted(_bs_map)
+        else:
+            _bs_ks = sorted(_bs_map)
+        _bs_tot    = sum(1 for _k in _bs_ks if _bs_map[_k] is not None)
+        _bs_neu    = sum(1 for _k in _bs_ks if _bs_map[_k] == 0)
+        _bs_neu_lo = sum(1 for _k in _bs_ks if _k < _bs_atm and _bs_map[_k] == 0)
+        _bs_neu_hi = sum(1 for _k in _bs_ks if _k > _bs_atm and _bs_map[_k] == 0)
+        _bs_frac   = (_bs_neu / _bs_tot) if _bs_tot else 0.0
+        _c_atm = _bs_map.get(_bs_atm)
+        _c_up  = _bs_map.get(_bs_atm + _bs_step)
+        _c_dn  = _bs_map.get(_bs_atm - _bs_step)
+
+        _bs_today = date.today().isoformat()
+        try:
+            with open(_bs_file, "r", encoding="utf-8") as _fh:
+                _bs_prev = json.load(_fh)
+            if _bs_prev.get("date") != _bs_today: _bs_prev = {}
+        except Exception:
+            _bs_prev = {}
+        _prev_pw, _prev_cw = _bs_prev.get("put_wall"), _bs_prev.get("call_wall")
+        _prev_lo, _prev_hi = _bs_prev.get("neu_lo"),   _bs_prev.get("neu_hi")
+        _prev_bias         = _bs_prev.get("bias", "SIDEWAYS")
+
+        _near_pw  = _bs_pw is not None and spot <= _bs_pw + _bs_step
+        _near_cw  = _bs_cw is not None and spot >= _bs_cw - _bs_step
+        _pw_down  = _bs_pw is not None and _prev_pw is not None and _bs_pw < _prev_pw
+        _cw_up    = _bs_cw is not None and _prev_cw is not None and _bs_cw > _prev_cw
+        _atm_bear = _c_atm == -1 and (-1 in (_c_up, _c_dn))
+        _atm_bull = _c_atm == 1  and (1  in (_c_up, _c_dn))
+        _neutral_again = _c_atm == 0 and _c_up == 0 and _c_dn == 0
+
+        _fresh_dn = _near_pw and _atm_bear and _pw_down   # ALL criteria — no partial fire
+        _fresh_up = _near_cw and _atm_bull and _cw_up
+        if _fresh_dn:
+            _bs_bias = "BEARISH"
+        elif _fresh_up:
+            _bs_bias = "BULLISH"
+        elif _prev_bias in ("BEARISH", "BULLISH") and not _neutral_again:
+            _bs_bias = _prev_bias                          # sticky — hold the alert
+        else:
+            _bs_bias = "SIDEWAYS"
+
+        _lo_dec = _prev_lo is not None and _bs_neu_lo < _prev_lo
+        _hi_dec = _prev_hi is not None and _bs_neu_hi < _prev_hi
+        _weakening = _lo_dec or _hi_dec
+        _rng_txt = (f"{_bs_pw:,} – {_bs_cw:,}"
+                    if (_bs_pw is not None and _bs_cw is not None) else "walls N/A")
+
+        if _bs_bias == "BEARISH":
+            _bs_col, _bs_bg = "#DC2626", "#FEE2E2"
+            _bs_head = "🚨 BREAKDOWN ALERT — BEARISH BIAS"
+            if _fresh_dn:
+                _bs_lines = [
+                    f"Spot {spot:,.0f} is testing the Put Wall {_bs_pw:,} (within 1 strike) — the support floor is under attack.",
+                    f"ATM {_bs_atm:,} plus adjacent strike(s) show bearish EV pressure (ratio < 0.7) — put buyers / call sellers dominate right where the market sits.",
+                    f"The Put Wall has shifted DOWN vs the previous reading ({_prev_pw:,} → {_bs_pw:,}) — put writers are retreating to lower strikes.",
+                    "All three breakdown criteria are met → a downside break is in play.",
+                ]
+            else:
+                _bs_lines = [
+                    "Breakdown conditions fired earlier today — bias is HELD at BEARISH.",
+                    f"It reverts to SIDEWAYS only when ATM {_bs_atm:,} and BOTH ATM±1 strikes return to the neutral EV band (0.7–1.2).",
+                ]
+        elif _bs_bias == "BULLISH":
+            _bs_col, _bs_bg = "#047857", "#D1FAE5"
+            _bs_head = "🚀 BREAKOUT ALERT — BULLISH BIAS"
+            if _fresh_up:
+                _bs_lines = [
+                    f"Spot {spot:,.0f} is testing the Call Wall {_bs_cw:,} (within 1 strike) — the resistance ceiling is under attack.",
+                    f"ATM {_bs_atm:,} plus adjacent strike(s) show bullish EV pressure (ratio > 1.2) — call buyers / put sellers dominate right where the market sits.",
+                    f"The Call Wall has shifted UP vs the previous reading ({_prev_cw:,} → {_bs_cw:,}) — call writers are retreating to higher strikes.",
+                    "All three breakout criteria are met → an upside break is in play.",
+                ]
+            else:
+                _bs_lines = [
+                    "Breakout conditions fired earlier today — bias is HELD at BULLISH.",
+                    f"It reverts to SIDEWAYS only when ATM {_bs_atm:,} and BOTH ATM±1 strikes return to the neutral EV band (0.7–1.2).",
+                ]
+        else:
+            _bs_col, _bs_bg = "#0EA5E9", "#E0F2FE"
+            if _weakening:
+                _bs_side = ("both sides" if (_lo_dec and _hi_dec)
+                            else ("the Put-Wall side" if _lo_dec else "the Call-Wall side"))
+                _bs_head = f"🔷 SIDEWAYS BIAS — WEAKENING · Range {_rng_txt}"
+                _bs_lines = [
+                    f"Neutral strikes are reducing on {_bs_side} of ATM vs the previous reading — now {_bs_neu} of {_bs_tot} wall-to-wall strikes in the neutral EV band (0.7–1.2).",
+                    "The range is losing sponsorship — watch the walls closely; no breakout/breakdown criteria have been met yet.",
+                ]
+            elif _bs_frac >= 0.70:
+                _bs_head = f"🔷 SIDEWAYS BIAS — STRONG · Range {_rng_txt}"
+                _bs_lines = [
+                    f"{_bs_neu} of {_bs_tot} strikes between the Put Wall and Call Wall sit in the neutral EV band (0.7–1.2) — no side has the edge at or around ATM.",
+                    f"Option writers are defending both walls — expect price to stay range-bound between {_rng_txt}.",
+                ]
+            else:
+                _bs_head = f"🔷 SIDEWAYS BIAS · Range {_rng_txt}"
+                _bs_lines = [
+                    f"Only {_bs_neu} of {_bs_tot} wall-to-wall strikes are neutral (below the 70% 'strong' threshold), but no breakout/breakdown criteria are met either.",
+                    "Default stance stays sideways until the wall-shift + ATM±1 criteria fire.",
+                ]
+
+        if _bs_prev.get("ts") != _bs_ts:   # persist once per data tick (not per rerender)
+            _atomic_json_write(_bs_file, {
+                "date": _bs_today, "ts": _bs_ts, "put_wall": _bs_pw, "call_wall": _bs_cw,
+                "neu_lo": _bs_neu_lo, "neu_hi": _bs_neu_hi, "neutral_count": _bs_neu,
+                "bias": _bs_bias})
+        _bs_bullets = ''.join(
+            f'<div style="font-size:13px;color:#111;margin-top:3px;">• {_l}</div>'
+            for _l in _bs_lines)
+        st.markdown(f"""
+        <div style="background:{_bs_bg};border:2px solid {_bs_col};border-radius:10px;
+                    padding:12px 16px;margin-top:12px;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Bias Summary</div>
+          <div style="font-size:20px;font-weight:900;color:{_bs_col};margin:2px 0 6px;">{_bs_head}</div>
+          {_bs_bullets}
+        </div>""", unsafe_allow_html=True)
+    except Exception as _bs_err:
+        st.info(f"Bias Summary — collecting data ({_bs_err}).")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7655,7 +7806,7 @@ with _slot_s2:   # v8: render into top-of-dashboard slot (display order only)
         mc = st.columns(4)
         metric_items = [
             ("EV Ratio (Raw Avg)", m.get("ev_ratio_avg_strikewise", 1.0),
-                 GREEN if m.get("ev_ratio_avg_strikewise", 1.0)>=1.05 else (AMBER if m.get("ev_ratio_avg_strikewise", 1.0)>=0.95 else RED)),
+                 GREEN if m.get("ev_ratio_avg_strikewise", 1.0)>1.2 else (SKY if m.get("ev_ratio_avg_strikewise", 1.0)>=0.7 else RED)),
             ("EV Ratio (OI-Wtd Avg)", m.get("ev_ratio_oiw_avg_strikewise", 1.0),
                  GREEN if m.get("ev_ratio_oiw_avg_strikewise", 1.0)>=1.05 else (AMBER if m.get("ev_ratio_oiw_avg_strikewise", 1.0)>=0.95 else RED)),
             ("Net Delta", f"{int(m['net_delta']):,}", GREEN if m["net_delta"]>0 else RED),
