@@ -261,11 +261,11 @@ def _render_owner_sidebar(expiry_list):
             # refresh cycle (up to `refresh_interval` seconds later). That's
             # the actual reason it looked "broken" — fixed by force-expiring
             # the server cache immediately on change, same as the expiry selector.
-            _VEGA_BAND_OPTIONS = {"±3 strikes (150 pts) — default": 3,
-                                  "±5 strikes (250 pts)": 5}
-            _saved_vb = _cur_settings.get("vega_band_strikes", 3)
+            _VEGA_BAND_OPTIONS = {"±3 strikes (150 pts)": 3,
+                                  "±5 strikes (250 pts) — default": 5}
+            _saved_vb = _cur_settings.get("vega_band_strikes", 5)
             _vb_label = next((k for k, v in _VEGA_BAND_OPTIONS.items() if v == _saved_vb),
-                             "±3 strikes (150 pts) — default")
+                             "±5 strikes (250 pts) — default")
             _chosen_vb = st.selectbox(
                 "📐 ATM Vega band width",
                 list(_VEGA_BAND_OPTIONS.keys()),
@@ -1179,9 +1179,9 @@ def compute_metrics(df, spot, expiry=None, history=None):
     # Ratio). Loaded here (pre-backfill) since only band membership is needed,
     # not vega values themselves — those are captured separately below.
     try:
-        _zband_n = int(_load_owner_settings().get("vega_band_strikes", 3))
+        _zband_n = int(_load_owner_settings().get("vega_band_strikes", 5))
     except Exception:
-        _zband_n = 3
+        _zband_n = 5
     _zband_lo = atm - _zband_n * NIFTY_STEP
     _zband_hi = atm + _zband_n * NIFTY_STEP
     t_band = t[t["strike"].between(_zband_lo, _zband_hi)]
@@ -1301,9 +1301,9 @@ def compute_metrics(df, spot, expiry=None, history=None):
     # Placed here (after IV+greek backfill) so we always read filled vega values.
     try:
         _vb_settings  = _load_owner_settings()
-        _vega_band_n  = int(_vb_settings.get("vega_band_strikes", 3))
+        _vega_band_n  = int(_vb_settings.get("vega_band_strikes", 5))
     except Exception:
-        _vega_band_n  = 3
+        _vega_band_n  = 5
     _vb_lo = atm - _vega_band_n * NIFTY_STEP
     _vb_hi = atm + _vega_band_n * NIFTY_STEP
     _vb_df = w[w["strike"].between(_vb_lo, _vb_hi)].copy()
@@ -3655,7 +3655,7 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
         # "ATM Vega band width" setting — the underlying vega/EV values were
         # always computed with the correct configured band, only the chart
         # title/label silently showed the wrong number of strikes.
-        "vega_band_strikes": m.get("vega_band_strikes", 3),
+        "vega_band_strikes": m.get("vega_band_strikes", 5),
         "call_oi_total":call_oi_total,
         "put_oi_total": put_oi_total,
         "synth_excess": synth_excess,
@@ -6908,6 +6908,10 @@ with _slot_s3:   # v8: render into top-of-dashboard slot (display order only)
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4: STRIKE-WISE CHARTS (Structural Band ±10)
 # ─────────────────────────────────────────────────────────────────────────────
+# v18.1 (DEX wiring): module-level defaults — populated inside Section 4 when
+# band data is available; the Final Decision Matrix reads them defensively.
+_dex_map, _dexm_map = {}, {}
+
 with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
     st.markdown('<div class="section-header"> Section 4  Strike-wise Charts (Structural Band ±10)</div>', unsafe_allow_html=True)
 
@@ -6921,6 +6925,13 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         dc = [RED if v>0 else GREEN for v in dv]
         mv = (df_band["call_oi_chg"] * call_delta_abs) - (df_band["put_oi_chg"] * put_delta_abs)
         mc = [RED if v>0 else GREEN for v in mv]
+
+        # v18.1 (DEX wiring): strike-wise net-delta exposure maps — dv (the
+        # STOCK of positioning) and mv (the intraday FLOW), keyed by strike.
+        # Same series as the two charts above; consumed by the Final Decision
+        # Matrix for Wall Load, alert grading, DEX tilt and sticky release.
+        _dex_map.update({int(_k): float(_v) for _k, _v in zip(x, dv)})
+        _dexm_map.update({int(_k): float(_v) for _k, _v in zip(x, mv)})
 
         # ── v8: shared cosmetic styler — clear, colour-coded, well-positioned
         # titles + annotated Spot line + titled axes. Cosmetic only, no calc change.
@@ -6982,7 +6993,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         # (compute_metrics: ev_c/ev_p and ev_c×CallOI / ev_p×PutOI), over the
         # SAME shared ATM±vega_band_strikes band. Baseline = 1 (bars extend
         # above/below it): >1 = Call extrinsic rich, <1 = Put extrinsic rich.
-        _ev_band_n = int(m.get("vega_band_strikes", 3))
+        _ev_band_n = int(m.get("vega_band_strikes", 5))
         _ev_atm_k  = safe_num(m.get("atm", 0))
         _ev_bd = df_band[df_band["strike"].between(
             _ev_atm_k - _ev_band_n * NIFTY_STEP,
@@ -7039,7 +7050,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
         with _s4_r3c2:
             f6 = _s4_evr_bar(_evr_raw_s,
-                             f"★ Parity-Adj CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1.2=Call buyers/Put sellers dominant · Sky Blue 0.7-1.2=Neutral/Sideways · Red<0.7=Put buyers/Call sellers dominant",
+                             f"★ Shantanu's Proprietary Strike-wise Sentiment (ATM±{_ev_band_n}) · Baseline=1 · Green>1.2=Call buyers/Put sellers dominant · Sky Blue 0.7-1.2=Neutral/Sideways · Red<0.7=Put buyers/Call sellers dominant",
                              bear_thresh=0.7, bull_thresh=1.2)
             st.plotly_chart(f6, width='stretch', config={"displayModeBar":False})
 
@@ -7335,7 +7346,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                     f'<div style="font-size:11.5px;color:#374151;margin-bottom:6px;">'
                     f'In plain English: for every ATM strike we ask two questions — WHO is adding or '
                     f'removing positions (the OI-change quadrant), and WHO is setting the price '
-                    f'(parity-adjusted premium pressure: buyers paying up, or writers pressing it down). '
+                    f'(Shantanu&#39;s Proprietary Strike-wise Sentiment: buyers paying up, or writers pressing it down). '
                     f'When the two disagree, premium pressure wins, because it reveals the aggressive side. '
                     f'The verdict is the premium-weighted sum of those per-strike answers '
                     f'(−1 fully bearish … +1 fully bullish).</div>'
@@ -7549,12 +7560,26 @@ with _slot_summary:
     _sum_pw  = _gv_levels_snapshot.get("put_wall")   if _gv_levels_snapshot else None
     _sum_gfl = _gv_levels_snapshot.get("gamma_flip") if _gv_levels_snapshot else gflip_str
 
+    # v18.1 (Suggestion 1): Wall Load — |strike-wise net-delta exposure (dv)|
+    # at each wall strike as % of the band's max |dv|. High load = wall backed
+    # by heavy dealer positioning (defended); low = hollow wall.
+    _dex_absmax = max((abs(_v) for _v in _dex_map.values()), default=0.0)
+    def _wall_load(_k):
+        if _k is None or _dex_absmax <= 0:
+            return None
+        _v = _dex_map.get(int(_k))
+        return None if _v is None else int(round(100.0 * abs(_v) / _dex_absmax))
+    _pw_load = _wall_load(_sum_pw)
+    _cw_load = _wall_load(_sum_cw)
+
     _sum_items = [
         ("Spot",       f"{spot:,.2f}",              GREEN if spot_vs_atm >= 0 else RED, f"vs ATM {spot_vs_atm:+.1f}"),
         ("Max Pain",   f"{int(m['max_pain']):,}",   PINK,                               "Writer equilibrium"),
         ("Net GEX",    f"{gex_val:,.0f}",           GREEN if gex_val > 0 else RED,      "+ve=pin / -ve=trend"),
-        ("Put Wall",   f"{_sum_pw:,}" if _sum_pw is not None else "N/A",   GREEN,       "GEX support floor"),
-        ("Call Wall",  f"{_sum_cw:,}" if _sum_cw is not None else "N/A",   RED,         "GEX resistance ceiling"),
+        ("Put Wall",   f"{_sum_pw:,}" if _sum_pw is not None else "N/A",   GREEN,
+                        "GEX support floor" + (f" · load {_pw_load}%" if _pw_load is not None else "")),
+        ("Call Wall",  f"{_sum_cw:,}" if _sum_cw is not None else "N/A",   RED,
+                        "GEX resistance ceiling" + (f" · load {_cw_load}%" if _cw_load is not None else "")),
         ("Gamma Flip", _sum_gfl if _sum_gfl else "N/A",
                         RED if (gflip and spot < gflip) else GREEN,
                         ("Short-γ zone" if gflip and spot < gflip else "Above flip")),
@@ -7572,7 +7597,7 @@ with _slot_summary:
     st.markdown(
         '<div style="font-size:12px;font-weight:700;color:#6B7280;'
         'text-transform:uppercase;margin:14px 0 4px;">'
-        'Parity-Adj CE/PE EV Ratio per Strike (Section 4, chart 6)</div>',
+        'Shantanu&#39;s Proprietary Strike-wise Sentiment (Section 4, chart 6)</div>',
         unsafe_allow_html=True)
     st.plotly_chart(f6, width='stretch', config={"displayModeBar": False},
                      key="summary_parity_evr_chart")
@@ -7641,18 +7666,45 @@ with _slot_summary:
 
         _fresh_dn = _near_pw and _atm_bear and _pw_down   # ALL criteria — no partial fire
         _fresh_up = _near_cw and _atm_bull and _cw_up
+
+        # v18.1 (Suggestion 2): DEX-flow grade at the tested wall — mv (Δ-wtd
+        # OI change) AT the wall strike. Call Wall: mv < 0 = call-side OI
+        # unwinding (writers covering) → Grade A breakout; mv ≥ 0 = still
+        # building (writers reinforcing) → Grade B attempt. Mirror at Put Wall.
+        _cw_mv = _dexm_map.get(int(_bs_cw)) if _bs_cw is not None else None
+        _pw_mv = _dexm_map.get(int(_bs_pw)) if _bs_pw is not None else None
+        _up_grade = None if _cw_mv is None else ("A" if _cw_mv < 0 else "B")
+        _dn_grade = None if _pw_mv is None else ("A" if _pw_mv > 0 else "B")
+
+        # v18.1 (Suggestion 5): sticky release — if the broken wall's DEX load
+        # has rebuilt to ≥70% of the band max, treat the break as failed and
+        # release the held alert even before ATM±1 turn neutral again.
+        _rebuilt = ((_prev_bias == "BULLISH" and not _fresh_up and _cw_load is not None and _cw_load >= 70) or
+                    (_prev_bias == "BEARISH" and not _fresh_dn and _pw_load is not None and _pw_load >= 70))
+
         if _fresh_dn:
             _bs_bias = "BEARISH"
         elif _fresh_up:
             _bs_bias = "BULLISH"
-        elif _prev_bias in ("BEARISH", "BULLISH") and not _neutral_again:
+        elif _prev_bias in ("BEARISH", "BULLISH") and not _neutral_again and not _rebuilt:
             _bs_bias = _prev_bias                          # sticky — hold the alert
         else:
             _bs_bias = "SIDEWAYS"
 
         _lo_dec = _prev_lo is not None and _bs_neu_lo < _prev_lo
         _hi_dec = _prev_hi is not None and _bs_neu_hi < _prev_hi
-        _weakening = _lo_dec or _hi_dec
+        # v18.1 (Suggestion 3): DEX tilt — support-side vs resistance-side
+        # positioning weight (Σ|dv|) between the walls. Balanced tilt confirms
+        # a genuine sideways day; a lopsided tilt (|tilt| ≥ 0.40) is an early,
+        # EV-independent WEAKENING trigger.
+        _tilt_sup = sum(abs(_v) for _k, _v in _dex_map.items()
+                        if _k < spot and (_bs_pw is None or _k >= _bs_pw))
+        _tilt_res = sum(abs(_v) for _k, _v in _dex_map.items()
+                        if _k > spot and (_bs_cw is None or _k <= _bs_cw))
+        _tilt_den = _tilt_sup + _tilt_res
+        _dex_tilt = ((_tilt_sup - _tilt_res) / _tilt_den) if _tilt_den > 0 else 0.0
+        _tilt_weak = _tilt_den > 0 and abs(_dex_tilt) >= 0.40
+        _weakening = _lo_dec or _hi_dec or _tilt_weak
         _rng_txt = (f"{_bs_pw:,} – {_bs_cw:,}"
                     if (_bs_pw is not None and _bs_cw is not None) else "walls N/A")
 
@@ -7660,12 +7712,18 @@ with _slot_summary:
             _bs_col, _bs_bg = "#DC2626", "#FEE2E2"
             _bs_head = "🚨 BREAKDOWN ALERT — BEARISH BIAS"
             if _fresh_dn:
+                if _dn_grade is not None:              # v18.1 (Suggestion 2)
+                    _bs_head += f" · Grade {_dn_grade}"
                 _bs_lines = [
                     f"Spot {spot:,.0f} is testing the Put Wall {_bs_pw:,} (within 1 strike) — the support floor is under attack.",
                     f"ATM {_bs_atm:,} plus adjacent strike(s) show bearish EV pressure (ratio < 0.7) — put buyers / call sellers dominate right where the market sits.",
                     f"The Put Wall has shifted DOWN vs the previous reading ({_prev_pw:,} → {_bs_pw:,}) — put writers are retreating to lower strikes.",
                     "All three breakdown criteria are met → a downside break is in play.",
                 ]
+                if _dn_grade == "A":                   # v18.1 (Suggestion 2)
+                    _bs_lines.append(f"Grade A — Δ-weighted OI flow at the Put Wall {_bs_pw:,} shows put writers UNWINDING: high-conviction break.")
+                elif _dn_grade == "B":
+                    _bs_lines.append(f"Grade B — put-side OI is still BUILDING at the Put Wall {_bs_pw:,} (writers reinforcing): break attempt may fail.")
             else:
                 _bs_lines = [
                     "Breakdown conditions fired earlier today — bias is HELD at BEARISH.",
@@ -7675,12 +7733,18 @@ with _slot_summary:
             _bs_col, _bs_bg = "#047857", "#D1FAE5"
             _bs_head = "🚀 BREAKOUT ALERT — BULLISH BIAS"
             if _fresh_up:
+                if _up_grade is not None:              # v18.1 (Suggestion 2)
+                    _bs_head += f" · Grade {_up_grade}"
                 _bs_lines = [
                     f"Spot {spot:,.0f} is testing the Call Wall {_bs_cw:,} (within 1 strike) — the resistance ceiling is under attack.",
                     f"ATM {_bs_atm:,} plus adjacent strike(s) show bullish EV pressure (ratio > 1.2) — call buyers / put sellers dominate right where the market sits.",
                     f"The Call Wall has shifted UP vs the previous reading ({_prev_cw:,} → {_bs_cw:,}) — call writers are retreating to higher strikes.",
                     "All three breakout criteria are met → an upside break is in play.",
                 ]
+                if _up_grade == "A":                   # v18.1 (Suggestion 2)
+                    _bs_lines.append(f"Grade A — Δ-weighted OI flow at the Call Wall {_bs_cw:,} shows call writers UNWINDING: high-conviction break.")
+                elif _up_grade == "B":
+                    _bs_lines.append(f"Grade B — call-side OI is still BUILDING at the Call Wall {_bs_cw:,} (writers reinforcing): break attempt may fail.")
             else:
                 _bs_lines = [
                     "Breakout conditions fired earlier today — bias is HELD at BULLISH.",
@@ -7689,19 +7753,31 @@ with _slot_summary:
         else:
             _bs_col, _bs_bg = "#0EA5E9", "#E0F2FE"
             if _weakening:
-                _bs_side = ("both sides" if (_lo_dec and _hi_dec)
-                            else ("the Put-Wall side" if _lo_dec else "the Call-Wall side"))
                 _bs_head = f"🔷 SIDEWAYS BIAS — WEAKENING · Range {_rng_txt}"
-                _bs_lines = [
-                    f"Neutral strikes are reducing on {_bs_side} of ATM vs the previous reading — now {_bs_neu} of {_bs_tot} wall-to-wall strikes in the neutral EV band (0.7–1.2).",
-                    "The range is losing sponsorship — watch the walls closely; no breakout/breakdown criteria have been met yet.",
-                ]
+                _bs_lines = []
+                if _lo_dec or _hi_dec:
+                    _bs_side = ("both sides" if (_lo_dec and _hi_dec)
+                                else ("the Put-Wall side" if _lo_dec else "the Call-Wall side"))
+                    _bs_lines += [
+                        f"Neutral strikes are reducing on {_bs_side} of ATM vs the previous reading — now {_bs_neu} of {_bs_tot} wall-to-wall strikes in the neutral EV band (0.7–1.2).",
+                        "The range is losing sponsorship — watch the walls closely; no breakout/breakdown criteria have been met yet.",
+                    ]
+                if _tilt_weak:                         # v18.1 (Suggestion 3)
+                    _tilt_side = "support (Put-Wall)" if _dex_tilt > 0 else "resistance (Call-Wall)"
+                    _bs_lines.append(
+                        f"DEX balance check: dealer positioning is lopsided toward the {_tilt_side} side "
+                        f"(tilt {_dex_tilt:+.0%}) — the range is tilting before the EV ratios show it.")
+                if not (_lo_dec or _hi_dec):
+                    _bs_lines.append("No breakout/breakdown criteria met yet — stance stays SIDEWAYS but conviction is reduced.")
             elif _bs_frac >= 0.70:
                 _bs_head = f"🔷 SIDEWAYS BIAS — STRONG · Range {_rng_txt}"
                 _bs_lines = [
                     f"{_bs_neu} of {_bs_tot} strikes between the Put Wall and Call Wall sit in the neutral EV band (0.7–1.2) — no side has the edge at or around ATM.",
                     f"Option writers are defending both walls — expect price to stay range-bound between {_rng_txt}.",
                 ]
+                if _tilt_den > 0:                      # v18.1 (Suggestion 3)
+                    _bs_lines.append(
+                        f"DEX balance check: positioning weight is balanced across the range (tilt {_dex_tilt:+.0%}) — confirms the sideways structure.")
             else:
                 _bs_head = f"🔷 SIDEWAYS BIAS · Range {_rng_txt}"
                 _bs_lines = [
@@ -7716,6 +7792,11 @@ with _slot_summary:
                 _bs_lines.append(f"SUPPORT (Put Wall) moving {'UP' if _bs_pw > _prev_pw else 'DOWN'} — {_prev_pw:,} → {_bs_pw:,} vs previous data refresh.")
             if _bs_cw is not None and _prev_cw is not None and _bs_cw != _prev_cw:
                 _bs_lines.append(f"RESISTANCE (Call Wall) moving {'UP' if _bs_cw > _prev_cw else 'DOWN'} — {_prev_cw:,} → {_bs_cw:,} vs previous data refresh.")
+            # v18.1 (Suggestion 5): note when a held alert was released because
+            # the broken wall's DEX load rebuilt (failed break).
+            if _rebuilt and _prev_bias in ("BEARISH", "BULLISH"):
+                _bs_wall_txt = "Call Wall" if _prev_bias == "BULLISH" else "Put Wall"
+                _bs_lines.append(f"Held {_prev_bias} alert RELEASED — the {_bs_wall_txt}'s DEX load has rebuilt to ≥70% of band max: failed break, back to SIDEWAYS.")
 
         # v17.2: one-line Max Pain movement note vs the previous data refresh.
         if _bs_mp is not None and _prev_mp is not None and _bs_mp != _prev_mp:
