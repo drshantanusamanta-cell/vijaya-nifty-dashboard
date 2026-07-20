@@ -4933,7 +4933,7 @@ _slot_sv    = st.container()   # v10: Shantanu's View — renders at the very to
 _slot_s3    = st.container()   # Section 3 — Key Price Levels
 _slot_s4    = st.container()   # Section 4 — Strike-wise Charts (4 rows × 2)
 _slot_s2    = st.container()   # Section 2 — Bias Engine · Strategy · Key Metrics
-_slot_gamma = st.container()   # Gamma & Vega Live Interpretation
+_slot_gamma = st.empty()      # Gamma & Vega Live Interpretation — v20: visuals hidden, calculations preserved
 _slot_s10   = st.container()   # Section 10 — Basis Triangulation
 
 # v14 (ported from Dash v15): module-level default so Shantanu's View can
@@ -4944,103 +4944,112 @@ _gv_levels_snapshot = None
 
 
 # ── Render the Enhanced Bias Panel at the top of the dashboard ───────────────
-_render_enhanced_bias_panel(
-    _enhanced_bias, _vwap_or_data, _ts_data, _vix_data, _combined_decision, spot, m
-)
+_ph_hidden_eb = st.empty()   # v20: Enhanced Market Bias visuals hidden — calculations preserved
+with _ph_hidden_eb.container():
+    _render_enhanced_bias_panel(
+        _enhanced_bias, _vwap_or_data, _ts_data, _vix_data, _combined_decision, spot, m
+    )
+_ph_hidden_eb.empty()        # v20: Enhanced Market Bias visual output suppressed
 # ══ END ENHANCED BIAS PANEL ═══════════════════════════════════════════════════
 
-st.markdown(
-    '<div class="section-header">&#128300; Greek Risk Framework &mdash; Hedge-Flow Pressure &amp; Confidence</div>',
-    unsafe_allow_html=True)
-st.markdown(f"""
-<div style="background:#fff;border:1.5px solid {_grf['cc']};border-radius:10px;
-     padding:14px 18px 12px 22px;margin-bottom:14px;position:relative;">
-  <div style="position:absolute;left:0;top:0;bottom:0;width:5px;
-       background:{_grf['cc']};border-radius:10px 0 0 10px;"></div>
+_ph_hidden_grf = st.empty()   # v20: Greek Risk Framework visuals hidden — calculations preserved
+with _ph_hidden_grf.container():
+    st.markdown(
+        '<div class="section-header">&#128300; Greek Risk Framework &mdash; Hedge-Flow Pressure &amp; Confidence</div>',
+        unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style="background:#fff;border:1.5px solid {_grf['cc']};border-radius:10px;
+         padding:14px 18px 12px 22px;margin-bottom:14px;position:relative;">
+      <div style="position:absolute;left:0;top:0;bottom:0;width:5px;
+           background:{_grf['cc']};border-radius:10px 0 0 10px;"></div>
 
-  <!-- Row 1: bias badge + conviction + range/size -->
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
-    <span style="background:{_grf_dc}22;color:{_grf_dc};border:1px solid {_grf_dc};
-          border-radius:6px;padding:3px 12px;font-size:13px;font-weight:800;">
-      {_grf['bias_s']}
-    </span>
-    <span style="background:{_grf['cc']}22;color:{_grf['cc']};border:1px solid {_grf['cc']};
-          border-radius:6px;padding:2px 10px;font-size:12px;font-weight:700;">
-      {_grf['conv']} &nbsp;·&nbsp; {_grf['total']}/10
-    </span>
-    <span style="font-size:11px;color:#6B7280;margin-left:auto;">
-      Gamma range: <strong>{_grf['gamma_range']}</strong>
-      &nbsp;·&nbsp; Position size: <strong style="color:{_grf['cc']};">{_grf['sl']}</strong>
-    </span>
-  </div>
+      <!-- Row 1: bias badge + conviction + range/size -->
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <span style="background:{_grf_dc}22;color:{_grf_dc};border:1px solid {_grf_dc};
+              border-radius:6px;padding:3px 12px;font-size:13px;font-weight:800;">
+          {_grf['bias_s']}
+        </span>
+        <span style="background:{_grf['cc']}22;color:{_grf['cc']};border:1px solid {_grf['cc']};
+              border-radius:6px;padding:2px 10px;font-size:12px;font-weight:700;">
+          {_grf['conv']} &nbsp;·&nbsp; {_grf['total']}/10
+        </span>
+        <span style="font-size:11px;color:#6B7280;margin-left:auto;">
+          Gamma range: <strong>{_grf['gamma_range']}</strong>
+          &nbsp;·&nbsp; Position size: <strong style="color:{_grf['cc']};">{_grf['sl']}</strong>
+        </span>
+      </div>
 
-  <!-- Row 2: sub-score progress bars -->
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:10px;">
-    <div>
-      <div style="font-size:11px;font-weight:600;color:#6B7280;">
-        Gamma · Range quality &nbsp;<strong style="color:#1A1A2E;">{_grf['g']}/3</strong>
+      <!-- Row 2: sub-score progress bars -->
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:10px;">
+        <div>
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">
+            Gamma · Range quality &nbsp;<strong style="color:#1A1A2E;">{_grf['g']}/3</strong>
+          </div>
+          {_gbar(_grf['g'], 3, '#5DCAA5')}
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">
+            Delta · Equilibrium &nbsp;<strong style="color:#1A1A2E;">{_grf['d']}/3</strong>
+          </div>
+          {_gbar(_grf['d'], 3, '#378ADD')}
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">
+            Momentum · Flow &nbsp;<strong style="color:#1A1A2E;">{_grf['ms']}/4</strong>
+          </div>
+          {_gbar(_grf['ms'], 4, '#7F77DD')}
+        </div>
       </div>
-      {_gbar(_grf['g'], 3, '#5DCAA5')}
-    </div>
-    <div>
-      <div style="font-size:11px;font-weight:600;color:#6B7280;">
-        Delta · Equilibrium &nbsp;<strong style="color:#1A1A2E;">{_grf['d']}/3</strong>
-      </div>
-      {_gbar(_grf['d'], 3, '#378ADD')}
-    </div>
-    <div>
-      <div style="font-size:11px;font-weight:600;color:#6B7280;">
-        Momentum · Flow &nbsp;<strong style="color:#1A1A2E;">{_grf['ms']}/4</strong>
-      </div>
-      {_gbar(_grf['ms'], 4, '#7F77DD')}
-    </div>
-  </div>
 
-  <!-- Row 3: key signals + recommendation -->
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;
-       padding-top:10px;border-top:1px solid #F3F4F6;">
-    <div>
-      <div style="font-size:11px;font-weight:700;color:#374151;margin-bottom:4px;">Key signals</div>
-      {_grf_fac_html}
-    </div>
-    <div style="background:{_grf['cc']}22;border-radius:8px;padding:10px 12px;">
-      <div style="font-size:11px;font-weight:700;color:{_grf['cc']};margin-bottom:4px;">
-        Recommendation
+      <!-- Row 3: key signals + recommendation -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;
+           padding-top:10px;border-top:1px solid #F3F4F6;">
+        <div>
+          <div style="font-size:11px;font-weight:700;color:#374151;margin-bottom:4px;">Key signals</div>
+          {_grf_fac_html}
+        </div>
+        <div style="background:{_grf['cc']}22;border-radius:8px;padding:10px 12px;">
+          <div style="font-size:11px;font-weight:700;color:{_grf['cc']};margin-bottom:4px;">
+            Recommendation
+          </div>
+          <div style="font-size:12px;color:#374151;line-height:1.55;">{_grf['rtxt']}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:6px;">
+            {_grf['iv_env']} (IV rank {_grf['iv_r']:.0f}) &nbsp;·&nbsp;
+            Sources: net delta · OI momentum · GEX · PCR · max pain
+          </div>
+        </div>
       </div>
-      <div style="font-size:12px;color:#374151;line-height:1.55;">{_grf['rtxt']}</div>
-      <div style="font-size:10px;color:#9CA3AF;margin-top:6px;">
-        {_grf['iv_env']} (IV rank {_grf['iv_r']:.0f}) &nbsp;·&nbsp;
-        Sources: net delta · OI momentum · GEX · PCR · max pain
-      </div>
     </div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
+_ph_hidden_grf.empty()        # v20: Greek Risk Framework visual output suppressed
 # ══ END Greek Risk Framework ══════════════════════════════════════════════════
 
 # ── SECTION 3 & 4 MARKET BIAS vs NIFTY SPOT ─────────────────────────────────
-_bh_data = st.session_state.get("bias_history", [])
+_ph_hidden_s34badge = st.empty()   # v20: Section 3&4 Bias badge visuals hidden — calculations preserved
+with _ph_hidden_s34badge.container():
+    _bh_data = st.session_state.get("bias_history", [])
 
-# ── Current snapshot badge (always visible, even before 2 data points) ───────
-_s34_dir   = _s34_bias["direction"]
-_s34_bc    = "#22C55E" if _s34_score > 15 else ("#EF4444" if _s34_score < -15 else "#F59E0B")
-_s34_bd    = _s34_breakdown
-_s34_parts = " | ".join(f"{k}: {v:+.0f}" for k, v in _s34_bd.items())
-st.markdown(
-    f"""<div style="background:#fff;border:1.5px solid {_s34_bc};border-radius:10px;
-         padding:10px 16px;margin-bottom:10px;display:flex;align-items:center;
-         gap:12px;flex-wrap:wrap;">
-      <span style="font-size:13px;font-weight:800;color:#1A1A2E;">
-        &#x1F4CA; Section 3&4 Bias</span>
-      <span style="background:{_s34_bc}22;color:{_s34_bc};border:1px solid {_s34_bc};
-            border-radius:6px;padding:2px 10px;font-size:13px;font-weight:700;">
-        {_s34_dir} &nbsp; {_s34_score:+.0f}/100</span>
-      <span style="font-size:11px;color:#6B7280;">{_s34_parts}</span>
-      <span style="font-size:11px;color:#9CA3AF;margin-left:auto;">
-        5-min chart updates every 5 min · {len(_bh_data)} pts</span>
-    </div>""",
-    unsafe_allow_html=True,
-)
+    # ── Current snapshot badge (always visible, even before 2 data points) ───────
+    _s34_dir   = _s34_bias["direction"]
+    _s34_bc    = "#22C55E" if _s34_score > 15 else ("#EF4444" if _s34_score < -15 else "#F59E0B")
+    _s34_bd    = _s34_breakdown
+    _s34_parts = " | ".join(f"{k}: {v:+.0f}" for k, v in _s34_bd.items())
+    st.markdown(
+        f"""<div style="background:#fff;border:1.5px solid {_s34_bc};border-radius:10px;
+             padding:10px 16px;margin-bottom:10px;display:flex;align-items:center;
+             gap:12px;flex-wrap:wrap;">
+          <span style="font-size:13px;font-weight:800;color:#1A1A2E;">
+            &#x1F4CA; Section 3&4 Bias</span>
+          <span style="background:{_s34_bc}22;color:{_s34_bc};border:1px solid {_s34_bc};
+                border-radius:6px;padding:2px 10px;font-size:13px;font-weight:700;">
+            {_s34_dir} &nbsp; {_s34_score:+.0f}/100</span>
+          <span style="font-size:11px;color:#6B7280;">{_s34_parts}</span>
+          <span style="font-size:11px;color:#9CA3AF;margin-left:auto;">
+            5-min chart updates every 5 min · {len(_bh_data)} pts</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+_ph_hidden_s34badge.empty()        # v20: Section 3&4 Bias badge visual output suppressed
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -5173,136 +5182,139 @@ _render_combined_bias_panel(_combined_decision)
 # END COMBINED MARKET BIAS DECISION PANEL
 # ═════════════════════════════════════════════════════════════════════════════
 
-if len(_bh_data) >= 2:
-    import plotly.graph_objs as _go2
-    _B_GREEN = "#22C55E"; _B_RED = "#EF4444"; _B_CYAN = "#22D3EE"
-    _B_ZONE  = "#F3F4F6"  # neutral zone fill
+_ph_hidden_s34chart = st.empty()   # v20: Section 3&4 Bias chart visuals hidden — calculations preserved
+with _ph_hidden_s34chart.container():
+    if len(_bh_data) >= 2:
+        import plotly.graph_objs as _go2
+        _B_GREEN = "#22C55E"; _B_RED = "#EF4444"; _B_CYAN = "#22D3EE"
+        _B_ZONE  = "#F3F4F6"  # neutral zone fill
 
-    _bh_ts    = [r["ts"]    for r in _bh_data]
-    _bh_spot  = [r["spot"]  for r in _bh_data]
-    _bh_score = [r["score"] for r in _bh_data]
+        _bh_ts    = [r["ts"]    for r in _bh_data]
+        _bh_spot  = [r["spot"]  for r in _bh_data]
+        _bh_score = [r["score"] for r in _bh_data]
 
-    # Build custom hover for each point (signal breakdown if available)
-    _bh_hover = []
-    for r in _bh_data:
-        _hlines = [
-            f"<b>{r['ts']}</b>",
-            f"Bias: <b>{r['score']:+.0f}</b> ({r.get('direction','—')})",
-            f"Spot: {r['spot']:,.0f}",
-        ]
-        for _sk in ("s1","s2","s3","s4","s5","s6"):
-            if _sk in r:
-                _label = {"s1":"S1 Net OI","s2":"S2 Mom","s3":"S3 Levels",
-                          "s4":"S4 Skew","s5":"S5 TS","s6":"S6 Vel"}.get(_sk, _sk)
-                _hlines.append(f"{_label}: {r[_sk]:+.0f}")
-        _bh_hover.append("<br>".join(_hlines))
+        # Build custom hover for each point (signal breakdown if available)
+        _bh_hover = []
+        for r in _bh_data:
+            _hlines = [
+                f"<b>{r['ts']}</b>",
+                f"Bias: <b>{r['score']:+.0f}</b> ({r.get('direction','—')})",
+                f"Spot: {r['spot']:,.0f}",
+            ]
+            for _sk in ("s1","s2","s3","s4","s5","s6"):
+                if _sk in r:
+                    _label = {"s1":"S1 Net OI","s2":"S2 Mom","s3":"S3 Levels",
+                              "s4":"S4 Skew","s5":"S5 TS","s6":"S6 Vel"}.get(_sk, _sk)
+                    _hlines.append(f"{_label}: {r[_sk]:+.0f}")
+            _bh_hover.append("<br>".join(_hlines))
 
-    _bf = _go2.Figure()
+        _bf = _go2.Figure()
 
-    # ── Zone bands ────────────────────────────────────────────────────────────
-    # Strong bullish zone (40–100): light green tint
-    _bf.add_hrect(y0=40,  y1=100, fillcolor="#DCFCE7", opacity=0.25, layer="below", line_width=0)
-    # Neutral zone (±15): grey
-    _bf.add_hrect(y0=-15, y1=15,  fillcolor="#E5E7EB", opacity=0.35, layer="below", line_width=0)
-    # Strong bearish zone (-40 to -100): light red tint
-    _bf.add_hrect(y0=-100, y1=-40, fillcolor="#FEE2E2", opacity=0.25, layer="below", line_width=0)
+        # ── Zone bands ────────────────────────────────────────────────────────────
+        # Strong bullish zone (40–100): light green tint
+        _bf.add_hrect(y0=40,  y1=100, fillcolor="#DCFCE7", opacity=0.25, layer="below", line_width=0)
+        # Neutral zone (±15): grey
+        _bf.add_hrect(y0=-15, y1=15,  fillcolor="#E5E7EB", opacity=0.35, layer="below", line_width=0)
+        # Strong bearish zone (-40 to -100): light red tint
+        _bf.add_hrect(y0=-100, y1=-40, fillcolor="#FEE2E2", opacity=0.25, layer="below", line_width=0)
 
-    # ── Reference lines ───────────────────────────────────────────────────────
-    for _rl, _rd, _rc in [
-        (0,   "dot",   "#9CA3AF"),   # zero line
-        (40,  "dash",  "#86EFAC"),   # bull conviction
-        (-40, "dash",  "#FCA5A5"),   # bear conviction
-        (15,  "dot",   "#D1D5DB"),   # neutral upper edge
-        (-15, "dot",   "#D1D5DB"),   # neutral lower edge
-    ]:
-        _bf.add_hline(y=_rl, line_width=1.2, line_dash=_rd, line_color=_rc)
+        # ── Reference lines ───────────────────────────────────────────────────────
+        for _rl, _rd, _rc in [
+            (0,   "dot",   "#9CA3AF"),   # zero line
+            (40,  "dash",  "#86EFAC"),   # bull conviction
+            (-40, "dash",  "#FCA5A5"),   # bear conviction
+            (15,  "dot",   "#D1D5DB"),   # neutral upper edge
+            (-15, "dot",   "#D1D5DB"),   # neutral lower edge
+        ]:
+            _bf.add_hline(y=_rl, line_width=1.2, line_dash=_rd, line_color=_rc)
 
-    # ── Nifty Spot on right axis (cyan) ───────────────────────────────────────
-    _bf.add_trace(_go2.Scatter(
-        x=_bh_ts, y=_bh_spot, name="Nifty Spot",
-        mode="lines+markers",
-        line=dict(color=_B_CYAN, width=2.2),
-        marker=dict(size=4, color=_B_CYAN),
-        yaxis="y2",
-        hovertemplate="%{x}<br>Spot: %{y:,.0f}<extra>Spot</extra>",
-    ))
-
-    # ── Bias line: colour-coded segments (green above 0, red below) ───────────
-    for _bi in range(len(_bh_score)):
-        _bc = _B_GREEN if _bh_score[_bi] >= 0 else _B_RED
-        if _bi < len(_bh_score) - 1:
-            # Colour each segment by the current point's sign
-            _bf.add_trace(_go2.Scatter(
-                x=[_bh_ts[_bi], _bh_ts[_bi + 1]],
-                y=[_bh_score[_bi], _bh_score[_bi + 1]],
-                mode="lines",
-                line=dict(color=_bc, width=2.8),
-                showlegend=False,
-                yaxis="y1",
-                hoverinfo="skip",
-            ))
-        # Marker with full breakdown tooltip
+        # ── Nifty Spot on right axis (cyan) ───────────────────────────────────────
         _bf.add_trace(_go2.Scatter(
-            x=[_bh_ts[_bi]], y=[_bh_score[_bi]],
-            mode="markers",
-            marker=dict(
-                color=_bc, size=8,
-                line=dict(color="#fff", width=1.5),
-                symbol="circle",
-            ),
-            name="S3/4 Bias" if _bi == 0 else None,
-            showlegend=(_bi == 0),
-            customdata=[_bh_hover[_bi]],
-            hovertemplate="%{customdata}<extra></extra>",
-            yaxis="y1",
+            x=_bh_ts, y=_bh_spot, name="Nifty Spot",
+            mode="lines+markers",
+            line=dict(color=_B_CYAN, width=2.2),
+            marker=dict(size=4, color=_B_CYAN),
+            yaxis="y2",
+            hovertemplate="%{x}<br>Spot: %{y:,.0f}<extra>Spot</extra>",
         ))
 
-    # ── Layout ────────────────────────────────────────────────────────────────
-    _spot_vals  = [v for v in _bh_spot if v > 0]
-    _spot_pad   = (max(_spot_vals) - min(_spot_vals)) * 0.15 if len(_spot_vals) > 1 else 50
-    _spot_range = [min(_spot_vals) - _spot_pad, max(_spot_vals) + _spot_pad] if _spot_vals else None
+        # ── Bias line: colour-coded segments (green above 0, red below) ───────────
+        for _bi in range(len(_bh_score)):
+            _bc = _B_GREEN if _bh_score[_bi] >= 0 else _B_RED
+            if _bi < len(_bh_score) - 1:
+                # Colour each segment by the current point's sign
+                _bf.add_trace(_go2.Scatter(
+                    x=[_bh_ts[_bi], _bh_ts[_bi + 1]],
+                    y=[_bh_score[_bi], _bh_score[_bi + 1]],
+                    mode="lines",
+                    line=dict(color=_bc, width=2.8),
+                    showlegend=False,
+                    yaxis="y1",
+                    hoverinfo="skip",
+                ))
+            # Marker with full breakdown tooltip
+            _bf.add_trace(_go2.Scatter(
+                x=[_bh_ts[_bi]], y=[_bh_score[_bi]],
+                mode="markers",
+                marker=dict(
+                    color=_bc, size=8,
+                    line=dict(color="#fff", width=1.5),
+                    symbol="circle",
+                ),
+                name="S3/4 Bias" if _bi == 0 else None,
+                showlegend=(_bi == 0),
+                customdata=[_bh_hover[_bi]],
+                hovertemplate="%{customdata}<extra></extra>",
+                yaxis="y1",
+            ))
 
-    _bf.update_layout(
-        title=dict(
-            text=(
-                f"S3/4 Market Bias vs Nifty Spot — "
-                f"<span style='color:{_s34_bc}'>{_s34_dir} {_s34_score:+.0f}</span>"
-                f"  <span style='font-size:11px;color:#9CA3AF'>· 5-min snapshots</span>"
+        # ── Layout ────────────────────────────────────────────────────────────────
+        _spot_vals  = [v for v in _bh_spot if v > 0]
+        _spot_pad   = (max(_spot_vals) - min(_spot_vals)) * 0.15 if len(_spot_vals) > 1 else 50
+        _spot_range = [min(_spot_vals) - _spot_pad, max(_spot_vals) + _spot_pad] if _spot_vals else None
+
+        _bf.update_layout(
+            title=dict(
+                text=(
+                    f"S3/4 Market Bias vs Nifty Spot — "
+                    f"<span style='color:{_s34_bc}'>{_s34_dir} {_s34_score:+.0f}</span>"
+                    f"  <span style='font-size:11px;color:#9CA3AF'>· 5-min snapshots</span>"
+                ),
+                font=dict(size=13, color="#1A1A2E"),
             ),
-            font=dict(size=13, color="#1A1A2E"),
-        ),
-        height=270,
-        paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-        margin=dict(l=52, r=66, t=44, b=30),
-        font=dict(color="#1A1A2E", size=11),
-        legend=dict(orientation="h", y=1.14, x=0, font=dict(size=10)),
-        hovermode="closest",
-        yaxis=dict(
-            title=dict(text="Bias Score", font=dict(size=10, color="#1A1A2E")),
-            range=[-105, 105],
-            zeroline=False,
-            gridcolor="#F3F4F6",
-            tickvals=[-100, -60, -40, -15, 0, 15, 40, 60, 100],
-            tickfont=dict(size=9),
-        ),
-        yaxis2=dict(
-            title=dict(text="Nifty Spot", font=dict(size=10, color=_B_CYAN)),
-            overlaying="y", side="right",
-            showgrid=False, zeroline=False,
-            range=_spot_range,
-            tickfont=dict(size=9, color=_B_CYAN),
-        ),
-    )
-    st.plotly_chart(_bf, width='stretch', config={"displayModeBar": False})  # H23 fix: was use_container_width=True
-elif len(_bh_data) == 1:
-    st.caption("⏳ Chart will appear after the second 5-minute snapshot is recorded.")
+            height=270,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=52, r=66, t=44, b=30),
+            font=dict(color="#1A1A2E", size=11),
+            legend=dict(orientation="h", y=1.14, x=0, font=dict(size=10)),
+            hovermode="closest",
+            yaxis=dict(
+                title=dict(text="Bias Score", font=dict(size=10, color="#1A1A2E")),
+                range=[-105, 105],
+                zeroline=False,
+                gridcolor="#F3F4F6",
+                tickvals=[-100, -60, -40, -15, 0, 15, 40, 60, 100],
+                tickfont=dict(size=9),
+            ),
+            yaxis2=dict(
+                title=dict(text="Nifty Spot", font=dict(size=10, color=_B_CYAN)),
+                overlaying="y", side="right",
+                showgrid=False, zeroline=False,
+                range=_spot_range,
+                tickfont=dict(size=9, color=_B_CYAN),
+            ),
+        )
+        st.plotly_chart(_bf, width='stretch', config={"displayModeBar": False})  # H23 fix: was use_container_width=True
+    elif len(_bh_data) == 1:
+        st.caption("⏳ Chart will appear after the second 5-minute snapshot is recorded.")
+_ph_hidden_s34chart.empty()        # v20: Section 3&4 Bias chart visual output suppressed
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GAMMA DATA SECTION — Option C: OI×Gamma Directional Balance
 # All data sourced from the already-loaded option chain (_early_df_band).
 # No new API calls. Gamma is computed during the main chain fetch (BS Greeks).
 # ═══════════════════════════════════════════════════════════════════════════════
-with _slot_gamma:   # v8: render into top-of-dashboard slot (display order only)
+with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display order only)
     st.markdown(
         '<div class="section-header">⚡ Gamma &amp; Vega Live Interpretation — OI×Gamma Balance · Net Vega Exposure per Strike</div>',
         unsafe_allow_html=True,
@@ -6308,6 +6320,7 @@ with _slot_gamma:   # v8: render into top-of-dashboard slot (display order only)
 
     else:
         st.info("⏳ Gamma data unavailable — waiting for option chain.")
+_slot_gamma.empty()           # v20: Gamma & Vega Live Interpretation visual output suppressed — all calculations above preserved
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3: KEY PRICE LEVELS
@@ -7519,31 +7532,34 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1: MARKET SENTIMENTS
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header"> Section 1  Market Sentiments</div>', unsafe_allow_html=True)
+_ph_hidden_s1 = st.empty()   # v20: Section 1 Market Sentiments visuals hidden — calculations preserved
+with _ph_hidden_s1.container():
+    st.markdown('<div class="section-header"> Section 1  Market Sentiments</div>', unsafe_allow_html=True)
 
-s = compute_market_sentiments(today_history)  # Fix #2: intraday only
-if s:
-    sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
-    for col, label, val, color in [
-        (sc1, "VEGA",     s["vega_label"],     s["vega_color"]),
-        (sc2, "THETA",    s["theta_label"],    s["theta_color"]),
-        (sc3, "OI",       s["oi_label"],       s["oi_color"]),
-        (sc4, "STRENGTH", s["strength_label"], s["strength_color"]),
-        (sc5, "POS",      f"{s['pos_score']:+.2f}", s["pos_dot"]),
-        (sc6, "SENTIMENT",s["overall"],        s["overall_color"]),
-    ]:
-        col.markdown(f"""
-        <div class="card" style="text-align:center;">
-          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">{label}</div>
-          <div style="font-size:20px;font-weight:800;color:{color};">{val}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    s = compute_market_sentiments(today_history)  # Fix #2: intraday only
+    if s:
+        sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
+        for col, label, val, color in [
+            (sc1, "VEGA",     s["vega_label"],     s["vega_color"]),
+            (sc2, "THETA",    s["theta_label"],    s["theta_color"]),
+            (sc3, "OI",       s["oi_label"],       s["oi_color"]),
+            (sc4, "STRENGTH", s["strength_label"], s["strength_color"]),
+            (sc5, "POS",      f"{s['pos_score']:+.2f}", s["pos_dot"]),
+            (sc6, "SENTIMENT",s["overall"],        s["overall_color"]),
+        ]:
+            col.markdown(f"""
+            <div class="card" style="text-align:center;">
+              <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">{label}</div>
+              <div style="font-size:20px;font-weight:800;color:{color};">{val}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    if s.get("warming"):
-        st.warning(f"⏳ Warming up  {s['n_ticks']} tick(s). Absolute thresholds active until 5 ticks.")
-    st.caption(f"{s['pos_caption']} | Based on last {s['n_ticks']} ticks | Vega=IV z-score · Theta=GEX z-score · OI=PCR z-score · Strength=Net-Delta z-score")
-else:
-    st.info("Collecting data need at least 3 ticks for Market Sentiments.")
+        if s.get("warming"):
+            st.warning(f"⏳ Warming up  {s['n_ticks']} tick(s). Absolute thresholds active until 5 ticks.")
+        st.caption(f"{s['pos_caption']} | Based on last {s['n_ticks']} ticks | Vega=IV z-score · Theta=GEX z-score · OI=PCR z-score · Strength=Net-Delta z-score")
+    else:
+        st.info("Collecting data need at least 3 ticks for Market Sentiments.")
+_ph_hidden_s1.empty()        # v20: Section 1 Market Sentiments visual output suppressed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
