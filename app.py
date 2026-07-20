@@ -5177,7 +5177,10 @@ def _render_combined_bias_panel(cd: dict) -> None:
 """, unsafe_allow_html=True)
 
 # ── Call the panel ────────────────────────────────────────────────────────────
-_render_combined_bias_panel(_combined_decision)
+_ph_hidden_cd = st.empty()   # v20.1: Combined Decision panel visuals hidden — calculations preserved
+with _ph_hidden_cd.container():
+    _render_combined_bias_panel(_combined_decision)
+_ph_hidden_cd.empty()        # v20.1: Combined Decision panel visual output suppressed
 # ═════════════════════════════════════════════════════════════════════════════
 # END COMBINED MARKET BIAS DECISION PANEL
 # ═════════════════════════════════════════════════════════════════════════════
