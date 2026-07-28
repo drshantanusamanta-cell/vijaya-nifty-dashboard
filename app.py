@@ -7839,6 +7839,82 @@ with _slot_summary:
     except Exception as _bs_err:
         st.info(f"Bias Summary — collecting data ({_bs_err}).")
 
+    # v21: Section 4 Summary — standalone verdict built ONLY from Section 4's
+    # own 12 charts, independent of Section 3 / Bias Score / Bias Summary
+    # state above. Four checks, each read straight off an already-computed
+    # chart series (no new heavy calc):
+    #   Regime      — chart 3 (gv, net GEX sign) + chart 4 (_iv_sc badge)
+    #   Structure    — chart 1 (dv) agreeing in sign with chart 2 (mv)
+    #   Premium      — chart 5/6 (_s4_evmap) net tilt across the ATM band
+    #   Size confirm — charts 7/8 (_evr_oiw_s/_evr_oic_s) + charts 11/12
+    #                  (_devr_oi_s/_devr_chg_s, liquidity-masked)
+    # All three of Structure/Premium/Size agreeing → HIGH CONVICTION;
+    # none decisive → NO CLEAR SIGNAL; anything else → WEAKENING/MIXED.
+    try:
+        _s4sum_gex_dir  = -1 if float(gv.sum()) < 0 else 1
+        _s4sum_iv_badge = _iv_sc.get("badge") if _iv_sc else "NEUTRAL"
+
+        _s4sum_dv_sum = float(dv.sum()); _s4sum_mv_sum = float(mv.sum())
+        _s4sum_struct_dir = -1 if _s4sum_dv_sum > 0 else (1 if _s4sum_dv_sum < 0 else 0)
+        _s4sum_flow_dir   = -1 if _s4sum_mv_sum > 0 else (1 if _s4sum_mv_sum < 0 else 0)
+        _s4sum_sf_dir     = _s4sum_struct_dir if _s4sum_struct_dir == _s4sum_flow_dir else 0
+
+        def _s4sum_cls(_v):
+            if _v is None or not np.isfinite(_v): return None
+            return 1 if _v > 1.2 else (-1 if _v < 0.7 else 0)
+        _s4sum_prem_vals = [v for v in (_s4sum_cls(_v) for _v in _s4_evmap.values()) if v]
+        _s4sum_prem_sum  = sum(_s4sum_prem_vals)
+        _s4sum_prem_dir  = 1 if _s4sum_prem_sum > 0 else (-1 if _s4sum_prem_sum < 0 else 0)
+
+        _s4sum_conv_dirs = [1 if float(_evr_oiw_s.mean()) >= 1 else -1,
+                             1 if float(_evr_oic_s.mean()) >= 1 else -1]
+        if int(_liq_ev_oi.sum()) > 0:
+            _s4sum_conv_dirs.append(1 if float(_devr_oi_s[_liq_ev_oi].mean()) >= 1 else -1)
+        if int(_liq_ev_chg.sum()) > 0:
+            _s4sum_conv_dirs.append(1 if float(_devr_chg_s[_liq_ev_chg].mean()) >= 1 else -1)
+        _s4sum_conv_sum = sum(_s4sum_conv_dirs)
+        _s4sum_conv_dir = 1 if _s4sum_conv_sum > 0 else (-1 if _s4sum_conv_sum < 0 else 0)
+
+        _s4sum_votes = [v for v in (_s4sum_sf_dir, _s4sum_prem_dir, _s4sum_conv_dir) if v != 0]
+        if len(_s4sum_votes) == 3 and _s4sum_votes[0] == _s4sum_votes[1] == _s4sum_votes[2]:
+            _s4sum_bias = "BULLISH" if _s4sum_votes[0] > 0 else "BEARISH"
+            _s4sum_col, _s4sum_bg = ("#047857", "#D1FAE5") if _s4sum_bias == "BULLISH" else ("#DC2626", "#FEE2E2")
+            _s4sum_head = f"🎯 HIGH CONVICTION — {_s4sum_bias}"
+        elif not _s4sum_votes:
+            _s4sum_col, _s4sum_bg = "#6B7280", "#F9FAFB"
+            _s4sum_head = "◻ NO CLEAR SIGNAL"
+        else:
+            _s4sum_col, _s4sum_bg = "#D97706", "#FFFBEB"
+            _s4sum_head = "⚠ WEAKENING / MIXED SIGNALS"
+
+        _s4sum_lines = [
+            f"Regime (charts 3, 4): {'trending, negative-gamma' if _s4sum_gex_dir < 0 else 'range-bound, positive-gamma'} backdrop · IV smile reading {_s4sum_iv_badge}.",
+            "Structure &amp; flow (charts 1, 2): " + (
+                "position and today's activity agree — put side gaining strength (bullish tilt)." if _s4sum_sf_dir > 0 else
+                "position and today's activity agree — call side gaining strength (bearish tilt)." if _s4sum_sf_dir < 0 else
+                "the standing position and today's flow disagree — no lean here."),
+            "Premium pressure (charts 5, 6): " + (
+                "buyers are paying up on the call side (bullish)." if _s4sum_prem_dir > 0 else
+                "buyers are paying up on the put side (bearish)." if _s4sum_prem_dir < 0 else
+                "premium is flat across the band — no side is paying up."),
+            "Size confirmation (charts 7, 8, 11, 12): " + (
+                "backs up the premium read with real size and fresh flow." if (_s4sum_prem_dir != 0 and _s4sum_conv_dir == _s4sum_prem_dir) else
+                "does not back up the premium read — treat it with caution." if _s4sum_prem_dir != 0 else
+                "shows no decisive lean either."),
+        ]
+        _s4sum_bullets = ''.join(
+            f'<div style="font-size:13px;color:#111;margin-top:3px;">• {_l}</div>'
+            for _l in _s4sum_lines)
+        st.markdown(f"""
+        <div style="background:{_s4sum_bg};border:2px solid {_s4sum_col};border-radius:10px;
+                    padding:12px 16px;margin-top:10px;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Section 4 Summary</div>
+          <div style="font-size:18px;font-weight:900;color:{_s4sum_col};margin:2px 0 6px;">{_s4sum_head}</div>
+          {_s4sum_bullets}
+        </div>""", unsafe_allow_html=True)
+    except Exception as _s4sum_err:
+        st.info(f"Section 4 Summary — collecting data ({_s4sum_err}).")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
