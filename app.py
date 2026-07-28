@@ -274,7 +274,7 @@ def _render_owner_sidebar(expiry_list):
                 help="Number of strikes either side of ATM. Governs all 4 Z-Score "
                      "charts: the OI-weighted band vega sum (Raw & OI-Wtd Vega "
                      "Ratio charts) and the strike-wise averaging band (Raw & "
-                     "OI-Wtd CE/PE EV Ratio charts). Takes effect on the next "
+                     "OI-Wtd Sentiment charts). Takes effect on the next "
                      "data fetch (forced immediately on change).",
             )
             _new_vb = _VEGA_BAND_OPTIONS[_chosen_vb]
@@ -307,7 +307,7 @@ def _render_owner_sidebar(expiry_list):
                 index=list(_ZS_TF_OPTIONS.keys()).index(_zs_tf_label),
                 key="zscore_tf_selector",
                 help="Applies to all 4 Z-Score charts (Raw & OI-Wtd Vega Ratio, "
-                     "Raw & OI-Wtd CE/PE EV Ratio). Ticks are resampled into bars "
+                     "Raw & OI-Wtd Sentiment). Ticks are resampled into bars "
                      "of this width (last value per bar); the in-progress bar "
                      "updates every refresh and locks once its window closes. "
                      "Does not affect data collection.",
@@ -400,8 +400,8 @@ METRIC_EXPLAIN = {
     "Bias Score":      "Hedge-flow bias score (-100..+100) from the legacy compute_nifty_bias engine — uses SIGNED delta x OI (net_delta), so it reads dealer hedge-flow pressure, not writer positioning. Use the S3/4 / Combined Decision panels for the authoritative directional call.",
     "Confidence":      "Signal quality score based on regime, persistence, concentration, and wall behavior.",
     "Regime":          "Range/pin, trend/expansion, or transition inferred from gamma, IV, walls, and persistence.",
-    "EV Ratio (Raw Avg)":    "Per-strike Call/Put time-value ratio averaged across the ATM band (same series as the Raw CE/PE EV Ratio Z-Score chart); higher means call premium stronger, lower means put premium stronger.",
-    "EV Ratio (OI-Wtd Avg)": "Per-strike (Call EV x Call OI)/(Put EV x Put OI) averaged across the ATM band (same series as the OI-Wtd CE/PE EV Ratio Z-Score chart).",
+    "Sentiment (Raw Avg)":    "Per-strike Call/Put time-value ratio averaged across the ATM band (same series as the Raw Sentiment Z-Score chart); higher means call premium stronger, lower means put premium stronger.",
+    "Sentiment (OI-Wtd Avg)": "Per-strike (Call EV x Call OI)/(Put EV x Put OI) averaged across the ATM band (same series as the OI-Wtd Sentiment Z-Score chart).",
     "Net Delta":       "Directional lean from near-spot open interest weighted by delta.",
     "Momentum":        "Fresh intraday open-interest change weighted by delta near spot.",
     "GEX":             "Gamma exposure from the structural band; positive tends to pin, negative tends to expand moves.",
@@ -1362,8 +1362,8 @@ def compute_metrics(df, spot, expiry=None, history=None):
 
     return {
         "ev_ratio": round(ev_ratio, 3),
-        "ev_ratio_avg_strikewise": round(ev_ratio_avg_strikewise, 4),  # avg of per-strike CE/PE EV ratio, ATM±vega_band_strikes
-        "ev_ratio_oiw_avg_strikewise": round(ev_ratio_oiw_avg_strikewise, 4),  # avg of per-strike OI-weighted CE/PE EV ratio, ATM±vega_band_strikes
+        "ev_ratio_avg_strikewise": round(ev_ratio_avg_strikewise, 4),  # avg of per-strike Sentiment, ATM±vega_band_strikes
+        "ev_ratio_oiw_avg_strikewise": round(ev_ratio_oiw_avg_strikewise, 4),  # avg of per-strike OI-weighted Sentiment, ATM±vega_band_strikes
         "net_delta": round(net_delta, 0),
         "net_gamma": round(net_gamma, 6),
         "net_theta": round(net_theta, 0),
@@ -5809,13 +5809,13 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 ))
                 _ev_fig.add_trace(go.Scatter(
                     x=_evz_times, y=_evz_raw_z,
-                    name=f"Raw CE/PE EV Ratio Z-Score ({_evz_lookback_label}, ±{_vd_band_n} strikes)",
+                    name=f"Raw Sentiment Z-Score ({_evz_lookback_label}, ±{_vd_band_n} strikes)",
                     mode="lines+markers",
                     line=dict(color="#059669", width=2.0),
                     marker=dict(size=4, color="#059669"),
                     yaxis="y2",
                     customdata=_evz_raw_ratio,
-                    hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Avg CE/PE EV Ratio: %{customdata:.4f}"
+                    hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Avg Sentiment: %{customdata:.4f}"
                                   f"<extra>strike-wise avg, ±{_vd_band_n}</extra>",
                 ))
                 # Mean (0σ) line + ±1σ / ±2σ level markers
@@ -5834,7 +5834,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 _add_atm_change_annotations(_ev_fig, _evz_times, _evz_atm_k)
                 _ev_fig.update_layout(
                     title=dict(
-                        text=f"Raw CE/PE EV Ratio Z-Score — {_evz_lookback_label}  (±{_vd_band_n} strikes)  "
+                        text=f"Raw Sentiment Z-Score — {_evz_lookback_label}  (±{_vd_band_n} strikes)  "
                              "<span style='font-size:11px;color:#6B7280'>"
                              "Amber=Spot (left) · Green=Z-Score (right) · "
                              "&gt;+1σ/+2σ = Call premium relatively rich · &lt;−1σ/−2σ = Put premium relatively rich · "
@@ -5851,7 +5851,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                         gridcolor="#F3F4F6", autorange=True, showgrid=True,
                     ),
                     yaxis2=dict(
-                        title=dict(text=f"Raw CE/PE EV Ratio Z-Score ({_evz_lookback_label})", font=dict(color="#059669")),
+                        title=dict(text=f"Raw Sentiment Z-Score ({_evz_lookback_label})", font=dict(color="#059669")),
                         tickfont=dict(color="#059669", size=9),
                         overlaying="y", side="right",
                         zeroline=False, autorange=True, showgrid=False,
@@ -5877,13 +5877,13 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 ))
                 _evo_fig.add_trace(go.Scatter(
                     x=_evz_times, y=_evz_oiw_z,
-                    name=f"OI-Wtd CE/PE EV Ratio Z-Score ({_evz_lookback_label}, ±{_vd_band_n} strikes)",
+                    name=f"OI-Wtd Sentiment Z-Score ({_evz_lookback_label}, ±{_vd_band_n} strikes)",
                     mode="lines+markers",
                     line=dict(color="#DB2777", width=2.0),
                     marker=dict(size=4, color="#DB2777"),
                     yaxis="y2",
                     customdata=_evz_oiw_ratio,
-                    hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>OI-Wtd CE/PE EV Ratio: %{customdata:.4f}"
+                    hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>OI-Wtd Sentiment: %{customdata:.4f}"
                                   f"<extra>strike-wise, OI-weighted, ±{_vd_band_n}</extra>",
                 ))
                 # Mean (0σ) line + ±1σ / ±2σ level markers
@@ -5902,7 +5902,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 _add_atm_change_annotations(_evo_fig, _evz_times, _evz_atm_k)
                 _evo_fig.update_layout(
                     title=dict(
-                        text=f"OI-Weighted CE/PE EV Ratio Z-Score — {_evz_lookback_label}  (±{_vd_band_n} strikes)  "
+                        text=f"OI-Weighted Sentiment Z-Score — {_evz_lookback_label}  (±{_vd_band_n} strikes)  "
                              "<span style='font-size:11px;color:#6B7280'>"
                              "Amber=Spot (left) · Pink=Z-Score (right) · "
                              "&gt;+1σ/+2σ = Call premium×OI relatively rich · &lt;−1σ/−2σ = Put premium×OI relatively rich · "
@@ -5919,7 +5919,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                         gridcolor="#F3F4F6", autorange=True, showgrid=True,
                     ),
                     yaxis2=dict(
-                        title=dict(text=f"OI-Wtd CE/PE EV Ratio Z-Score ({_evz_lookback_label})", font=dict(color="#DB2777")),
+                        title=dict(text=f"OI-Wtd Sentiment Z-Score ({_evz_lookback_label})", font=dict(color="#DB2777")),
                         tickfont=dict(color="#DB2777", size=9),
                         overlaying="y", side="right",
                         zeroline=False, autorange=True, showgrid=False,
@@ -5932,7 +5932,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 st.plotly_chart(_evo_fig, use_container_width=True,
                                 config={"displayModeBar": False})
         else:
-            st.info("⏳ CE/PE EV Ratio Z-Score charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
+            st.info("⏳ Sentiment Z-Score charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
 
         # ═════════════════════════════════════════════════════════════════════════
         # LIVE GEX + VEGA INTERPRETATION ENGINE  (v3 — lot-size corrected GEX,
@@ -6678,7 +6678,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#D97706", "#FFFBEB"
         _key_ks   = _fmt_ks(_pb_ks + _ca_ks)
         _reason = [
-            f"Avg raw CE/PE EV ratio is {_evr_avg:.2f}, but strong SELLERS sit on both sides of spot.",
+            f"Avg Raw Sentiment is {_evr_avg:.2f}, but strong SELLERS sit on both sides of spot.",
             f"Put writers defend [{_fmt_ks(_pb_ks)}] below spot and call writers cap [{_fmt_ks(_ca_ks)}] above spot.",
             f"Both sides are pressing price toward the middle → expect the market to stay pinned near ATM {int(_atm):,}.",
         ]
@@ -6688,7 +6688,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#059669", "#D1FAE5"
         _key_ks   = _fmt_ks(_strong_ks)
         _reason = [
-            f"Call premiums are richer than puts (avg raw CE/PE EV ratio {_evr_avg:.2f} > 1.2) → call buyers + put sellers → bullish bias.",
+            f"Call premiums are richer than puts (avg Raw Sentiment {_evr_avg:.2f} > 1.2) → call buyers + put sellers → bullish bias.",
             f"Net Δ-weighted OI change is POSITIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — call BUYERS are stronger than put sellers.",
             "Buyers, not sellers, are driving the move → upside momentum is STRONG.",
         ]
@@ -6698,7 +6698,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#65A30D", "#F7FEE7"
         _key_ks   = _fmt_ks(_weak_ks)
         _reason = [
-            f"Call premiums are richer than puts (avg raw CE/PE EV ratio {_evr_avg:.2f} > 1.2) → bias stays bullish.",
+            f"Call premiums are richer than puts (avg Raw Sentiment {_evr_avg:.2f} > 1.2) → bias stays bullish.",
             f"But net Δ-weighted OI change is NEGATIVE at key strikes [{_fmt_ks(_weak_ks)}] — put SELLERS are stronger than call buyers.",
             "The market is supported by sellers rather than driven by buyers → upside momentum is NOT strong.",
         ]
@@ -6708,7 +6708,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#DC2626", "#FEE2E2"
         _key_ks   = _fmt_ks(_strong_ks)
         _reason = [
-            f"Put premiums are richer than calls (avg raw CE/PE EV ratio {_evr_avg:.2f} < 0.7) → put buyers + call sellers → bearish bias.",
+            f"Put premiums are richer than calls (avg Raw Sentiment {_evr_avg:.2f} < 0.7) → put buyers + call sellers → bearish bias.",
             f"Net Δ-weighted OI change is NEGATIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — put BUYERS are stronger than call sellers.",
             "Buyers of downside protection are driving → downside momentum is STRONG.",
         ]
@@ -6718,7 +6718,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#EA580C", "#FFF7ED"
         _key_ks   = _fmt_ks(_weak_ks)
         _reason = [
-            f"Put premiums are richer than calls (avg raw CE/PE EV ratio {_evr_avg:.2f} < 0.7) → bias stays bearish.",
+            f"Put premiums are richer than calls (avg Raw Sentiment {_evr_avg:.2f} < 0.7) → bias stays bearish.",
             f"But net Δ-weighted OI change is POSITIVE at key strikes [{_fmt_ks(_weak_ks)}] — call SELLERS are stronger than put buyers.",
             "The upside is capped by sellers rather than pressed by buyers → downside momentum is NOT strong.",
         ]
@@ -6727,7 +6727,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _mom_lbl = "—"
         _sc, _sbg = "#6B7280", "#F9FAFB"
         _key_ks   = "—"
-        _reason = [f"Avg raw CE/PE EV ratio is {_evr_avg:.2f} (neutral zone 0.7–1.2) — call and put premiums are balanced, so neither side has the edge."]
+        _reason = [f"Avg Raw Sentiment is {_evr_avg:.2f} (neutral zone 0.7–1.2) — call and put premiums are balanced, so neither side has the edge."]
 
     # ── 15-minute final-verdict history ──────────────────────────────────────
     # v14 (ported from Dash v15): the log's level column is now the GEX+Vega
@@ -6775,14 +6775,14 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
 
 with _slot_sv:   # v10: display Shantanu's View just below Section 4
     st.markdown(
-        '<div style="font-size:20px;font-weight:900;color:#7C3AED;letter-spacing:0.5px;'    'padding:14px 0 6px 0;border-bottom:2px solid #7C3AED;margin-bottom:12px;">'    '🎯 Shantanu\'s View — Buyer / Seller Matrix (Raw CE/PE EVR × Δ-Wtd OI Change Momentum)</div>',
+        '<div style="font-size:20px;font-weight:900;color:#7C3AED;letter-spacing:0.5px;'    'padding:14px 0 6px 0;border-bottom:2px solid #7C3AED;margin-bottom:12px;">'    '🎯 Shantanu\'s View — Buyer / Seller Matrix (Raw Sentiment × Δ-Wtd OI Change Momentum)</div>',
         unsafe_allow_html=True
     )
 
     if df_band_records:
         # ── Enhanced NDM v10 — per-strike Buyer/Seller Matrix ─────────────────────
         st.caption(
-            "BIAS comes from the raw CE/PE Extrinsic-Value ratio per strike: >1.2 = Call buyers & Put sellers → BULLISH; "
+            "BIAS comes from the Raw Sentiment per strike: >1.2 = Call buyers & Put sellers → BULLISH; "
             "<0.7 = Put buyers & Call sellers → BEARISH (0.7-1.2 is a NEUTRAL zone — no longer treated as bearish). "
             "MOMENTUM comes from the Δ-weighted OI change per strike: "
             "with EVR>1.2, positive NDM = Call BUYERS stronger → strong upside; negative NDM = Put SELLERS stronger → "
@@ -6854,7 +6854,7 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
 
             with st.expander("📊 Strike-by-Strike Buyer/Seller Matrix Breakdown", expanded=False):
                 st.caption(
-                    f"Avg raw CE/PE EV ratio this tick: **{_endm['evr_avg']:.3f}** → bias **{_endm['bias']}**. "
+                    f"Avg Raw Sentiment this tick: **{_endm['evr_avg']:.3f}** → bias **{_endm['bias']}**. "
                     "Per strike: EVR>1.2 = bullish bias · EVR<0.7 = bearish bias · 0.7-1.2 = neutral (no dominant "
                     "aggressor). The NDM (Δ×ΔOI) sign then decides "
                     "WHO is stronger at that strike — buyers (strong momentum) or sellers (weak momentum)."
@@ -6877,7 +6877,7 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
                     return ""
 
                 st.dataframe(
-                    _endm_df.rename(columns={"NDM": "NDM (Δ×ΔOI)", "EVR": "Raw CE/PE EVR"})
+                    _endm_df.rename(columns={"NDM": "NDM (Δ×ΔOI)", "EVR": "Raw Sentiment"})
                             .style.map(_endm_style, subset=["Enhanced NDM", "NDM (Δ×ΔOI)"])
                             .map(_endm_read_style, subset=["Reading"]),
                     use_container_width=True,
@@ -7044,11 +7044,11 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             _cols = [GREEN if v >= bull_thresh else (RED if v < bear_thresh else SKY) for v in vals]
             f = go.Figure(go.Bar(x=_ev_bd["strike"], y=vals - 1.0, base=1.0,
                                  marker_color=_cols, customdata=vals,
-                                 hovertemplate="Strike %{x}<br>CE/PE EV Ratio: %{customdata:.3f}<extra></extra>"))
+                                 hovertemplate="Strike %{x}<br>Sentiment: %{customdata:.3f}<extra></extra>"))
             f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
                         annotation_text="Baseline 1.0", annotation_position="bottom right",
                         annotation_font=dict(size=9, color=MUTED))
-            _s4_style(f, title, "CE/PE EV Ratio")
+            _s4_style(f, title, "Sentiment")
             f.update_layout(title=dict(font=dict(size=11)))
             return f
 
@@ -7061,7 +7061,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         _s4_r3c1, _s4_r3c2 = st.columns(2)
         with _s4_r3c1:
             f4 = _s4_evr_bar(_evr_true_raw_s,
-                             f"★ Raw CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1.2=Call buyers/Put sellers dominant · Sky Blue 0.7-1.2=Neutral/Sideways · Red<0.7=Put buyers/Call sellers dominant",
+                             f"★ Raw Sentiment per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1.2=Call buyers/Put sellers dominant · Sky Blue 0.7-1.2=Neutral/Sideways · Red<0.7=Put buyers/Call sellers dominant",
                              bear_thresh=0.7, bull_thresh=1.2)
             st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
         with _s4_r3c2:
@@ -7081,11 +7081,11 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         _s4_r4c1, _s4_r4c2 = st.columns(2)
         with _s4_r4c1:
             f7 = _s4_evr_bar(_evr_oiw_s,
-                             f"★ OI-Wtd CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×OI rich · Red<1=Put EV×OI rich")
+                             f"★ OI-Wtd Sentiment per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×OI rich · Red<1=Put EV×OI rich")
             st.plotly_chart(f7, width='stretch', config={"displayModeBar":False})
         with _s4_r4c2:
             f8 = _s4_evr_bar(_evr_oic_s,
-                             f"★ OI-Chg-Wtd CE/PE EV Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×ΔOI rich · Red<1=Put EV×ΔOI rich")
+                             f"★ OI-Chg-Wtd Sentiment per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×ΔOI rich · Red<1=Put EV×ΔOI rich")
             st.plotly_chart(f8, width='stretch', config={"displayModeBar":False})
 
         # ★ v12: mask-aware per-strike CE/PE ratio bar (baseline = 1).
@@ -7995,9 +7995,9 @@ with _slot_s2:   # v8: render into top-of-dashboard slot (display order only)
     with metrics_col:
         mc = st.columns(4)
         metric_items = [
-            ("EV Ratio (Raw Avg)", m.get("ev_ratio_avg_strikewise", 1.0),
+            ("Sentiment (Raw Avg)", m.get("ev_ratio_avg_strikewise", 1.0),
                  GREEN if m.get("ev_ratio_avg_strikewise", 1.0)>1.2 else (SKY if m.get("ev_ratio_avg_strikewise", 1.0)>=0.7 else RED)),
-            ("EV Ratio (OI-Wtd Avg)", m.get("ev_ratio_oiw_avg_strikewise", 1.0),
+            ("Sentiment (OI-Wtd Avg)", m.get("ev_ratio_oiw_avg_strikewise", 1.0),
                  GREEN if m.get("ev_ratio_oiw_avg_strikewise", 1.0)>=1.05 else (AMBER if m.get("ev_ratio_oiw_avg_strikewise", 1.0)>=0.95 else RED)),
             ("Net Delta", f"{int(m['net_delta']):,}", GREEN if m["net_delta"]>0 else RED),
             ("Momentum",  f"{int(m['momentum']):,}",  GREEN if m["momentum"]>0 else RED),
