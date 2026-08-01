@@ -7575,6 +7575,18 @@ _ph_hidden_s1.empty()        # v20: Section 1 Market Sentiments visual output su
 with _slot_summary:
     st.markdown('<div class="section-header">&#128204; Shantanu&#39;s Final Decision Matrix</div>', unsafe_allow_html=True)
 
+    # ── v23 HOIST: Section 10 basis triangulation, computed EARLY ──────────
+    # Previously computed at the Section 10 render site further down. Moved up
+    # verbatim so the Final Decision Matrix can read futures data. Pure MOVE:
+    #   • identical arguments — all already populated far above here;
+    #   • fetch_futures_ltp() is NOT called here, it already ran once when the
+    #     payload was built, so this adds ZERO network requests;
+    #   • Section 10 below now REUSES sf_res/sig10 instead of recomputing, so
+    #     its rendered output is identical by construction.
+    _atm_s10 = safe_num(m.get("atm", 0))
+    sf_res   = compute_synthetic_future(payload["df_band"], spot, _atm_s10, expiry)
+    sig10    = compute_basis_signals(sf_res, payload.get("traded_future"))
+
     _sum_cw  = _gv_levels_snapshot.get("call_wall")  if _gv_levels_snapshot else None
     _sum_pw  = _gv_levels_snapshot.get("put_wall")   if _gv_levels_snapshot else None
     _sum_gfl = _gv_levels_snapshot.get("gamma_flip") if _gv_levels_snapshot else gflip_str
@@ -7634,6 +7646,11 @@ with _slot_summary:
     #   • BREAKOUT ALERT (DEEP GREEN) — exact mirror at the Call Wall
     #   • Alert bias is STICKY — held until ATM and BOTH ATM±1 strikes return to
     #     the neutral band, then reverts to SIDEWAYS.
+    # v23: defaults declared up-front so the Futures Confirmation panel below
+    # can read them safely even if this block raises. _bs_ok is the sentinel —
+    # only set True once the block has completed successfully.
+    _bs_ok, _bs_bias, _dex_tilt, _tilt_weak = False, "SIDEWAYS", 0.0, False
+    _bs_pw = _bs_cw = _prev_basis_gap = None
     try:
         _bs_file = os.path.join(_BASE_DIR, "bias_summary_state_streamlit.json")
         _bs_pw   = int(_sum_pw) if _sum_pw is not None else None
@@ -7674,6 +7691,11 @@ with _slot_summary:
         _prev_lo, _prev_hi = _bs_prev.get("neu_lo"),   _bs_prev.get("neu_hi")
         _prev_bias         = _bs_prev.get("bias", "SIDEWAYS")
         _prev_mp           = _bs_prev.get("max_pain")
+        # v23 (Layer C): previous tick's futures−synthetic gap, read from the
+        # SAME per-tick state file the wall / max-pain movement lines already
+        # use — so the "vs previous data refresh" comparison is tick-aligned
+        # with every other movement note in this panel.
+        _prev_basis_gap    = _bs_prev.get("basis_gap")
 
         _near_pw  = _bs_pw is not None and spot <= _bs_pw + _bs_step
         _near_cw  = _bs_cw is not None and spot >= _bs_cw - _bs_step
@@ -7822,10 +7844,17 @@ with _slot_summary:
             _bs_lines.append(f"MAX PAIN moved {'UP' if _bs_mp > _prev_mp else 'DOWN'} — {_prev_mp:,} → {_bs_mp:,} vs previous data refresh.")
 
         if _bs_prev.get("ts") != _bs_ts:   # persist once per data tick (not per rerender)
+            # v23: basis_gap appended so Layer C can show the futures−synthetic
+            # gap trend on the next tick. Additive key — older state files
+            # without it simply read back None and the trend line is skipped.
             _atomic_json_write(_bs_file, {
                 "date": _bs_today, "ts": _bs_ts, "put_wall": _bs_pw, "call_wall": _bs_cw,
                 "neu_lo": _bs_neu_lo, "neu_hi": _bs_neu_hi, "neutral_count": _bs_neu,
-                "bias": _bs_bias, "max_pain": _bs_mp})
+                "bias": _bs_bias, "max_pain": _bs_mp,
+                "basis_gap": (round(float(sig10["basis_gap"]), 2)
+                              if (sig10 and sig10.get("has_traded")
+                                  and sig10.get("basis_gap") is not None) else None)})
+        _bs_ok = True          # v23 sentinel — block completed cleanly
         _bs_bullets = ''.join(
             f'<div style="font-size:13px;color:#111;margin-top:3px;">• {_l}</div>'
             for _l in _bs_lines)
@@ -7838,6 +7867,145 @@ with _slot_summary:
         </div>""", unsafe_allow_html=True)
     except Exception as _bs_err:
         st.info(f"Bias Summary — collecting data ({_bs_err}).")
+
+    # ── Futures Confirmation (v23) — ADDITIVE ONLY ─────────────────────────
+    # Reads the hoisted Section 10 objects (sig10) plus the DEX tilt / wall
+    # values the Bias Summary above already computed. Adds NOTHING to the
+    # headline verdict: _bs_bias, the sticky-alert state machine, Grade A/B
+    # logic and the release rule are untouched (decision D1a). This panel is
+    # purely explanatory and renders nothing at all when the futures feed is
+    # absent, restoring byte-identical pre-v23 output.
+    #
+    # Three layers, all from values already computed elsewhere:
+    #   A. Futures−Fair  ×  Synth−Fair   → 3x3 agreement read (any regime)
+    #   B. DEX tilt      ×  Futures−Fair → lopsided-range read (SIDEWAYS only)
+    #   C. |basis_gap| vs previous tick  → basis tension widening/narrowing
+    #
+    # NOTE on Layer B (documented limitation): the existing _dex_tilt sums
+    # abs(dv), so it measures WHICH SIDE CARRIES MORE dealer positioning weight
+    # — it is deliberately direction-agnostic (decision D2a keeps it that way).
+    # Futures therefore supply the direction the tilt cannot. The join "the
+    # lighter-weighted side is the thinner wall" is a structural reading, NOT a
+    # backtested rule; wording below stays descriptive rather than predictive.
+    try:
+        if sig10 and sig10.get("has_traded") and _bs_ok:
+            _fc_thr   = max(spot * 0.0004, 5.0)      # same thr as compute_basis_signals
+            _fc_te    = sig10.get("traded_excess")
+            _fc_se    = sig10.get("synth_excess")
+            _fc_gap   = sig10.get("basis_gap")
+            _fc_lines = []
+
+            def _fc_cat(_v):
+                if _v is None or not np.isfinite(_v):
+                    return None
+                return "Premium" if _v > _fc_thr else ("Discount" if _v < -_fc_thr else "Neutral")
+
+            _fc_tcat, _fc_scat = _fc_cat(_fc_te), _fc_cat(_fc_se)
+
+            # ── Layer A — futures vs options agreement (all regimes) ─────────
+            _fc_A = {
+                ("Premium",  "Premium"):  ("ALIGNED BULLISH",  "#047857",
+                    "Futures and options pricing agree — both trade above fair carry."),
+                ("Premium",  "Neutral"):  ("FUTURES LEADING",  "#047857",
+                    "Futures trade above fair carry while options price at carry — futures are leading, options have not confirmed."),
+                ("Premium",  "Discount"): ("SPLIT BOOKS",      "#D97706",
+                    "Futures bid above fair carry while options price below it — the two markets disagree."),
+                ("Neutral",  "Premium"):  ("OPTIONS LEADING",  "#047857",
+                    "Options price above fair carry while futures sit at carry — options are leading, futures have not confirmed."),
+                ("Neutral",  "Neutral"):  ("CARRY-NEUTRAL",    "#0EA5E9",
+                    "Both futures and options sit at fair carry — no directional edge from the basis."),
+                ("Neutral",  "Discount"): ("OPTIONS LEADING DOWN", "#D97706",
+                    "Options price below fair carry while futures sit at carry — options are leading lower, futures have not confirmed."),
+                ("Discount", "Premium"):  ("SPLIT BOOKS",      "#D97706",
+                    "Futures trade below fair carry while options price above it — the two markets disagree."),
+                ("Discount", "Neutral"):  ("FUTURES LEADING DOWN", "#DC2626",
+                    "Futures trade below fair carry while options price at carry — futures are leading lower, options have not confirmed."),
+                ("Discount", "Discount"): ("ALIGNED BEARISH",  "#DC2626",
+                    "Futures and options pricing agree — both trade below fair carry."),
+            }
+            _fc_head, _fc_col = "FUTURES DATA INCOMPLETE", "#6B7280"
+            if _fc_tcat and _fc_scat:
+                _fc_head, _fc_col, _fc_txt = _fc_A[(_fc_tcat, _fc_scat)]
+                _fc_lines.append(_fc_txt)
+                _fc_lines.append(
+                    f"Futures − Fair {_fc_te:+.1f}pts ({_fc_tcat}) · Synthetic − Fair {_fc_se:+.1f}pts "
+                    f"({_fc_scat}) · threshold ±{_fc_thr:.1f}pts.")
+
+            # ── Layer B — lopsided walls × futures (SIDEWAYS regime only) ────
+            if _bs_bias == "SIDEWAYS":
+                _fc_pw_txt = f"{_bs_pw:,}" if _bs_pw is not None else "N/A"
+                _fc_cw_txt = f"{_bs_cw:,}" if _bs_cw is not None else "N/A"
+                if _tilt_weak and _fc_tcat:
+                    # tilt > 0 → support side carries MORE weight → the
+                    # resistance (Call Wall) side is the thinner one.
+                    _heavy = "support (Put-Wall)" if _dex_tilt > 0 else "resistance (Call-Wall)"
+                    _thin  = ("Call Wall " + _fc_cw_txt) if _dex_tilt > 0 else ("Put Wall " + _fc_pw_txt)
+                    _tilt_dir = 1 if _dex_tilt > 0 else -1        # direction the THIN wall implies
+                    _fut_dir  = 1 if _fc_tcat == "Premium" else (-1 if _fc_tcat == "Discount" else 0)
+                    if _fut_dir == 0:
+                        _fc_lines.append(
+                            f"Lopsided range check: positioning weight is concentrated on the {_heavy} side "
+                            f"(tilt {_dex_tilt:+.0%}), but futures sit at fair carry — no directional "
+                            f"confirmation from the futures side yet.")
+                    elif _fut_dir == _tilt_dir:
+                        _fc_lines.append(
+                            f"Lopsided range check: positioning weight is concentrated on the {_heavy} side "
+                            f"(tilt {_dex_tilt:+.0%}), leaving {_thin} as the thinner wall — and futures "
+                            f"{'above' if _fut_dir > 0 else 'below'} fair carry point the same way. "
+                            f"Structure and futures agree on which side is under pressure.")
+                    else:
+                        _fc_lines.append(
+                            f"Lopsided range check: positioning weight is on the {_heavy} side "
+                            f"(tilt {_dex_tilt:+.0%}, thinner wall {_thin}) but futures trade "
+                            f"{'above' if _fut_dir > 0 else 'below'} fair carry — structure and futures "
+                            f"DISAGREE; treat the lopsided range as unresolved.")
+                elif (not _tilt_weak) and _fc_gap is not None and np.isfinite(_fc_gap):
+                    if abs(_fc_gap) <= _fc_thr:
+                        _fc_lines.append(
+                            f"Balanced range check: dealer positioning is balanced (tilt {_dex_tilt:+.0%}) and "
+                            f"futures track the synthetic within {abs(_fc_gap):.1f}pts — structure and basis "
+                            f"both confirm the sideways range.")
+                    else:
+                        _fc_lines.append(
+                            f"Balanced range check: dealer positioning is balanced (tilt {_dex_tilt:+.0%}), but "
+                            f"futures and the synthetic disagree by {_fc_gap:+.1f}pts — basis tension is "
+                            f"present even though the option structure looks calm.")
+
+            # ── Layer C — basis gap trend vs previous data refresh ───────────
+            if (_fc_gap is not None and np.isfinite(_fc_gap)
+                    and _prev_basis_gap is not None):
+                try:
+                    _pg = float(_prev_basis_gap)
+                    if abs(_fc_gap) > abs(_pg):
+                        _fc_lines.append(
+                            f"FUTURES–SYNTHETIC GAP WIDENING — {_pg:+.1f}pts → {_fc_gap:+.1f}pts vs previous "
+                            f"data refresh: the two markets are pulling further apart.")
+                    elif abs(_fc_gap) < abs(_pg):
+                        _fc_lines.append(
+                            f"FUTURES–SYNTHETIC GAP NARROWING — {_pg:+.1f}pts → {_fc_gap:+.1f}pts vs previous "
+                            f"data refresh: the two markets are converging.")
+                except (TypeError, ValueError):
+                    pass
+
+            if _fc_lines:
+                _fc_bg = {"#047857": "#D1FAE5", "#DC2626": "#FEE2E2",
+                          "#D97706": "#FFFBEB", "#0EA5E9": "#E0F2FE"}.get(_fc_col, "#F9FAFB")
+                _fc_bullets = ''.join(
+                    f'<div style="font-size:13px;color:#111;margin-top:3px;">• {_l}</div>'
+                    for _l in _fc_lines)
+                st.markdown(f"""
+                <div style="background:{_fc_bg};border:2px solid {_fc_col};border-radius:10px;
+                            padding:12px 16px;margin-top:10px;">
+                  <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Futures Confirmation &middot; Section 10 basis, read against the option structure above</div>
+                  <div style="font-size:18px;font-weight:900;color:{_fc_col};margin:2px 0 6px;">&#9878; {_fc_head}</div>
+                  {_fc_bullets}
+                  <div style="font-size:11px;color:#6B7280;margin-top:7px;font-style:italic;">
+                    Explanatory only — does not alter the Bias Summary verdict above.
+                    Layer B pairs a magnitude-only DEX tilt with futures direction;
+                    structural reading, not a backtested rule.</div>
+                </div>""", unsafe_allow_html=True)
+    except Exception as _fc_err:
+        st.info(f"Futures Confirmation — collecting data ({_fc_err}).")
 
     # v21: Section 4 Summary — standalone verdict built ONLY from Section 4's
     # own 12 charts, independent of Section 3 / Bias Score / Bias Summary
@@ -8033,9 +8201,11 @@ with _slot_s10:   # v8: render into top-of-dashboard slot (display order only)
     st.markdown('<div class="section-header"> Section 10  Basis Triangulation · Spot · Synthetic Future · NIFTY Futures</div>', unsafe_allow_html=True)
     st.caption("Put-call parity synthetic future vs live traded NIFTY futures vs fair carry. Futures − Synthetic (★) is the primary leading signal.")
 
-    _atm_s10 = safe_num(m.get("atm", 0))
-    sf_res   = compute_synthetic_future(payload["df_band"], spot, _atm_s10, expiry)
-    sig      = compute_basis_signals(sf_res, payload.get("traded_future"))
+    # v23: _atm_s10 / sf_res / sig10 are now computed once in the HOIST block
+    # at the top of the Final Decision Matrix so the top panel can read them.
+    # Nothing is recomputed here — `sig` is bound to that same object, so this
+    # section renders identically to pre-v23.
+    sig = sig10
 
     if sig:
         b10c1, b10c2, b10c3, b10c4 = st.columns(4)
