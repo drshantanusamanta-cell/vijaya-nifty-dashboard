@@ -11,6 +11,9 @@
 ║  v9 — Owner refresh dropdown: new 30-sec Turbo interval added      ║
 ║  v10 — Enhanced NDM Buyer/Seller Matrix (per-strike EVR × Δ-Wtd    ║
 ║        OI Chg Momentum) · 15-min verdict log · View under Sec-4    ║
+║  v24 — 13-Aug-2026: NIFTY futures contract-resolution fix           ║
+║        (NIFTYFPI symbol collision) + spot sanity guard +            ║
+║        dual-expiry Max Pain: CURRENT / NEXT, W/M tagged             ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -1028,6 +1031,13 @@ def get_option_chain(expiry=None):
 
 
 # ─── NIFTY Futures LTP ────────────────────────────────────────────────────────
+import re
+
+# v24 (2026-08-13): exact-match pattern for the plain NIFTY 50 index future.
+# Accepts "NIFTY-AUG2026-FUT" and "NIFTY26AUGFUT". Rejects NIFTYNXT50-*, NIFTYFPI-*
+# and any future NIFTY<suffix> index-future family NSE introduces.
+_NIFTY_FUT_PATTERN = r"^NIFTY(?:-[A-Z]{3}\d{4}-FUT|\d{2}[A-Z]{3}FUT)$"
+
 _fut_master_df   = None
 _fut_id_cache    = {}
 _fut_master_lock = threading.Lock()
@@ -1072,23 +1082,45 @@ def _resolve_futures_id(near_expiry_str=None):
         if instr_col:
             df = df[df[instr_col].astype(str).str.strip().str.upper().isin(["FUTIDX"])]
         tsym_s = df[tsym_col].astype(str).str.strip().str.upper()
-        mask = tsym_s.str.startswith("NIFTY") & tsym_s.str.endswith("FUT")
+        # ── v24 FIX (2026-08-13) ────────────────────────────────────────────
+        # NSE listed NIFTYFPI (Nifty India FPI 150) FUTIDX contracts on
+        # 2026-08-12 with the same 25-Aug expiry as NIFTY. The old test
+        # startswith("NIFTY") also matched NIFTYFPI-* and NIFTYNXT50-*, and
+        # sort_values() defaults to UNSTABLE quicksort, so iloc[0] among rows
+        # tied on expiry was arbitrary. Match the FULL trading symbol instead.
+        mask = tsym_s.str.match(_NIFTY_FUT_PATTERN, na=False)
+        if not mask.any():
+            # Fallback if Dhan ever reformats: exact root before the first hyphen.
+            mask = (tsym_s.str.split("-").str[0] == "NIFTY") & tsym_s.str.endswith("FUT")
         df = df[mask].copy()
         if df.empty:
             return None, None
         df["_expdt"] = pd.to_datetime(df[expdt_col], dayfirst=True, errors="coerce").dt.date
-        df = df[df["_expdt"] >= today].sort_values("_expdt")
+        df = df[df["_expdt"].notna()]
         if df.empty:
             return None, None
+        df = df[df["_expdt"] >= today]
+        if df.empty:
+            return None, None
+        # v24 FIX: stable mergesort + security-id tie-break => deterministic pick.
+        df = df.sort_values(["_expdt", secid_col], kind="mergesort")
         chosen = df.iloc[0]
-        return str(int(float(chosen[secid_col]))), chosen["_expdt"]
+        sec_id = str(int(float(chosen[secid_col])))
+        try:
+            print(f"[_resolve_futures_id] resolved -> {str(chosen[tsym_col]).strip()} "
+                  f"| id={sec_id} | expiry={chosen['_expdt']}", flush=True)
+        except Exception:
+            pass
+        return sec_id, chosen["_expdt"]
     except Exception:
         return None, None
 
 _fut_ltp_cache = {"ltp": 0.0, "ts": 0.0}
 _FUT_CACHE_SEC = 58
 
-def fetch_futures_ltp(near_expiry_str=None):
+def fetch_futures_ltp(near_expiry_str=None, spot=None):
+    # v24: `spot` is optional — omit it and the sanity guard below is skipped,
+    # so every pre-existing call site keeps working unchanged.
     if not USE_DHAN:
         return 0.0
     now = time.time()
@@ -1113,6 +1145,24 @@ def fetch_futures_ltp(near_expiry_str=None):
         for _, info in seg.items():
             ltp = float(info.get("last_price") or info.get("ltp") or 0)
             if ltp > 0:
+                # ── v24 FIX: spot sanity guard ──────────────────────────────
+                # NIFTY futures never trade >3% from spot. If they appear to, we
+                # resolved the wrong contract — drop the cached id so the next
+                # tick re-resolves, and return 0.0 so has_traded goes False and
+                # the Futures Confirmation panel hides instead of printing a
+                # fabricated basis into the Final Decision Matrix.
+                _s = safe_num(spot, 0) if spot is not None else 0
+                if _s > 0 and abs(ltp - _s) / _s > 0.03:
+                    try:
+                        print(f"[fetch_futures_ltp] REJECTED ltp={ltp} vs spot={_s} "
+                              f"(securityId={cached.get('id')}) — wrong contract "
+                              f"resolved, clearing id cache", flush=True)
+                    except Exception:
+                        pass
+                    _fut_id_cache.pop("NIFTY", None)
+                    _fut_ltp_cache["ltp"] = 0.0
+                    _fut_ltp_cache["ts"]  = 0.0
+                    return 0.0
                 _fut_ltp_cache["ltp"] = ltp
                 _fut_ltp_cache["ts"]  = now
                 return ltp
@@ -1149,6 +1199,79 @@ def compute_max_pain(df):
         pl = (upper["put_oi"] * (upper["strike"] - K)).sum()
         results[K] = cl + pl
     return float(min(results, key=results.get)) if results else 0.0
+
+
+# ─── v24 ADDITION: dual-expiry Max Pain (CURRENT + NEXT) ───────────────────
+# COST: zero additional Dhan API calls in the default path.
+#   • fetch_dhan_expiry_list()    — memoised ttl=300, already called every refresh.
+#   • fetch_back_expiry_oi_band() — memoised ttl=300, already called every refresh
+#     by the roll-detection engine, and it already returns exactly the three
+#     columns compute_max_pain() needs (strike / call_oi / put_oi).
+# Both calls below are therefore cache hits in steady state. Dhan's option-chain
+# limit is 1 unique request per 3s; this adds no new unique request.
+# ONE EXCEPTION: if the user picks a non-default expiry in the override selector,
+# "next" is the expiry after the selected one, which may not be the frame the
+# roll engine cached — that resolves to one extra (throttled, memoised) call.
+def _fmt_expiry_label(exp_str):
+    """'2026-08-25' -> '25-AUG'."""
+    try:
+        return datetime.strptime(str(exp_str)[:10], "%Y-%m-%d").strftime("%d-%b").upper()
+    except Exception:
+        return str(exp_str or "")[:10]
+
+
+def get_dual_max_pain(front_max_pain, front_expiry=None):
+    """
+    Returns (cur_mp:int, cur_label:str, next_mp:int|None, next_label:str).
+
+    next_mp is None whenever the next-expiry chain is unavailable. Callers MUST
+    render "N/A" in that case — never fall back to the current-expiry value, or
+    the two tiles silently agree and the comparison becomes meaningless.
+    """
+    cur_mp  = int(safe_num(front_max_pain, 0))
+    cur_lbl = _fmt_expiry_label(front_expiry)
+    nxt_mp, nxt_lbl = None, ""
+    try:
+        # v24 HARDENING: Dhan's expirylist happens to arrive ascending, but
+        # nothing in the API contract guarantees it and the rest of this file
+        # already indexes it positionally. Sort explicitly — the strings are ISO
+        # "YYYY-MM-DD", so lexicographic order IS chronological order. This is the
+        # same unverified-ordering assumption that broke the futures resolver.
+        exps = sorted({str(e)[:10] for e in (fetch_dhan_expiry_list() or []) if e})
+
+        # NIFTY carries weekly (every Tuesday) AND monthly (last Tuesday)
+        # expiries in one list. CURRENT/NEXT are simply the two nearest entries,
+        # whichever kind they happen to be — no weekly/monthly filtering.
+        if front_expiry and str(front_expiry)[:10] in exps:
+            _i  = exps.index(str(front_expiry)[:10])
+            nxt = exps[_i + 1] if _i + 1 < len(exps) else None
+        else:
+            nxt = exps[1] if len(exps) > 1 else None
+
+        # Tag each series W or M. An expiry is the monthly if no LATER expiry
+        # falls in the same calendar month — derived from the list itself, so it
+        # stays correct if SEBI moves the settlement weekday again.
+        def _kind(e):
+            if not e:
+                return ""
+            return "M" if not any(o > e and o[:7] == e[:7] for o in exps) else "W"
+
+        _ck = _kind(str(front_expiry)[:10] if front_expiry else None)
+        if _ck:
+            cur_lbl = f"{cur_lbl} {_ck}"
+
+        if nxt:
+            nxt_lbl = f"{_fmt_expiry_label(nxt)} {_kind(nxt)}".strip()
+            band = fetch_back_expiry_oi_band(nxt)          # cache hit in steady state
+            if band is not None and not band.empty:
+                _v = compute_max_pain(band)
+                nxt_mp = int(_v) if _v and _v > 0 else None
+    except Exception as e:
+        try:
+            print(f"[get_dual_max_pain] {e}", flush=True)
+        except Exception:
+            pass
+    return cur_mp, cur_lbl, nxt_mp, nxt_lbl
 
 
 def compute_metrics(df, spot, expiry=None, history=None):
@@ -3696,7 +3819,7 @@ def _raw_fetch_and_compute(expiry_override=None, history=None):
     df_band  = m.pop("df_band", df)
     df_sig   = m.pop("df_signal", df)
 
-    traded_fut   = fetch_futures_ltp(expiry)
+    traded_fut   = fetch_futures_ltp(expiry, spot)   # v24: spot enables sanity guard
     _atm         = safe_num(m.get("atm", 0))
     _df_band_lst = df_band.fillna(0).to_dict("records")
     m["_df_band_records"] = _df_band_lst
@@ -6898,9 +7021,16 @@ with _slot_s3:   # v8: render into top-of-dashboard slot (display order only)
     gflip_str = str(int(gflip)) if gflip else "N/A"
     spot_vs_atm = spot - safe_num(m.get("atm", spot))
     chg_col = GREEN if spot_vs_atm >= 0 else RED
+    # v24: dual-expiry Max Pain — no extra Dhan calls, see get_dual_max_pain().
+    _mp_cur_s3, _mp_lbl_s3, _mp_nxt_s3, _mp_nxtlbl_s3 = get_dual_max_pain(
+        m["max_pain"], payload.get("expiry"))
     level_items = [
         ("Spot",       f"{spot:,.2f}",             GREEN if spot_vs_atm>=0 else RED, f"vs ATM {spot_vs_atm:+.1f}"),
-        ("Max Pain",   int(m["max_pain"]),          PINK,    "Writer equilibrium"),
+        ("Max Pain · CURRENT", f"{_mp_cur_s3:,}",  PINK,
+                       f"Exp {_mp_lbl_s3} · writer equilibrium"),
+        ("Max Pain · NEXT",    (f"{_mp_nxt_s3:,}" if _mp_nxt_s3 else "N/A"), CYAN,
+                       (f"Exp {_mp_nxtlbl_s3} · next-series pull" if _mp_nxt_s3
+                        else "Next expiry unavailable")),
         ("Support",    int(m["support"]),           GREEN,   f"Dist: {m['dist_to_support']:.0f}"),
         ("Resistance", int(m["resistance"]),        RED,     f"Dist: {m['dist_to_resistance']:.0f}"),
         ("ATM Strike", int(m["atm"]),               BLUE,    "Nearest strike"),
@@ -6910,7 +7040,7 @@ with _slot_s3:   # v8: render into top-of-dashboard slot (display order only)
         ("Net GEX",    f"{gex_val:,.0f}",           GREEN if gex_val>0 else RED,
                        "+ve=pin / -ve=trend"),
     ]
-    lv_cols = st.columns(8)
+    lv_cols = st.columns(9)   # v24: 8 -> 9 for the second Max Pain tile
     for col, (label, val, color, tip) in zip(lv_cols, level_items):
         col.markdown(f"""
         <div class="card" style="text-align:center;border-bottom:3px solid {color};">
@@ -7603,9 +7733,16 @@ with _slot_summary:
     _pw_load = _wall_load(_sum_pw)
     _cw_load = _wall_load(_sum_cw)
 
+    # v24: dual-expiry Max Pain — no extra Dhan calls, see get_dual_max_pain().
+    _mp_cur_s4, _mp_lbl_s4, _mp_nxt_s4, _mp_nxtlbl_s4 = get_dual_max_pain(
+        m["max_pain"], payload.get("expiry"))
     _sum_items = [
         ("Spot",       f"{spot:,.2f}",              GREEN if spot_vs_atm >= 0 else RED, f"vs ATM {spot_vs_atm:+.1f}"),
-        ("Max Pain",   f"{int(m['max_pain']):,}",   PINK,                               "Writer equilibrium"),
+        ("Max Pain · CURRENT", f"{_mp_cur_s4:,}",   PINK,
+                        f"Exp {_mp_lbl_s4} · writer equilibrium"),
+        ("Max Pain · NEXT",    (f"{_mp_nxt_s4:,}" if _mp_nxt_s4 else "N/A"), CYAN,
+                        (f"Exp {_mp_nxtlbl_s4} · next-series pull" if _mp_nxt_s4
+                         else "Next expiry unavailable")),
         ("Net GEX",    f"{gex_val:,.0f}",           GREEN if gex_val > 0 else RED,      "+ve=pin / -ve=trend"),
         ("Put Wall",   f"{_sum_pw:,}" if _sum_pw is not None else "N/A",   GREEN,
                         "GEX support floor" + (f" · load {_pw_load}%" if _pw_load is not None else "")),
@@ -7615,7 +7752,7 @@ with _slot_summary:
                         RED if (gflip and spot < gflip) else GREEN,
                         ("Short-γ zone" if gflip and spot < gflip else "Above flip")),
     ]
-    _sum_cols = st.columns(6)
+    _sum_cols = st.columns(7)   # v24: 6 -> 7 for the second Max Pain tile
     for col, (label, val, color, tip) in zip(_sum_cols, _sum_items):
         col.markdown(f"""
         <div class="card" style="text-align:center;border-bottom:3px solid {color};">
