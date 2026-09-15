@@ -14,6 +14,9 @@
 ║  v24 — 13-Aug-2026: NIFTY futures contract-resolution fix           ║
 ║        (NIFTYFPI symbol collision) + spot sanity guard +            ║
 ║        dual-expiry Max Pain: CURRENT / NEXT, W/M tagged             ║
+║  v25 — 15-Sep-2026: GEX × Gamma Flip Regime Matrix (3×3 live cell, ║
+║        confidence + levels) added inside Shantanu's Final Decision ║
+║        Matrix — independent add-on, no existing logic changed      ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -676,6 +679,253 @@ def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamm
         return "FLIP ZONE / UNSTABLE", vol_regime, near_flip
     else:
         return "TRANSITION",           vol_regime, near_flip
+
+
+# ─── v25 ADDITION: GEX × Gamma Flip Regime Matrix (independent add-on) ──────────
+# Classifies the live snapshot into one of 9 cells:
+#   rows    = Net GEX vs its typical size  (positive / near zero / negative)
+#   columns = spot vs Gamma Flip           (above / near / below)
+# Pure read-only: consumes values already computed elsewhere (spot, m["gex"],
+# m["gamma_flip"], GEX walls, history, VIX, VWAP). Nothing upstream is modified
+# and no existing verdict, score or state file reads its output.
+#   • "Typical |GEX|" = median |Net GEX| over the persisted history ticks.
+#     Until GRM_MIN_HIST ticks exist the row is decided by GEX sign alone.
+#   • Momentum sign follows the dashboard's existing convention
+#     (compute_nifty_bias / GRF): momentum > 0 = bullish flow.
+GRM_BAND_PCT  = 0.30   # near-flip band, % of spot (0.30% ≈ 75 pts at 25,000)
+GRM_ZERO_MULT = 0.25   # |Net GEX| < 0.25 × typical |GEX|  →  "near zero" row
+GRM_MIN_HIST  = 20     # ticks required before the typical-|GEX| scale is used
+
+GRM_CELLS = {
+    "pos_above": dict(name="Pinned range", tag="Dampened", tone="pin", dir="Neutral, mild up-drift", dirn=0.0, base=6,
+        expect="Dealers sell rallies and buy dips. Realised move usually smaller than implied; breakouts fade.",
+        posture="Fade the edges: sell near the call wall, buy near the put wall. Iron condors or strangles beyond the walls are favoured. Skip opening-range breakout buys.",
+        inv="15-min close below the flip"),
+    "pos_near": dict(name="Fragile floor", tag="Dampening thinning", tone="warn", dir="Neutral · decision zone", dirn=0.0, base=4,
+        expect="Flip acts as support while GEX stays positive. A hold sends price back into the range; a break turns dealers into amplifiers.",
+        posture="Wait for the reaction. Long on a hold with a stop just under the flip; flip short on a decisive break. Cut short-premium size.",
+        inv="Acceptance beyond the near-flip band"),
+    "pos_below": dict(name="Stale signal", tag="Conflict", tone="warn", dir="Lean bearish", dirn=-1.0, base=3,
+        expect="Net GEX is positive but spot is already under the flip. Usually far-OTM call gamma inflating the total, or a fast move after the snapshot. Gamma at spot is likely negative.",
+        posture="Recompute first. Until then treat it as negative gamma: don't buy dips blindly, sell bounces into the flip.",
+        inv="Reclaim and hold above the flip"),
+    "zero_above": dict(name="Loose drift", tag="Weak dealer influence", tone="up", dir="Mild bullish", dirn=0.5, base=4,
+        expect="Hedging flows are too small to steer price; order flow and fresh OI decide. Trends can start but follow-through is thin.",
+        posture="Trade price action and OI momentum. Smaller size, wider stops. Buy dips toward the flip if puts are being written.",
+        inv="Break below the flip"),
+    "zero_near": dict(name="Vol coil", tag="Maximum uncertainty", tone="warn", dir="No bias", dirn=0.0, base=3,
+        expect="Sitting at zero gamma, nothing damps a move. Range compresses, then expands sharply either way.",
+        posture="Stand aside, or own gamma (long straddle/strangle) if IV isn't rich. Trade the opening-range break, not a forecast.",
+        inv="A clean trend away from the flip means reclassify"),
+    "zero_below": dict(name="Loose slide", tag="Weak amplification", tone="down", dir="Mild bearish", dirn=-0.5, base=4,
+        expect="Dealer selling on dips starts to matter as GEX tips negative. Supports break more easily than they hold.",
+        posture="Sell rallies toward the flip. Prefer bear put spreads over naked puts; don't catch falling knives.",
+        inv="Reclaim of the flip"),
+    "neg_above": dict(name="Squeeze", tag="Conflict", tone="up", dir="Bullish momentum", dirn=1.0, base=5,
+        expect="Spot has pushed above the flip while Net GEX is still negative. Short-gamma hedgers chase the rally; moves can overshoot to the call wall.",
+        posture="Momentum long or bull call spreads toward the call wall, trailing stops. Don't short strength until GEX turns positive or the call wall rejects.",
+        inv="Slip back below the flip"),
+    "neg_near": dict(name="Knife edge", tag="Short gamma at the pivot", tone="warn", dir="Two-sided breakout", dirn=0.0, base=4,
+        expect="The most explosive cell. A reclaim triggers a squeeze, a loss triggers liquidation. Whipsaws around the level are common.",
+        posture="Set both triggers in advance: long above flip + band, short below flip − band. Enter on candle close with volume; small size, fast stops.",
+        inv="Chop inside the band for 45 min: stand aside"),
+    "neg_below": dict(name="Trend amplifier", tag="Short gamma", tone="down", dir="Bearish continuation", dirn=-1.0, base=6,
+        expect="Hedgers sell into falls and buy into rises, adding fuel. Widest intraday ranges; India VIX usually firm. Relief rallies are sharp but tend to fail under the flip.",
+        posture="Sell rallies; buy puts or bear put spreads toward the put wall. No naked premium selling. Never fade a breakdown here.",
+        inv="15-min close back above the flip"),
+}
+GRM_ROWS = [("pos", "Net GEX positive", f"> +{GRM_ZERO_MULT:.2f}× typical"),
+            ("zero", "Net GEX near zero", f"within ±{GRM_ZERO_MULT:.2f}×"),
+            ("neg", "Net GEX negative", f"< −{GRM_ZERO_MULT:.2f}× typical")]
+GRM_COLS = [("above", "Spot above flip", "beyond +band"),
+            ("near", "Spot near flip", "inside ±band"),
+            ("below", "Spot below flip", "beyond −band")]
+GRM_TONES = {  # (text/border colour, background) — dashboard palette
+    "pin":  ("#2563EB", "#DBEAFE"),
+    "up":   ("#047857", "#D1FAE5"),
+    "down": ("#DC2626", "#FEE2E2"),
+    "warn": ("#B45309", "#FEF3C7"),
+}
+
+
+def compute_gamma_regime_matrix(spot, gex, gamma_flip, call_wall=None, put_wall=None,
+                                history=None, momentum=None, vix_change=None,
+                                above_vwap=None, expiry=None, now=None,
+                                band_pct=GRM_BAND_PCT, zero_mult=GRM_ZERO_MULT):
+    """Return a dict describing the active GEX × Gamma-Flip cell, or
+    {"available": False, "reason": ...} when spot / flip / GEX are missing."""
+    spot = safe_num(spot, 0.0)
+    gex = safe_num(gex, 0.0)
+    flip = safe_num(gamma_flip, 0.0) if gamma_flip is not None else 0.0
+    if spot <= 0 or flip <= 0:
+        return {"available": False, "reason": "Gamma Flip or spot unavailable for this tick"}
+
+    # Typical |Net GEX| from persisted history (multi-day, ≤500 ticks)
+    _abs_hist = [abs(safe_num(h.get("gex"), 0.0)) for h in (history or [])
+                 if h.get("gex") not in (None, 0, 0.0)]
+    _days = len({str(h.get("ts", ""))[:10] for h in (history or []) if h.get("gex") not in (None, 0, 0.0)})
+    calibrated = len(_abs_hist) >= GRM_MIN_HIST
+    typical = float(np.median(_abs_hist)) if calibrated else max(abs(gex), 1.0)
+    ratio = gex / typical if typical > 0 else 0.0
+
+    dist_pts = spot - flip
+    dist_pct = dist_pts / spot * 100.0
+    col = "near" if abs(dist_pct) <= band_pct else ("above" if dist_pct > 0 else "below")
+    if calibrated:
+        row = "pos" if ratio > zero_mult else ("neg" if ratio < -zero_mult else "zero")
+    else:
+        row = "pos" if gex > 0 else ("neg" if gex < 0 else "zero")
+    key = f"{row}_{col}"
+    cell = GRM_CELLS[key]
+    dirn = cell["dirn"]
+
+    # Confluence — only checks that apply to this cell are counted
+    checks = []
+    if dirn != 0 and momentum is not None:
+        _ok = (safe_num(momentum) > 0) if dirn > 0 else (safe_num(momentum) < 0)
+        checks.append(("Δ-weighted OI momentum", _ok, f"{safe_num(momentum):+,.0f}"))
+    if row != "zero" and vix_change is not None:
+        _vc = safe_num(vix_change)
+        _ok = (_vc > 0) if row == "neg" else (_vc < 0)
+        checks.append(("India VIX direction", _ok, f"{_vc:+.2f}"))
+    if dirn != 0 and above_vwap is not None:
+        _ok = bool(above_vwap) if dirn > 0 else (not bool(above_vwap))
+        checks.append(("Price vs VWAP", _ok, "above" if above_vwap else "below"))
+
+    score = float(cell["base"]) + sum(1 for c in checks if c[1])
+    notes = []
+    if abs(dist_pct) > 0.75:
+        score += 0.5
+    if calibrated and row != "zero" and abs(ratio) > 1.5:
+        score += 0.5
+    _now = now or datetime.now(pytz.timezone("Asia/Kolkata"))
+    _hm = (_now.hour, _now.minute)
+    if (10, 45) <= _hm < (13, 45):
+        score -= 1; notes.append("Mid-session: GEX hedging flows are weakest")
+    _is_expiry = False
+    if expiry:
+        for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+            try:
+                _is_expiry = datetime.strptime(str(expiry), _fmt).date() == _now.date()
+                break
+            except ValueError:
+                continue
+    if _is_expiry:
+        if row == "pos" and col != "below":
+            score += 1; notes.append("Expiry day: positive-gamma pinning strongest into the close")
+        elif col == "near" and row == "neg":
+            score -= 1; notes.append("Expiry day at the flip: whipsaw risk is extreme")
+    if not calibrated:
+        score -= 1
+        notes.append(f"Typical |GEX| still calibrating ({len(_abs_hist)}/{GRM_MIN_HIST} ticks): row uses GEX sign only")
+    score = int(max(1, min(10, round(score))))
+
+    band_pts = spot * band_pct / 100.0
+    cw = int(call_wall) if call_wall else None
+    pw = int(put_wall) if put_wall else None
+    _f = lambda v: f"{v:,.0f}" if v is not None else "N/A"
+    if key == "pos_above":
+        target, stop = f"Fade {_f(cw)} · buy {_f(pw)}", f"Below {_f(flip)}"
+    elif col == "below" and row in ("pos", "zero", "neg"):
+        target, stop = f"{_f(pw)} (put wall)", f"Above {_f(flip)}"
+    elif col == "above":
+        target, stop = f"{_f(cw)} (call wall)", f"Below {_f(flip)}"
+    else:
+        target = f"Long > {_f(flip + band_pts)} · Short < {_f(flip - band_pts)}"
+        stop = f"Back inside {_f(flip - band_pts)}–{_f(flip + band_pts)}"
+
+    return {
+        "available": True, "key": key, "row": row, "col": col, "cell": cell,
+        "spot": spot, "flip": flip, "gex": gex, "typical": typical, "ratio": ratio,
+        "calibrated": calibrated, "hist_ticks": len(_abs_hist), "hist_days": _days,
+        "dist_pts": dist_pts, "dist_pct": dist_pct, "band_pct": band_pct, "band_pts": band_pts,
+        "call_wall": cw, "put_wall": pw, "target": target, "stop": stop,
+        "checks": checks, "notes": notes, "score": score, "is_expiry": _is_expiry,
+    }
+# ─── end v25 GEX × Gamma Flip Regime Matrix core ─────────────────────────────────
+
+
+def render_gamma_regime_matrix_html(r):
+    """v25: Streamlit renderer for compute_gamma_regime_matrix() — returns one
+    single-line HTML string (no indentation, so Markdown never treats it as code)."""
+    import html as _h
+    esc = lambda s: _h.escape(str(s))
+    if not r or not r.get("available"):
+        _why = esc((r or {}).get("reason", "no data"))
+        return ('<div style="background:#F9FAFB;border:2px solid #6B7280;border-radius:10px;'
+                'padding:12px 16px;margin-top:12px;"><div style="font-size:11px;font-weight:700;'
+                'color:#6B7280;text-transform:uppercase;">GEX × Gamma Flip Regime Matrix</div>'
+                f'<div style="font-size:14px;color:#111;margin-top:4px;">Waiting for data — {_why}.</div></div>')
+    c = r["cell"]; col, bg = GRM_TONES[c["tone"]]
+    lab = 'font-size:10px;font-weight:700;letter-spacing:.06em;color:#6B7280;text-transform:uppercase;'
+    stat = lambda k, v: (f'<div style="display:flex;flex-direction:column;margin-right:22px;">'
+                         f'<span style="{lab}">{k}</span>'
+                         f'<span style="font-size:15px;font-weight:800;color:#111;font-family:monospace;">{v}</span></div>')
+    stats = "".join([
+        stat("Spot − Flip", f"{r['dist_pts']:+,.0f} pts"),
+        stat("Distance", f"{r['dist_pct']:+.2f}% (band ±{r['band_pct']:.2f}%)"),
+        stat("GEX ÷ typical", f"{r['ratio']:+.2f}×" if r["calibrated"] else "calibrating"),
+        stat("To call wall", f"{r['call_wall'] - r['spot']:+,.0f} pts" if r["call_wall"] else "N/A"),
+        stat("To put wall", f"{r['spot'] - r['put_wall']:+,.0f} pts" if r["put_wall"] else "N/A"),
+    ])
+    meter = "".join(
+        f'<span style="display:inline-block;width:9px;height:14px;border-radius:2px;margin-left:3px;'
+        f'background:{col if i < r["score"] else "#E5E7EB"};"></span>' for i in range(10))
+    chk = "".join(
+        f'<span style="display:inline-block;margin:4px 8px 0 0;padding:3px 8px;border-radius:999px;font-size:12px;'
+        f'background:{"#D1FAE5" if ok else "#FEE2E2"};color:{"#047857" if ok else "#DC2626"};">'
+        f'{"✓" if ok else "✗"} {esc(name)} ({esc(val)})</span>' for name, ok, val in r["checks"])
+    notes = "".join(f'<div style="font-size:12px;color:#6B7280;margin-top:3px;">• {esc(n)}</div>' for n in r["notes"])
+    rd = lambda k, v: (f'<div style="flex:1 1 220px;min-width:200px;"><div style="{lab}">{k}</div>'
+                       f'<div style="font-size:13px;color:#111;margin-top:2px;">{v}</div></div>')
+    verdict = (
+        f'<div style="background:{bg};border:2px solid {col};border-radius:10px;padding:12px 16px;margin-top:12px;">'
+        '<div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">'
+        f'<div><div style="{lab}">GEX × Gamma Flip Regime Matrix · live cell</div>'
+        f'<div style="font-size:24px;font-weight:900;color:{col};margin:2px 0;">{esc(c["name"])}'
+        f'<span style="font-size:11px;font-weight:700;margin-left:10px;padding:3px 8px;border-radius:999px;'
+        f'background:#FFFFFF;color:{col};vertical-align:middle;text-transform:uppercase;">{esc(c["tag"])}</span></div>'
+        f'<div style="font-size:14px;font-weight:700;color:{col};font-family:monospace;">{esc(c["dir"])}</div></div>'
+        f'<div style="text-align:right;"><div style="{lab}">Confidence</div>'
+        f'<div style="font-size:30px;font-weight:900;color:#111;font-family:monospace;line-height:1.1;">{r["score"]}'
+        f'<span style="font-size:14px;color:#6B7280;">/10</span></div><div>{meter}</div></div></div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:6px 0;border-top:1px solid {col}33;margin-top:10px;padding-top:8px;">{stats}</div>'
+        '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;">'
+        + rd("Expect", esc(c["expect"])) + rd("Posture", esc(c["posture"]))
+        + rd("Target / trigger", esc(r["target"])) + rd("Invalidation", f'{esc(r["stop"])} · {esc(c["inv"])}')
+        + f'</div><div style="margin-top:6px;">{chk}</div>{notes}</div>')
+
+    th = 'font-size:11px;font-weight:700;letter-spacing:.05em;color:#374151;text-transform:uppercase;padding:4px;'
+    grid = ['<div style="overflow-x:auto;margin-top:10px;"><div style="display:grid;'
+            'grid-template-columns:110px repeat(3,minmax(230px,1fr));gap:8px;min-width:820px;">',
+            f'<div style="{th}color:#9CA3AF;">Net GEX ↓ · Spot vs flip →</div>']
+    grid += [f'<div style="{th}">{t}<div style="font-size:11px;font-weight:400;color:#9CA3AF;text-transform:none;">{s}</div></div>'
+             for _, t, s in GRM_COLS]
+    for rk, rt, rs in GRM_ROWS:
+        grid.append(f'<div style="{th}display:flex;flex-direction:column;justify-content:center;border-right:2px solid #E5E7EB;">'
+                    f'{rt}<div style="font-size:11px;font-weight:400;color:#9CA3AF;text-transform:none;">{rs}</div></div>')
+        for ck, _, _ in GRM_COLS:
+            k = f"{rk}_{ck}"; x = GRM_CELLS[k]; tc, tb = GRM_TONES[x["tone"]]
+            active = k == r["key"]
+            box = (f"border:3px solid {tc};box-shadow:0 0 0 3px {tb};background:{tb};" if active
+                   else "border:1px solid #E5E7EB;background:#FFFFFF;opacity:.82;")
+            grid.append(
+                f'<div style="{box}border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:5px;">'
+                '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">'
+                f'<span style="font-size:16px;font-weight:800;color:#111;">{esc(x["name"])}{" ◉" if active else ""}</span>'
+                f'<span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;background:{tb};color:{tc};'
+                f'text-transform:uppercase;white-space:nowrap;">{esc(x["tag"])}</span></div>'
+                f'<div style="font-size:12px;font-weight:700;color:{tc};font-family:monospace;">{esc(x["dir"])}</div>'
+                f'<div style="font-size:12px;color:#374151;"><span style="{lab}">Expect</span><br>{esc(x["expect"])}</div>'
+                f'<div style="font-size:12px;color:#374151;"><span style="{lab}">Posture</span><br>{esc(x["posture"])}</div>'
+                f'<div style="font-size:12px;color:#111;border-top:1px dashed #D1D5DB;padding-top:5px;margin-top:auto;">'
+                f'<span style="{lab}">Invalidation</span><br>{esc(x["inv"])}</div></div>')
+    grid.append('</div></div>')
+    foot = ('<div style="font-size:11px;color:#6B7280;margin-top:6px;font-style:italic;">'
+            f'Typical |GEX| = median of {r["hist_ticks"]} history ticks across {r["hist_days"]} day(s). '
+            'Independent read — does not alter the Bias Summary or any other verdict. '
+            'GEX is a model of dealer hedging; on NIFTY many writers do not delta-hedge.</div>')
+    return verdict + "".join(grid) + foot
 
 
 # ─── Data fetchers ────────────────────────────────────────────────────────────
@@ -7761,6 +8011,24 @@ with _slot_summary:
           <div style="font-size:11px;color:#374151;margin-top:2px;">{tip}</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # ── v25: GEX × Gamma Flip Regime Matrix — INDEPENDENT ADD-ON ─────────────
+    # Reads only values already on hand (spot, m, the GEX walls shown in the
+    # tiles above, persisted history, India VIX, VWAP). Writes nothing and no
+    # other panel reads it. Any failure is contained to this block.
+    try:
+        _grm_vix  = globals().get("_vix_data") or {}
+        _grm_vwap = globals().get("_vwap_or_data") or {}
+        _grm = compute_gamma_regime_matrix(
+            spot=spot, gex=m.get("gex", 0), gamma_flip=m.get("gamma_flip"),
+            call_wall=(_sum_cw if _sum_cw is not None else m.get("resistance")),
+            put_wall=(_sum_pw if _sum_pw is not None else m.get("support")),
+            history=history, momentum=m.get("momentum"),
+            vix_change=(_grm_vix.get("vix_change") if _grm_vix.get("available") else None),
+            above_vwap=_grm_vwap.get("above_vwap"), expiry=expiry, now=now_ist())
+        st.markdown(render_gamma_regime_matrix_html(_grm), unsafe_allow_html=True)
+    except Exception as _grm_err:
+        st.info(f"GEX × Gamma Flip Regime Matrix — collecting data ({_grm_err}).")
 
     st.markdown(
         '<div style="font-size:12px;font-weight:700;color:#6B7280;'
