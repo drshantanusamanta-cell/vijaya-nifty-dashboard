@@ -17,6 +17,10 @@
 ║  v25 — 15-Sep-2026: GEX × Gamma Flip Regime Matrix (3×3 live cell, ║
 ║        confidence + levels) added inside Shantanu's Final Decision ║
 ║        Matrix — independent add-on, no existing logic changed      ║
+║  v26 — 25-Sep-2026: Δ-Wtd Ratio R & Normalised Score S charts      ║
+║        (1A/2A Total OI · 1B/2B Intraday ΔOI) added to the top;     ║
+║        Regime Matrix top = live cell only, 9-cell grid moved to    ║
+║        the bottom of the dashboard. No existing logic changed      ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -845,12 +849,14 @@ def compute_gamma_regime_matrix(spot, gex, gamma_flip, call_wall=None, put_wall=
 # ─── end v25 GEX × Gamma Flip Regime Matrix core ─────────────────────────────────
 
 
-def render_gamma_regime_matrix_html(r):
+def render_gamma_regime_matrix_html(r, part="all"):
     """v25: Streamlit renderer for compute_gamma_regime_matrix() — returns one
     single-line HTML string (no indentation, so Markdown never treats it as code)."""
     import html as _h
     esc = lambda s: _h.escape(str(s))
     if not r or not r.get("available"):
+        if part == "grid":          # v26: bottom reference grid needs a live snapshot
+            return ""
         _why = esc((r or {}).get("reason", "no data"))
         return ('<div style="background:#F9FAFB;border:2px solid #6B7280;border-radius:10px;'
                 'padding:12px 16px;margin-top:12px;"><div style="font-size:11px;font-weight:700;'
@@ -925,7 +931,182 @@ def render_gamma_regime_matrix_html(r):
             f'Typical |GEX| = median of {r["hist_ticks"]} history ticks across {r["hist_days"]} day(s). '
             'Independent read — does not alter the Bias Summary or any other verdict. '
             'GEX is a model of dealer hedging; on NIFTY many writers do not delta-hedge.</div>')
+    # v26: part="verdict" → live cell only (top) · part="grid" → 9-cell grid (bottom)
+    if part == "verdict":
+        return verdict
+    if part == "grid":
+        return "".join(grid) + foot
     return verdict + "".join(grid) + foot
+
+
+# ─── v26 ADDITION: Δ-weighted strike-wise Ratio (R) & Normalised Score (S) ──────
+# Four independent charts for the top panel (Shantanu's Final Decision Matrix).
+# Pure read-only: consumes only the ±10 structural band (payload["df_band"]) and
+# spot. Nothing upstream is modified; no verdict, score or state file reads it.
+#
+#   a = Call leg × |Call Δ|        b = Put leg × |Put Δ|
+#   1A  R  (Total OI)   = a / b                         baseline 1
+#   1B  R  (Intraday ΔOI) = a / b  (ΔOI legs)            baseline 1
+#   2A  S  (Total OI)   = (a − b) / (a + b)             range −1 … +1
+#   2B  S  (Intraday ΔOI) = (a − b) / (|a| + |b|)        range −1 … +1
+#
+# Colour convention = Section-4 charts 1 & 2 (Δ-Weighted Net OI):
+#   RED   = call side dominant (call writing → resistance / bearish tilt)
+#   GREEN = put side dominant  (put writing → support / bullish tilt)
+#   GREY  = illiquid, masked (pinned to baseline, never imputed as a signal)
+# 1B uses the dashboard's existing four-quadrant colouring (the ΔOI ratio is
+# sign-ambiguous: build-vs-build and unwind-vs-unwind both print positive).
+# 2B uses |a|+|b| in the denominator: identical to the stated formula when both
+# sides are building, and it keeps S bounded with the correct sign when one or
+# both sides are unwinding (the sign of 2B always equals the sign of Section-4
+# chart 2, Δ-Weighted OI Change Momentum).
+# Liquidity floor = same rule as Section 4 (2 % of the band's largest leg).
+DWRS_R_CAP = 5.0   # display cap for R bars (true value always shown on hover)
+
+
+def compute_dw_ratio_score(df_band, spot):
+    """Return a DataFrame with R / S for total OI and intraday ΔOI per strike,
+    plus liquidity masks. Empty DataFrame when data is missing."""
+    df = pd.DataFrame(df_band)
+    need = ["strike", "call_oi", "put_oi", "call_oi_chg", "put_oi_chg",
+            "call_delta", "put_delta"]
+    if df.empty or any(c not in df.columns for c in need):
+        return pd.DataFrame()
+    df = df.sort_values("strike").reset_index(drop=True)
+    for c in need:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(float)
+    cda, pda = df["call_delta"].abs(), df["put_delta"].abs()
+
+    a_oi, b_oi = df["call_oi"] * cda, df["put_oi"] * pda
+    a_ch, b_ch = df["call_oi_chg"] * cda, df["put_oi_chg"] * pda
+
+    out = pd.DataFrame({"strike": df["strike"]})
+    out["a_oi"], out["b_oi"], out["a_ch"], out["b_ch"] = a_oi, b_oi, a_ch, b_ch
+    out["doi_c"], out["doi_p"] = df["call_oi_chg"], df["put_oi_chg"]
+    out["R_oi"]  = a_oi / b_oi.replace(0, np.nan)
+    out["R_chg"] = a_ch / b_ch.replace(0, np.nan)
+    _den_oi = (a_oi + b_oi).replace(0, np.nan)
+    _den_ch = (a_ch.abs() + b_ch.abs()).replace(0, np.nan)
+    out["S_oi"]  = (a_oi - b_oi) / _den_oi
+    out["S_chg"] = (a_ch - b_ch) / _den_ch
+
+    _oi_floor  = 0.02 * max(float(df["call_oi"].max()), float(df["put_oi"].max()), 1.0)
+    _chg_floor = 0.02 * max(float(df["call_oi_chg"].abs().max()),
+                            float(df["put_oi_chg"].abs().max()), 1.0)
+    _c_ok  = df["call_oi"] > _oi_floor
+    _p_ok  = df["put_oi"]  > _oi_floor
+    _cc_ok = df["call_oi_chg"].abs() > _chg_floor
+    _pc_ok = df["put_oi_chg"].abs()  > _chg_floor
+    # R needs BOTH legs liquid (a thin denominator makes the ratio explode).
+    out["liq_R_oi"]  = _c_ok & _p_ok & out["R_oi"].notna() & np.isfinite(out["R_oi"])
+    out["liq_R_chg"] = _cc_ok & _pc_ok & out["R_chg"].notna() & np.isfinite(out["R_chg"])
+    # S is bounded, so ONE liquid leg is enough (a one-sided strike reads ±1).
+    out["liq_S_oi"]  = (_c_ok | _p_ok) & out["S_oi"].notna()
+    out["liq_S_chg"] = (_cc_ok | _pc_ok) & out["S_chg"].notna()
+    return out
+
+
+def _dwrs_quad(dc_, dp_):
+    if dc_ >= 0 and dp_ < 0:  return "#EF4444", "Call build + Put unwind (bearish)"
+    if dc_ < 0 and dp_ >= 0:  return "#22C55E", "Put build + Call unwind (bullish)"
+    if dc_ >= 0 and dp_ >= 0: return "#F59E0B", "Both building (contested)"
+    return "#64748B", "Both unwinding (de-risking)"
+
+
+def _dwrs_style(f, title, y_title, spot):
+    f.add_vline(x=spot, line_width=2, line_dash="dash", line_color=CYAN,
+                annotation_text=f"Spot {spot:,.0f}", annotation_position="top",
+                annotation_font=dict(size=9, color=CYAN))
+    f.update_layout(
+        title=dict(text=title, x=0.02, xanchor="left", font=dict(color="#1A1A2E", size=11)),
+        height=275, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=45, r=18, t=52, b=42), font=dict(color="#1A1A2E", size=11),
+        hoverlabel=dict(bgcolor="#fff", font_color="#1A1A2E", font_size=11),
+        showlegend=False,
+        xaxis=dict(title=dict(text="Strike", font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text=y_title, font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
+    )
+    return f
+
+
+def build_dw_ratio_score_figs(df_band, spot):
+    """v26: return {"1A","1B","2A","2B": plotly Figure} or {} when no data."""
+    d = compute_dw_ratio_score(df_band, spot)
+    if d.empty:
+        return {}
+    spot = float(spot)
+    grey = "#D1D5DB"
+    xs = list(d["strike"])
+    figs = {}
+
+    # ── 1A · R on total OI (baseline 1) ──────────────────────────────────────
+    cols, cd, ys = [], [], []
+    for v, ok, a, b in zip(d["R_oi"], d["liq_R_oi"], d["a_oi"], d["b_oi"]):
+        if not ok:
+            cols.append(grey); ys.append(0.0); cd.append("illiquid — masked"); continue
+        cols.append(RED if v >= 1 else GREEN)
+        ys.append(min(v, DWRS_R_CAP) - 1.0)
+        cd.append(f"R {v:.3f}{' (capped)' if v > DWRS_R_CAP else ''}<br>"
+                  f"CE Δ×OI {a:,.0f} · PE Δ×OI {b:,.0f}")
+    f = go.Figure(go.Bar(x=xs, y=ys, base=1.0, marker_color=cols, customdata=cd,
+                         hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
+    f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
+                annotation_text="Baseline 1.0", annotation_position="bottom right",
+                annotation_font=dict(size=9, color=MUTED))
+    figs["1A"] = _dwrs_style(f, "1A · Δ-Wtd Ratio R · TOTAL OI = (CE OI×|Δc|)/(PE OI×|Δp|) · "
+                                "Red>1 call side · Green<1 put side · Grey=illiquid",
+                             f"R (cap {DWRS_R_CAP:g})", spot)
+
+    # ── 1B · R on intraday ΔOI (baseline 1, four-quadrant colour) ────────────
+    cols, cd, ys = [], [], []
+    for v, ok, dc_, dp_, a, b in zip(d["R_chg"], d["liq_R_chg"], d["doi_c"], d["doi_p"],
+                                     d["a_ch"], d["b_ch"]):
+        if not ok:
+            cols.append(grey); ys.append(0.0); cd.append("illiquid — masked"); continue
+        c_, lbl = _dwrs_quad(dc_, dp_)
+        cols.append(c_)
+        vv = max(min(v, DWRS_R_CAP), -DWRS_R_CAP)
+        ys.append(vv - 1.0)
+        cd.append(f"{lbl}<br>R {v:.3f}{' (capped)' if abs(v) > DWRS_R_CAP else ''}<br>"
+                  f"CE Δ×ΔOI {a:+,.0f} · PE Δ×ΔOI {b:+,.0f}")
+    f = go.Figure(go.Bar(x=xs, y=ys, base=1.0, marker_color=cols, customdata=cd,
+                         hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
+    f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
+                annotation_text="Baseline 1.0", annotation_position="bottom right",
+                annotation_font=dict(size=9, color=MUTED))
+    figs["1B"] = _dwrs_style(f, "1B · Δ-Wtd Ratio R · INTRADAY ΔOI · Red=C-build/P-unwind · "
+                                "Green=P-build/C-unwind · Amber=both build · Slate=both unwind",
+                             f"R ΔOI (cap ±{DWRS_R_CAP:g})", spot)
+
+    # ── 2A / 2B · S (range −1 … +1, zero line) ───────────────────────────────
+    def _s_fig(vals, liq, a_s, b_s, title, y_title, quad=False):
+        cols, cd, ys = [], [], []
+        for i, (v, ok, a, b) in enumerate(zip(vals, liq, a_s, b_s)):
+            if not ok:
+                cols.append(grey); ys.append(0.0); cd.append("illiquid — masked"); continue
+            cols.append(RED if v > 0 else (GREEN if v < 0 else MUTED))
+            ys.append(float(v))
+            _q = (_dwrs_quad(d["doi_c"].iloc[i], d["doi_p"].iloc[i])[1] + "<br>") if quad else ""
+            cd.append(f"{_q}S {v:+.3f}<br>CE {a:+,.0f} · PE {b:+,.0f}")
+        f = go.Figure(go.Bar(x=xs, y=ys, marker_color=cols, customdata=cd,
+                             hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
+        f.add_hline(y=0.0, line_width=1.5, line_dash="dash", line_color=MUTED,
+                    annotation_text="Balanced 0", annotation_position="bottom right",
+                    annotation_font=dict(size=9, color=MUTED))
+        _dwrs_style(f, title, y_title, spot)
+        f.update_yaxes(range=[-1.08, 1.08], tickvals=[-1, -0.5, 0, 0.5, 1])
+        return f
+
+    figs["2A"] = _s_fig(d["S_oi"], d["liq_S_oi"], d["a_oi"], d["b_oi"],
+                        "2A · Normalised Δ-Wtd Score S · TOTAL OI = (a−b)/(a+b) · "
+                        "Red>0 call side · Green<0 put side · Grey=illiquid",
+                        "S (−1 … +1)")
+    figs["2B"] = _s_fig(d["S_chg"], d["liq_S_chg"], d["a_ch"], d["b_ch"],
+                        "2B · Normalised Δ-Wtd Score S · INTRADAY ΔOI = (a−b)/(|a|+|b|) · "
+                        "Red>0 net call-side flow · Green<0 net put-side flow",
+                        "S ΔOI (−1 … +1)", quad=True)
+    return figs
+# ─── end v26 Δ-weighted R & S ───────────────────────────────────────────────────
 
 
 # ─── Data fetchers ────────────────────────────────────────────────────────────
@@ -8026,9 +8207,46 @@ with _slot_summary:
             history=history, momentum=m.get("momentum"),
             vix_change=(_grm_vix.get("vix_change") if _grm_vix.get("available") else None),
             above_vwap=_grm_vwap.get("above_vwap"), expiry=expiry, now=now_ist())
-        st.markdown(render_gamma_regime_matrix_html(_grm), unsafe_allow_html=True)
+        # v26: top shows the LIVE CELL only; the full 9-cell grid renders at the
+        # bottom of the dashboard (same _grm object, see "v26 BOTTOM" below).
+        st.markdown(render_gamma_regime_matrix_html(_grm, part="verdict"), unsafe_allow_html=True)
     except Exception as _grm_err:
+        _grm = None
         st.info(f"GEX × Gamma Flip Regime Matrix — collecting data ({_grm_err}).")
+
+    # ── v26: Δ-Weighted Ratio R & Normalised Score S — INDEPENDENT ADD-ON ───
+    # Reads only payload["df_band"] (±10 structural band) and spot. Writes
+    # nothing; no verdict or state file reads it. Failure is contained here.
+    try:
+        _dwrs_figs = build_dw_ratio_score_figs(payload["df_band"], spot)
+        if _dwrs_figs:
+            st.markdown(
+                '<div style="font-size:12px;font-weight:700;color:#6B7280;'
+                'text-transform:uppercase;margin:14px 0 4px;">'
+                'Δ-Weighted Strike-wise Sentiment · Ratio R (1A/1B) &amp; Normalised Score S (2A/2B)</div>',
+                unsafe_allow_html=True)
+            _dw_r1c1, _dw_r1c2 = st.columns(2)
+            with _dw_r1c1:
+                st.plotly_chart(_dwrs_figs["1A"], width='stretch', config={"displayModeBar": False},
+                                key="dwrs_1A")
+            with _dw_r1c2:
+                st.plotly_chart(_dwrs_figs["1B"], width='stretch', config={"displayModeBar": False},
+                                key="dwrs_1B")
+            _dw_r2c1, _dw_r2c2 = st.columns(2)
+            with _dw_r2c1:
+                st.plotly_chart(_dwrs_figs["2A"], width='stretch', config={"displayModeBar": False},
+                                key="dwrs_2A")
+            with _dw_r2c2:
+                st.plotly_chart(_dwrs_figs["2B"], width='stretch', config={"displayModeBar": False},
+                                key="dwrs_2B")
+            st.caption("a = CE leg × |Δc| · b = PE leg × |Δp| · R = a/b · S = (a−b)/(a+b); "
+                       "2B uses |a|+|b| so S stays in −1…+1 when a side is unwinding. "
+                       "Red = call side dominant · Green = put side dominant · Grey = illiquid (masked). "
+                       "OI cannot show who opened the position — colours assume writers dominate.")
+        else:
+            st.info("Δ-Weighted R & S charts — waiting for band data.")
+    except Exception as _dwrs_err:
+        st.info(f"Δ-Weighted R & S charts — collecting data ({_dwrs_err}).")
 
     st.markdown(
         '<div style="font-size:12px;font-weight:700;color:#6B7280;'
@@ -8687,6 +8905,20 @@ if not df_band_disp.empty:
         "C OI":"{:,}","P OI":"{:,}","C OI Chg":"{:+,}","P OI Chg":"{:+,}",
         "C Δ":"{:.3f}","P Δ":"{:.3f}","C IV":"{:.1f}%","P IV":"{:.1f}%","Strike":"{:,}"
     }), width='stretch', hide_index=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v26 BOTTOM: GEX × Gamma Flip Regime Matrix — full 9-cell reference grid
+# (moved from the top panel; same _grm object, live cell still highlighted ◉)
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    _grm_bottom = globals().get("_grm")
+    if _grm_bottom and _grm_bottom.get("available"):
+        st.markdown('<div class="section-header"> GEX × Gamma Flip Regime Matrix  9-Cell Reference · Explanation</div>',
+                    unsafe_allow_html=True)
+        st.markdown(render_gamma_regime_matrix_html(_grm_bottom, part="grid"), unsafe_allow_html=True)
+except Exception as _grm_b_err:
+    st.info(f"GEX × Gamma Flip Regime Matrix grid — collecting data ({_grm_b_err}).")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
