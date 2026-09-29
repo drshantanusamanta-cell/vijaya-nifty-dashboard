@@ -21,6 +21,15 @@
 ║        (1A/2A Total OI · 1B/2B Intraday ΔOI) added to the top;     ║
 ║        Regime Matrix top = live cell only, 9-cell grid moved to    ║
 ║        the bottom of the dashboard. No existing logic changed      ║
+║  v27 — 29-Sep-2026: Direction-accuracy fixes                       ║
+║        · CE/PE EV ratio parity-adjusted (carry + dividend) in the  ║
+║          legacy Bias Score, Strategy engine & Shantanu's View      ║
+║        · One sign convention (writer) across Bias Score/GRF/Strat  ║
+║        · Term structure no longer double-counted; S6 velocity on   ║
+║          pre-S6 scores, applied before Enhanced/Combined           ║
+║        · Dividend + fractional-T in synthetic future fair value    ║
+║        · Futures candles now carry OI                              ║
+║        · NEW v27 Intraday Flow Engine panel (self-calibrating)     ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -124,6 +133,35 @@ USE_DEMO_MODE     = not USE_DHAN
 # ─── Constants ────────────────────────────────────────────────────────────────
 APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v13"
 RISK_FREE_RATE   = 0.065
+DIVIDEND_YIELD   = 0.012   # v27: approx. NIFTY dividend yield — used in carry / parity maths
+
+
+def _t_years_frac(expiry, now=None):
+    """v27: fractional years to 15:30 IST on expiry (floor 10 min). Replaces integer-day T."""
+    try:
+        _now = now or datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
+        _exp = None
+        for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+            try:
+                _exp = datetime.strptime(str(expiry)[:11].strip(), _fmt)
+                break
+            except ValueError:
+                continue
+        if _exp is None:
+            return 3 / 365.0
+        _exp = _exp.replace(hour=15, minute=30)
+        return max((_exp - _now).total_seconds(), 600) / (365.0 * 24 * 3600)
+    except Exception:
+        return 3 / 365.0
+
+
+def _parity_offset(strike, spot, T, r=None, q=None):
+    """v27: carry embedded in (CE extrinsic − PE extrinsic) by put-call parity when
+    intrinsic is measured against SPOT:  K(1−e^(−rT)) − S(1−e^(−qT)).
+    Without removing it, a flat market reads CE/PE EV ratio > 1 (i.e. 'bullish')."""
+    r = RISK_FREE_RATE if r is None else r
+    q = DIVIDEND_YIELD if q is None else q
+    return strike * (1 - np.exp(-r * T)) - spot * (1 - np.exp(-q * T))
 STRUCTURAL_BAND  = 10
 SIGNAL_BAND      = 5
 NIFTY_STEP       = 50
@@ -407,7 +445,7 @@ BIAS_WEIGHTS = {
 }
 
 METRIC_EXPLAIN = {
-    "Bias Score":      "Hedge-flow bias score (-100..+100) from the legacy compute_nifty_bias engine — uses SIGNED delta x OI (net_delta), so it reads dealer hedge-flow pressure, not writer positioning. Use the S3/4 / Combined Decision panels for the authoritative directional call.",
+    "Bias Score":      "Legacy bias score (-100..+100). v27: uses the WRITER convention like S3/4 (put-side Δ-OI = bullish) and the parity-adjusted CE/PE EV ratio. Use the S3/4 / Combined Decision and v27 Flow Engine panels for the directional call.",
     "Confidence":      "Signal quality score based on regime, persistence, concentration, and wall behavior.",
     "Regime":          "Range/pin, trend/expansion, or transition inferred from gamma, IV, walls, and persistence.",
     "Sentiment (Raw Avg)":    "Per-strike Call/Put time-value ratio averaged across the ATM band (same series as the Raw Sentiment Z-Score chart); higher means call premium stronger, lower means put premium stronger.",
@@ -1757,6 +1795,14 @@ def compute_metrics(df, spot, expiry=None, history=None):
         if _ev_ratio_oiw_per_strike.notna().any() else 1.0
     )
 
+    # v27: parity-adjusted strike-wise CE/PE EV ratio. Raw EV_c − EV_p equals the
+    # carry K(1−e^−rT) − S(1−e^−qT) at every strike, so the raw ratio sits above 1
+    # (reads 'bullish') even with zero flow — worst at low IV / wide bands.
+    _T_par = _t_years_frac(expiry)
+    _ev_c_adj = np.maximum(0, t_band["ev_c"] - _parity_offset(t_band["strike"], spot, _T_par))
+    _evr_par = _ev_c_adj / t_band["ev_p"].replace(0, np.nan)
+    ev_ratio_parity = float(_evr_par.mean(skipna=True)) if _evr_par.notna().any() else 1.0
+
     net_delta = float((t["call_oi"] * t["call_delta"]).sum() + (t["put_oi"] * t["put_delta"]).sum())
     net_gamma = float((t["call_oi"] * t["call_gamma"]).sum() + (t["put_oi"] * t["put_gamma"]).sum())
     net_theta = float((t["call_oi"] * t["call_theta"]).sum() + (t["put_oi"] * t["put_theta"]).sum())
@@ -1917,6 +1963,8 @@ def compute_metrics(df, spot, expiry=None, history=None):
     return {
         "ev_ratio": round(ev_ratio, 3),
         "ev_ratio_avg_strikewise": round(ev_ratio_avg_strikewise, 4),  # avg of per-strike Sentiment, ATM±vega_band_strikes
+        "ev_ratio_parity": round(ev_ratio_parity, 4),   # v27
+        "t_years": _T_par,                               # v27 fractional T to expiry
         "ev_ratio_oiw_avg_strikewise": round(ev_ratio_oiw_avg_strikewise, 4),  # avg of per-strike OI-weighted Sentiment, ATM±vega_band_strikes
         "net_delta": round(net_delta, 0),
         "net_gamma": round(net_gamma, 6),
@@ -2231,20 +2279,22 @@ def compute_nifty_bias(m, history=None):
     confidence = 0.0
     BW = BIAS_WEIGHTS
 
-    if m["net_delta"] > 0:
-        direction += BW["net_delta"]; factors.append("Net delta bullish")
-    elif m["net_delta"] < 0:
-        direction -= BW["net_delta"]; factors.append("Net delta bearish")
+    # v27: WRITER convention (same as S3/4 & Market Sentiments).
+    # net_delta = Σcall_oi·Δc + Σput_oi·Δp (Δp<0): < 0 ⇒ put-side dominant ⇒ bullish.
+    if m["net_delta"] < 0:
+        direction += BW["net_delta"]; factors.append("Put-side Δ-OI dominant (bullish)")
+    elif m["net_delta"] > 0:
+        direction -= BW["net_delta"]; factors.append("Call-side Δ-OI dominant (bearish)")
 
-    if m["momentum"] > 0:
-        direction += BW["momentum"]; factors.append("OI momentum bullish")
-    elif m["momentum"] < 0:
-        direction -= BW["momentum"]; factors.append("OI momentum bearish")
+    if m["momentum"] < 0:
+        direction += BW["momentum"]; factors.append("OI flow: put writing / call unwinding")
+    elif m["momentum"] > 0:
+        direction -= BW["momentum"]; factors.append("OI flow: call writing / put unwinding")
 
     # EV signal now uses the raw per-strike average CE/PE EV ratio
     # (ev_ratio_avg_strikewise, same series as the Z-Score charts) instead of
     # the legacy ratio-of-sums ev_ratio.
-    _ev_sig = m.get("ev_ratio_avg_strikewise", m["ev_ratio"])
+    _ev_sig = m.get("ev_ratio_parity", m.get("ev_ratio_avg_strikewise", m["ev_ratio"]))  # v27
     if _ev_sig >= BW["ev_ratio_bull"]:
         direction += BW["ev_ratio"]; factors.append("Call premium stronger")
     elif _ev_sig <= BW["ev_ratio_bear"]:
@@ -2260,9 +2310,9 @@ def compute_nifty_bias(m, history=None):
     elif m["skew_slope"] < -BW["skew_slope_threshold"]:
         direction += BW["skew_slope"]; factors.append("Upside call skew improving")
 
-    if m["vanna"] > 0:
+    if m["vanna"] < 0:          # v27 writer convention (put-vega-dominant OI = bullish)
         direction += BW["vanna"]
-    elif m["vanna"] < 0:
+    elif m["vanna"] > 0:
         direction -= BW["vanna"]
 
     regime, vol_regime, near_flip = classify_gamma_regime(
@@ -2311,9 +2361,9 @@ def compute_nifty_bias(m, history=None):
         recent = history[-2:]
         nds  = [safe_num(x.get("net_delta", 0)) for x in recent] + [safe_num(m["net_delta"])]
         moms = [safe_num(x.get("momentum",  0)) for x in recent] + [safe_num(m["momentum"])]
-        if all(x > 0 for x in nds) and all(x > 0 for x in moms):
+        if all(x < 0 for x in nds) and all(x < 0 for x in moms):      # v27 writer convention
             confidence += BW["persistence"]; factors.append("Bullish persistence")
-        elif all(x < 0 for x in nds) and all(x < 0 for x in moms):
+        elif all(x > 0 for x in nds) and all(x > 0 for x in moms):
             confidence += BW["persistence"]; factors.append("Bearish persistence")
 
     bias_score = max(-100, min(100, round(direction, 1)))
@@ -2576,10 +2626,11 @@ def strategy_recommendation(bias, m, history=None):
     step       = NIFTY_STEP
     gamma_flip = m.get("gamma_flip")
     iv_rank    = m.get("iv_rank", 50)
-    momentum   = m.get("momentum", 0)
-    # Raw per-strike average CE/PE EV ratio (Z-Score chart series) replaces
-    # the legacy ratio-of-sums ev_ratio for the EV bias signal.
-    ev_ratio   = m.get("ev_ratio_avg_strikewise", m.get("ev_ratio", 1.0))
+    # v27: writer-signed momentum (+ = put writing / call unwinding = bullish) so the
+    # "BULLISH and momentum > 0" branches below agree with the S3/4 direction.
+    momentum   = -m.get("momentum", 0)
+    # v27: parity-adjusted per-strike CE/PE EV ratio (carry removed).
+    ev_ratio   = m.get("ev_ratio_parity", m.get("ev_ratio_avg_strikewise", m.get("ev_ratio", 1.0)))
     pcr        = m.get("pcr", 1.0)
     skew_slope = m.get("skew_slope", 0)
     near_oichg = m.get("near_oichg_concentration", 0.5)
@@ -2856,18 +2907,8 @@ def compute_synthetic_future(df_band, spot, atm, expiry_str, r=0.065):
     if call_ltp <= 0 or put_ltp <= 0:
         return None
     synthetic = call_ltp - put_ltp + atm
-    T = 7.0 / 365
-    try:
-        for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
-            try:
-                _exp = datetime.strptime(str(expiry_str), _fmt).date()
-                T = max((_exp - date.today()).days, 0) / 365
-                break
-            except ValueError:
-                continue
-    except Exception:
-        pass
-    fair_future  = spot * np.exp(r * T)   # H9 fix: was spot*(1+r*T) (simple interest);
+    T = _t_years_frac(expiry_str)          # v27: fractional time to 15:30 on expiry
+    fair_future  = spot * np.exp((r - DIVIDEND_YIELD) * T)   # v27: dividend-adjusted carry
                                            # the synthetic call-put+K is a continuous-compounding
                                            # forward per BS assumptions. Mismatch was numerically
                                            # tiny for short DTE but methodologically inconsistent.
@@ -2967,7 +3008,7 @@ def fetch_nifty_intraday_candles():
                 "exchangeSegment": "NSE_FNO",
                 "instrument":      "FUTIDX",
                 "interval":        "1",
-                "oi":              False,
+                "oi":              True,   # v27: futures OI for price×OI build-up
                 "fromDate":        f"{today_str} 09:15:00",
                 "toDate":          f"{today_str} 15:30:00",
             },
@@ -2979,6 +3020,7 @@ def fetch_nifty_intraday_candles():
         lo_arr  = data.get("low",       [])
         cl_arr  = data.get("close",     [])
         vo_arr  = data.get("volume",    [])
+        oi_arr  = data.get("open_interest") or data.get("oi") or []   # v27 (optional)
         if not ts_arr:
             return []
         # M7 fix: validate array lengths — partial responses were silently zero-filled,
@@ -3003,6 +3045,7 @@ def fetch_nifty_intraday_candles():
                 "low":    float(lo_arr[i]),
                 "close":  float(cl_arr[i]),
                 "volume": float(vo_arr[i]),
+                "oi":     float(oi_arr[i]) if len(oi_arr) == n and oi_arr[i] is not None else 0.0,
             })
         return candles
     except (DhanAPIError, Exception) as e:
@@ -4094,7 +4137,8 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
 
     # Determine which new modules are live
     price_live = vwap_or  is not None and vwap_or.get("n_candles", 0) > 5
-    ts_live    = ts_signal  is not None and ts_signal.get("available", False)
+    # v27: term structure is already inside the S3/4 score as S5 — do not count it again here.
+    ts_live    = False
     vix_live   = vix_signal is not None and vix_signal.get("available", False)
 
     # Dynamic weight allocation: unavailable modules cede their 10 pts to S3/4
@@ -4127,7 +4171,6 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
     # FROM the other signals, not self-agreement.
     signs_non_s34 = []
     if price_s   != 0:   signs_non_s34.append(1 if price_s   > 0 else -1)
-    if ts_s      != 0:   signs_non_s34.append(1 if ts_s      > 0 else -1)
     if vix_s     != 0:   signs_non_s34.append(1 if vix_s     > 0 else -1)
     s34_sign = 1 if s34_score > 0 else (-1 if s34_score < 0 else 0)
     if s34_sign != 0 and signs_non_s34:
@@ -4138,7 +4181,6 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
         signs = []
         if s34_score != 0:   signs.append(1 if s34_score > 0 else -1)
         if price_s   != 0:   signs.append(1 if price_s   > 0 else -1)
-        if ts_s      != 0:   signs.append(1 if ts_s      > 0 else -1)
         if vix_s     != 0:   signs.append(1 if vix_s     > 0 else -1)
         agree_count = sum(1 for s in signs if s == (1 if enhanced_score >= 0 else -1))
         agreement_pct = agree_count / max(len(signs), 1)
@@ -4170,6 +4212,347 @@ def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float
     }
 
 # ══ END ENHANCED PRICE CONFIRMATION LAYER ════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v27 INTRADAY FLOW ENGINE  (additive — does not change any existing verdict)
+#   Scores 15-min FLOWS (strike-matched OI change, futures price×OI build-up,
+#   risk-reversal change, VIX change, futures-basis change) plus price vs VWAP /
+#   opening range. Logs every reading to nifty_bias_v27_log.csv. Weights are
+#   PRIORS until calibrate_v27() is run on >=15-20 sessions of logs; a fit is
+#   only used if it beats 53% on held-out later days.
+#   Offline:  python -c "import <this_file> as a; a.calibrate_v27('nifty_bias_v27_log.csv', 'nifty_bias_v27_weights.json')"
+# ══════════════════════════════════════════════════════════════════════════════
+import math
+from collections import deque
+
+DEFAULT_WEIGHTS = {            # prior weights before calibration (sum of |w| = 1)
+    "px_vwap":      0.22,      # futures distance from VWAP in ATR units
+    "px_or":        0.10,      # opening-range break state
+    "fut_buildup":  0.18,      # futures price x OI quadrant (long build-up / short build-up)
+    "oi_flow":      0.16,      # 15-min SNAPSHOT delta of near-ATM writer flow (not vs prev-day)
+    "rr_chg":       0.12,      # 15-min change in risk reversal (call wing IV - put wing IV)
+    "vix_chg":      0.10,      # -(15-min change in India VIX)
+    "basis_chg":    0.12,      # 15-min change in futures premium over fair value
+}
+WINDOW_MIN = 15
+
+
+# ─────────────────────────── helpers ───────────────────────────
+def _T_years(expiry, now):
+    """Fractional time to 15:30 IST on expiry — never integer days (v26 used .days)."""
+    try:
+        exp = datetime.strptime(str(expiry)[:10], "%Y-%m-%d").replace(hour=15, minute=30)
+        sec = (exp - now.replace(tzinfo=None)).total_seconds()
+        return max(sec, 600) / (365 * 24 * 3600)
+    except Exception:
+        return 3 / 365
+
+
+def forward_price(spot, T, r=0.065, q=0.012):
+    """Include dividend yield. v26 used spot*e^{rT} (no q) which biases every basis signal bearish-to-neutral."""
+    return spot * math.exp((r - q) * T)
+
+
+def parity_clean_evr(df, fwd):
+    """
+    The v26 CE/PE extrinsic ratio measures intrinsic against SPOT. By put-call parity,
+    C_ev - P_ev = (C - P + K - S) = synthetic forward - spot  at EVERY strike, i.e. it is the
+    carry, not buyer/seller aggression (flat market, 6 DTE -> avg EVR ~1.28 = 'BULLISH').
+    Measuring intrinsic against the FORWARD removes that artefact. Kept for display only.
+    """
+    ec = np.maximum(0, df["call_ltp"] - np.maximum(0, fwd - df["strike"]))
+    ep = np.maximum(0, df["put_ltp"] - np.maximum(0, df["strike"] - fwd))
+    return float(np.nanmedian(ec / ep.replace(0, np.nan)))
+
+
+def risk_reversal(df, spot, width=4):
+    """Call-wing IV minus put-wing IV at ~equal distance (ATM ± 2..width strikes). Rising = bullish."""
+    atm = round(spot / NIFTY_STEP) * NIFTY_STEP
+    c = df[(df.strike >= atm + 2 * NIFTY_STEP) & (df.strike <= atm + width * NIFTY_STEP) & (df.call_iv > 0.5)].call_iv
+    p = df[(df.strike <= atm - 2 * NIFTY_STEP) & (df.strike >= atm - width * NIFTY_STEP) & (df.put_iv > 0.5)].put_iv
+    return float(c.mean() - p.mean()) if len(c) and len(p) else np.nan
+
+
+def oi_book(df):
+    """Per-strike OI snapshot {strike: (call_oi, put_oi)} so later snapshots can be differenced
+    STRIKE BY STRIKE. (Differencing a band total is wrong: when spot moves, strikes enter/leave
+    the band and delta changes, which looks like flow even if no OI changed.)"""
+    return {int(k): (float(c), float(p)) for k, c, p in zip(df.strike, df.call_oi, df.put_oi)}
+
+
+def writer_flow(df, spot, prev_book, band=4):
+    """Delta-weighted OI change since `prev_book` on the SAME strikes near current ATM.
+    ASSUMPTION (contestable): writer convention, + = net put writing / call unwinding = bullish.
+    Calibration can flip the sign if the data disagree."""
+    atm = round(spot / NIFTY_STEP) * NIFTY_STEP
+    d = df[df.strike.between(atm - band * NIFTY_STEP, atm + band * NIFTY_STEP)]
+    net = gross = 0.0
+    for k, c_oi, p_oi, cd, pd_ in zip(d.strike, d.call_oi, d.put_oi, d.call_delta.abs(), d.put_delta.abs()):
+        if int(k) not in prev_book:
+            continue
+        pc, pp = prev_book[int(k)]
+        net += (p_oi - pp) * pd_ - (c_oi - pc) * cd
+        gross += p_oi * pd_ + c_oi * cd
+    return (net / (gross * 0.01)) if gross > 0 else 0.0     # in % of near-ATM delta-weighted book
+
+
+def vwap_atr(c):
+    """c: DataFrame with open/high/low/close/volume(/oi). Returns (dist_in_ATR, or_state)."""
+    tp = (c.high + c.low + c.close) / 3
+    vwap = (tp * c.volume).cumsum() / c.volume.cumsum().replace(0, np.nan)
+    tr = pd.concat([c.high - c.low, (c.high - c.close.shift()).abs(), (c.low - c.close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14, min_periods=5).mean().iloc[-1] * math.sqrt(5)   # ~5-min ATR from 1-min bars
+    dist = (c.close.iloc[-1] - vwap.iloc[-1]) / atr if atr and atr > 0 else 0.0
+    or_state = 0.0
+    if len(c) >= 15:
+        hi, lo = c.high.iloc[:15].max(), c.low.iloc[:15].min()
+        px = c.close.iloc[-1]
+        or_state = 1.0 if px > hi else (-1.0 if px < lo else (px - (hi + lo) / 2) / max(hi - lo, 1) )
+    return float(np.clip(dist, -3, 3)), float(or_state)
+
+
+def fut_buildup(c, lookback=WINDOW_MIN):
+    """Classic price x OI read on NIFTY futures over the last `lookback` 1-min bars.
+       +1 long build-up, +0.5 short covering, -0.5 long unwinding, -1 short build-up (scaled by size)."""
+    if "oi" not in c or len(c) <= lookback or c.oi.iloc[-1] <= 0:
+        return 0.0
+    dp = c.close.iloc[-1] - c.close.iloc[-1 - lookback]
+    doi = c.oi.iloc[-1] - c.oi.iloc[-1 - lookback]
+    if abs(doi) < 1e-9:
+        return 0.0
+    mag = min(1.0, abs(doi) / max(c.oi.iloc[-1] * 0.002, 1))    # 0.2% OI move = full size
+    if dp > 0:
+        return (1.0 if doi > 0 else 0.5) * mag
+    if dp < 0:
+        return (-1.0 if doi > 0 else -0.5) * mag
+    return 0.0
+
+
+# ─────────────────────────── engine ───────────────────────────
+class IntradayBiasEngine:
+    def __init__(self, log_path="bias_v27_log.csv", weights_path="bias_v27_weights.json"):
+        self.log_path, self.weights_path = log_path, weights_path
+        self.snap = deque(maxlen=400)     # (ts, oi_book, rr, vix, basis)
+        self._last_fetch, self._last_out = None, None
+        self.zhist = {k: deque(maxlen=400) for k in DEFAULT_WEIGHTS}
+        self.day = None
+        self.model = self._load_model()
+
+    def _load_model(self):
+        try:
+            with open(self.weights_path) as f:
+                m = json.load(f)
+            # only trust a fit that beat a coin out-of-sample on enough days
+            return m if m.get("oos_hit_rate", 0) >= 0.53 and m.get("test_days", 0) >= 5 else None
+        except Exception:
+            return None
+
+    def _lag(self, ts, minutes=WINDOW_MIN):
+        """Snapshot closest to `minutes` ago (by wall clock, robust to uneven refresh)."""
+        target = ts - pd.Timedelta(minutes=minutes)
+        old = [s for s in self.snap if s[0] <= target]
+        return old[-1] if old else None          # no fallback: a 1-min-old snapshot is not a 15-min flow
+
+    def _z(self, key, x):
+        h = self.zhist[key]
+        h.append(x)
+        if len(h) < 20:
+            return float(np.clip(x, -3, 3))       # warm-up: features are already roughly unit-scaled
+        a = np.asarray(h)
+        sd = a.std()
+        return float(np.clip((x - a.mean()) / sd, -3, 3)) if sd > 1e-9 else 0.0
+
+    def update(self, ts, spot, fut_candles, df_chain, expiry, vix=None, r=0.065, q=0.012, fut_ltp=None, fetch_id=None):
+        if fetch_id is not None and fetch_id == self._last_fetch:
+            return self._last_out               # same data snapshot: do not double-log or double-count
+        ts = pd.Timestamp(ts).tz_localize(None) if pd.Timestamp(ts).tzinfo else pd.Timestamp(ts)
+        if self.day != ts.date():                 # reset intraday state every session
+            self.snap.clear(); self.day = ts.date()
+        c = pd.DataFrame(fut_candles) if fut_candles is not None else pd.DataFrame()
+        df = df_chain.copy()
+        for col in ("strike", "call_oi", "put_oi", "call_delta", "put_delta", "call_iv", "put_iv", "call_ltp", "put_ltp"):
+            if col in df:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+        T = _T_years(expiry, ts.to_pydatetime())
+        fwd = forward_price(spot, T, r, q)
+        fut_px = fut_ltp or (float(c.close.iloc[-1]) if len(c) else np.nan)
+        basis = (fut_px - fwd) if fut_px == fut_px else np.nan
+        rr = risk_reversal(df, spot)
+        prev = self._lag(ts)
+        self.snap.append((ts, oi_book(df), rr, vix or np.nan, basis))
+
+        raw = dict.fromkeys(DEFAULT_WEIGHTS, 0.0)
+        if len(c) >= 6:
+            raw["px_vwap"], raw["px_or"] = vwap_atr(c)
+            raw["fut_buildup"] = fut_buildup(c)
+        if prev is not None:
+            raw["oi_flow"] = writer_flow(df, spot, prev[1])
+            if rr == rr and prev[2] == prev[2]:
+                raw["rr_chg"] = (rr - prev[2]) / 0.5                            # 0.5 vol-pt = 1 unit (guess)
+            if vix and prev[3] == prev[3]:
+                raw["vix_chg"] = -(vix - prev[3]) / 0.3                         # 0.3 VIX pt = 1 unit (guess)
+            if basis == basis and prev[4] == prev[4]:
+                raw["basis_chg"] = (basis - prev[4]) / max(spot * 0.0002, 3)    # ~5 pts = 1 unit (guess)
+        z = {k: self._z(k, v) for k, v in raw.items()}
+
+        w = (self.model or {}).get("weights", DEFAULT_WEIGHTS)
+        lin = sum(w.get(k, 0) * z[k] for k in z)
+        score = round(100 * math.tanh(lin / 1.2), 1)
+        prob = None
+        if self.model:
+            prob = 1 / (1 + math.exp(-(self.model.get("intercept", 0) + lin * self.model.get("scale", 1))))
+        signs = [np.sign(v) for k, v in z.items() if abs(v) > 0.5]
+        agree = (abs(sum(signs)) / len(signs)) if signs else 0.0
+        label = "BULLISH" if score >= 25 else "BEARISH" if score <= -25 else "NEUTRAL"
+        # No-trade filters: first 15 min (OR forming), last 20 min, and low agreement
+        t = ts.time()
+        if t < datetime.strptime("09:30", "%H:%M").time() or t > datetime.strptime("15:10", "%H:%M").time() or agree < 0.34:
+            label = "NEUTRAL"
+
+        out = dict(score=score, label=label, prob_up=None if prob is None else round(prob, 3),
+                   agreement=round(float(agree), 2), features={k: round(v, 2) for k, v in z.items()},
+                   evr_forward_clean=round(parity_clean_evr(df, fwd), 3) if len(df) else None,
+                   calibrated=self.model is not None)
+        self._log(ts, fut_px, spot, z, score)
+        self._last_fetch, self._last_out = fetch_id, out
+        return out
+
+    def _log(self, ts, fut_px, spot, z, score):
+        row = {"ts": ts.isoformat(), "fut": fut_px, "spot": spot, "score": score, **z}
+        hdr = not os.path.exists(self.log_path)
+        try:
+            pd.DataFrame([row]).to_csv(self.log_path, mode="a", header=hdr, index=False)
+        except Exception:
+            pass
+
+
+# ─────────────────────────── calibration ───────────────────────────
+def calibrate_v27(log_path="bias_v27_log.csv", out_path="bias_v27_weights.json", horizon_min=15):
+    """Fit weights on logged features vs the sign of the forward `horizon_min` futures return.
+    Walk-forward: train on first 70% of days, report hit rate on the last 30%."""
+    d = pd.read_csv(log_path, parse_dates=["ts"]).dropna(subset=["fut"]).sort_values("ts")
+    d["day"] = d.ts.dt.date
+    fwd = []
+    for _, g in d.groupby("day"):
+        s = g.drop_duplicates("ts").set_index("ts").fut
+        f = s.reindex(s.index + pd.Timedelta(minutes=horizon_min), method="nearest", tolerance=pd.Timedelta("3min")).values
+        fwd.append(pd.Series(f - s.values, index=g.index))
+    d["fwd_ret"] = pd.concat(fwd)
+    d = d.dropna(subset=["fwd_ret"])
+    feats = list(DEFAULT_WEIGHTS)
+    days = sorted(d.day.unique()); cut = days[int(len(days) * 0.7)]
+    tr, te = d[d.day < cut], d[d.day >= cut]
+    tr = tr[tr.fwd_ret.abs() > 3]                 # drop < 3-pt noise from TRAINING only; test on everything
+    te = te[te.fwd_ret != 0]
+    X, y = tr[feats].values, (tr.fwd_ret > 0).astype(float).values
+    # plain ridge-logistic via gradient descent (no sklearn dependency)
+    wv, b = np.zeros(len(feats)), 0.0
+    for _ in range(4000):
+        p = 1 / (1 + np.exp(-(X @ wv + b)))
+        wv -= 0.05 * (X.T @ (p - y) / len(y) + 0.01 * wv); b -= 0.05 * float(np.mean(p - y))
+    s = np.abs(wv).sum() or 1
+    weights = {k: float(v / s) for k, v in zip(feats, wv)}
+    lin_te = te[feats].values @ np.array([weights[k] for k in feats])
+    hit = float(np.mean(np.sign(lin_te) == np.sign(te.fwd_ret.values))) if len(te) else float("nan")
+    strong = np.abs(lin_te) > np.quantile(np.abs(lin_te), 0.7) if len(te) > 10 else np.ones(len(te), bool)
+    hit_strong = float(np.mean(np.sign(lin_te[strong]) == np.sign(te.fwd_ret.values[strong]))) if strong.any() else float("nan")
+    model = {"weights": weights, "intercept": b, "scale": s, "horizon_min": horizon_min,
+             "oos_hit_rate": round(hit, 3), "oos_hit_rate_top30pct": round(hit_strong, 3),
+             "train_days": len([x for x in days if x < cut]), "test_days": len([x for x in days if x >= cut]),
+             "fitted": datetime.now().isoformat(timespec="minutes")}
+    with open(out_path, "w") as f:
+        json.dump(model, f, indent=2)
+    print(json.dumps(model, indent=2))
+    return model
+
+
+
+_V27_ENGINE = None
+_V27_LOCK = threading.Lock()
+
+
+def _get_v27_engine():
+    global _V27_ENGINE
+    if _V27_ENGINE is None:
+        _V27_ENGINE = IntradayBiasEngine(
+            log_path=os.path.join(_BASE_DIR, "nifty_bias_v27_log.csv"),
+            weights_path=os.path.join(_BASE_DIR, "nifty_bias_v27_weights.json"))
+    return _V27_ENGINE
+
+
+def run_v27_engine(spot, candles, df_band_records, expiry, vix, fetch_id):
+    """Thread-safe single call per server fetch. Returns engine output dict or None."""
+    try:
+        with _V27_LOCK:
+            return _get_v27_engine_st().update(
+                ts=now_ist(), spot=spot, fut_candles=candles or [],
+                df_chain=pd.DataFrame(df_band_records or []), expiry=expiry,
+                vix=vix if vix and vix > 0 else None, fetch_id=fetch_id)
+    except Exception as _e:
+        try:
+            print(f"[v27-engine] {_e}", flush=True)
+        except Exception:
+            pass
+        return None
+
+
+_V27_FEAT_NAMES = {
+    "px_vwap": "Price vs VWAP", "px_or": "Opening range", "fut_buildup": "Fut price×OI",
+    "oi_flow": "15m OI flow", "rr_chg": "15m risk-reversal", "vix_chg": "15m VIX (inv)",
+    "basis_chg": "15m fut basis",
+}
+
+
+def _v27_panel_parts(v):
+    """Shared view-model for both UIs."""
+    if not v:
+        return None
+    lab = v["label"]
+    col = "#059669" if lab == "BULLISH" else ("#DC2626" if lab == "BEARISH" else "#6B7280")
+    if v.get("calibrated") and v.get("prob_up") is not None:
+        cal = f"Calibrated · P(up next 15m) = {v['prob_up']*100:.0f}%"
+    else:
+        cal = "UNCALIBRATED — prior weights; collecting data. Evaluate, do not trade on it alone."
+    chips = []
+    for k, z in v.get("features", {}).items():
+        c = "#059669" if z > 0.5 else ("#DC2626" if z < -0.5 else "#6B7280")
+        chips.append((_V27_FEAT_NAMES.get(k, k), z, c))
+    return dict(label=lab, color=col, score=v["score"], agree=v.get("agreement", 0),
+                cal=cal, chips=chips, evr=v.get("evr_forward_clean"))
+
+
+@st.cache_resource
+def _get_v27_engine_st():
+    """v27: one engine per Streamlit process (plain module globals are rebuilt on reruns)."""
+    return _get_v27_engine()
+
+
+def _render_v27_panel_st(v):
+    """v27: Intraday Flow Engine panel (Streamlit)."""
+    p = _v27_panel_parts(v)
+    if not p:
+        st.caption("v27 Flow Engine: warming up (needs futures candles + option chain)")
+        return
+    chips = "".join(
+        f'<span style="background:{c}18;color:{c};border:1px solid {c};border-radius:5px;'
+        f'padding:2px 8px;font-size:11px;font-weight:700;margin:0 6px 4px 0;display:inline-block;'
+        f'white-space:nowrap">{n}: {z:+.1f}</span>' for n, z, c in p["chips"])
+    evr = f"Parity-clean EVR {p['evr']:.2f}" if p["evr"] is not None else ""
+    st.markdown(
+        f'<div class="section-header">&#129517; v27 Intraday Flow Engine &mdash; next 15-30 min bias</div>'
+        f'<div style="border:1px solid #E5E7EB;border-left:4px solid {p["color"]};border-radius:10px;'
+        f'padding:10px 12px;background:#fff;margin-bottom:10px">'
+        f'<div style="display:flex;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
+        f'<span style="font-size:20px;font-weight:900;color:{p["color"]};margin-right:12px">{p["label"]}</span>'
+        f'<span style="font-size:13px;font-weight:700;color:{p["color"]};margin-right:12px">Score {p["score"]:+.0f}/100</span>'
+        f'<span style="font-size:12px;color:#374151;margin-right:12px">Agreement {p["agree"]*100:.0f}%</span>'
+        f'<span style="font-size:12px;color:#374151">{evr}</span></div>'
+        f'<div>{chips}</div>'
+        f'<div style="font-size:11px;color:#6B7280;font-style:italic">{p["cal"]}</div></div>',
+        unsafe_allow_html=True)
+# ══ END v27 INTRADAY FLOW ENGINE ══════════════════════════════════════════════
 
 
 # ─── History helpers ──────────────────────────────────────────────────────────
@@ -4956,6 +5339,25 @@ _s34_score     = _s34_bias["bias_score"]
 _s34_breakdown = _s34_bias.get("signal_breakdown", {})
 # ── end S5 term structure injection ──────────────────────────────────────────
 
+# ── v27: Bias Velocity (S6) — applied BEFORE Enhanced/Combined so every consumer sees
+# one score; velocity is measured on PRE-S6 history ("score_raw") so it never feeds on
+# its own past value. Direction is recomputed after S4-intra/S5/S6 in all cases.
+_bias_hist = st.session_state.get("bias_history", [])
+if len(_bias_hist) >= 3:
+    _recent_scores = [safe_num(x.get("score_raw", x.get("score", 0))) for x in _bias_hist[-4:]]
+    _recent_scores.append(float(_s34_score))
+    _velocity = _recent_scores[-1] - _recent_scores[-2]
+    _accel = (_recent_scores[-1] - _recent_scores[-2]) - (_recent_scores[-2] - _recent_scores[-3]) if len(_recent_scores) >= 3 else 0.0
+    _s6 = max(-10.0, min(10.0, (_velocity / 20.0) * 10.0))
+    _s34_score_v4 = max(-100.0, min(100.0, _s34_score + _s6))
+    _s34_bias["bias_score"] = _s34_score_v4
+    _s34_bias["signal_breakdown"]["S6 Velocity"] = round(_s6, 1)
+else:
+    _velocity = 0.0; _accel = 0.0; _s6 = 0.0; _s34_score_v4 = _s34_score
+if _s34_score_v4 >= 15: _s34_bias["direction"] = "BULLISH"
+elif _s34_score_v4 <= -15: _s34_bias["direction"] = "BEARISH"
+else: _s34_bias["direction"] = "NEUTRAL"
+
 # Module C: India VIX
 _vix_raw           = fetch_india_vix_ltp()
 # Maintain a lightweight intraday VIX history in session_state for spike detection
@@ -4970,7 +5372,7 @@ _vix_data          = classify_vix_signal(_vix_raw, st.session_state.vix_history)
 
 # Aggregate into Enhanced Price Bias
 _enhanced_bias     = compute_enhanced_price_bias(
-    _vwap_or_data, _ts_data, _vix_data, _s34_score, spot
+    _vwap_or_data, _ts_data, _vix_data, _s34_score_v4, spot   # v27: post-S6 score
 )
 # ── end Enhanced Price Confirmation Layer ─────────────────────────────────────
 
@@ -4981,24 +5383,10 @@ _enhanced_bias     = compute_enhanced_price_bias(
 # ── v4 #5: Feed Enhanced Price Layer into Combined Decision ──────────
 _combined_decision = generate_combined_decision(_s34_bias, _early_smile, m, _enhanced_bias)
 
-# ── v4 #1: Bias Velocity (Signal 6) — computed here where bias_history is available ──
-_bias_hist = st.session_state.get("bias_history", [])
-if len(_bias_hist) >= 3:
-    _recent_scores = [safe_num(x.get("score", 0)) for x in _bias_hist[-4:]]
-    _recent_scores.append(float(_s34_score))
-    _velocity = _recent_scores[-1] - _recent_scores[-2]
-    _accel = (_recent_scores[-1] - _recent_scores[-2]) - (_recent_scores[-2] - _recent_scores[-3]) if len(_recent_scores) >= 3 else 0.0
-    # Scale: 20-pt change over 1 tick = full ±10 score
-    _s6 = max(-10.0, min(10.0, (_velocity / 20.0) * 10.0))
-    # Update the bias score with velocity
-    _s34_score_v4 = max(-100.0, min(100.0, _s34_score + _s6))
-    _s34_bias["bias_score"] = _s34_score_v4
-    if _s34_score_v4 >= 15: _s34_bias["direction"] = "BULLISH"
-    elif _s34_score_v4 <= -15: _s34_bias["direction"] = "BEARISH"
-    else: _s34_bias["direction"] = "NEUTRAL"
-    _s34_bias["signal_breakdown"]["S6 Velocity"] = round(_s6, 1)
-else:
-    _velocity = 0.0; _accel = 0.0; _s6 = 0.0; _s34_score_v4 = _s34_score
+# v27 Intraday Flow Engine (additive panel)
+_v27 = run_v27_engine(spot, _intraday_candles, payload.get("df_band"), expiry, _vix_raw, _payload_fetch_ts)
+
+# v27: S6 bias velocity moved up (applied before Enhanced/Combined) — see above.
 
 # ── CHANGE 1 (audit fix): Rewire strategy_recommendation to Combined Decision ──
 # The legacy `bias` dict (compute_nifty_bias) uses signed-delta net_delta as a
@@ -5154,7 +5542,8 @@ if _payload_fetch_ts != _last_bh_fetch_ts:
         "_ts_unix":  _payload_fetch_ts,
         "_fetch_ts": _payload_fetch_ts,   # server fetch id — used for cross-session dedup
         "spot":      spot,
-        "score":     float(_s34_score),
+        "score":     float(_s34_score_v4),   # v27: final score (post-S6)
+        "score_raw": float(_s34_score),      # v27: pre-S6 score, used for velocity
         "direction": _s34_bias["direction"],
         "s1":        _s34_breakdown.get("S1 Net OI",     0.0),
         "s2":        _s34_breakdown.get("S2 Momentum",   0.0),
@@ -5181,6 +5570,9 @@ def _compute_grf(m_dict, spot_px):
     """Greek Risk Framework scorer — all inputs from compute_metrics() dict."""
     nd      = safe_num(m_dict.get("net_delta",           0))
     mom     = safe_num(m_dict.get("momentum",            0))
+    # v27: flip to WRITER convention (put-side Δ-OI / put writing = bullish) so GRF
+    # agrees with S3/4, Market Sentiments and the legacy Bias Score.
+    nd, mom = -nd, -mom
     gex     = safe_num(m_dict.get("gex",                 0))
     d_res   = safe_num(m_dict.get("dist_to_resistance",  0))   # resistance - spot  (>0 = spot below wall)
     d_sup   = safe_num(m_dict.get("dist_to_support",     0))   # spot - support      (>0 = spot above wall)
@@ -5222,7 +5614,7 @@ def _compute_grf(m_dict, spot_px):
     nd_bull = nd > 0
     if nd_sig:
         d += 1
-        fac.append(f"Net delta {'bullish' if nd_bull else 'bearish'} ({nd:+,.0f})")
+        fac.append(f"Writer-signed net Δ {'bullish' if nd_bull else 'bearish'} ({nd:+,.0f})")
     if nd_sig and mp_val > 0 and spot_px > 0:
         mp_bull = mp_val > spot_px
         if nd_bull == mp_bull and abs(mp_val - spot_px) > 20:
@@ -5504,6 +5896,7 @@ with _ph_hidden_eb.container():
         _enhanced_bias, _vwap_or_data, _ts_data, _vix_data, _combined_decision, spot, m
     )
 _ph_hidden_eb.empty()        # v20: Enhanced Market Bias visual output suppressed
+_render_v27_panel_st(_v27)   # v27: Intraday Flow Engine panel (visible)
 # ══ END ENHANCED BIAS PANEL ═══════════════════════════════════════════════════
 
 _ph_hidden_grf = st.empty()   # v20: Greek Risk Framework visuals hidden — calculations preserved
@@ -7129,6 +7522,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
     _atm  = round(spot / _step) * _step if spot else 0
 
     _rows = []
+    _T_endm = safe_num(m.get("t_years", 0)) or (3 / 365.0)   # v27
     for _r in df_band_records:
         _strike  = float(_r.get("strike", 0) or 0)
         _c_chg   = float(_r.get("call_oi_chg", 0) or 0)
@@ -7139,7 +7533,9 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _p_ltp   = float(_r.get("put_ltp",  0) or 0)
 
         # Raw CE/PE EV ratio per strike — identical formula to the Section-4 chart
-        _ev_c = max(0.0, _c_ltp - max(0.0, spot - _strike))
+        # v27: remove put-call-parity carry so a flat market reads EVR ≈ 1, not > 1
+        _ev_c = max(0.0, _c_ltp - max(0.0, spot - _strike)
+                    - float(_parity_offset(_strike, spot, _T_endm)))
         _ev_p = max(0.0, _p_ltp - max(0.0, _strike - spot))
         if _ev_p > 1e-9:
             _evr = _ev_c / _ev_p
@@ -7232,7 +7628,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#D97706", "#FFFBEB"
         _key_ks   = _fmt_ks(_pb_ks + _ca_ks)
         _reason = [
-            f"Avg Raw Sentiment is {_evr_avg:.2f}, but strong SELLERS sit on both sides of spot.",
+            f"Avg parity-adj Sentiment is {_evr_avg:.2f}, but strong SELLERS sit on both sides of spot.",
             f"Put writers defend [{_fmt_ks(_pb_ks)}] below spot and call writers cap [{_fmt_ks(_ca_ks)}] above spot.",
             f"Both sides are pressing price toward the middle → expect the market to stay pinned near ATM {int(_atm):,}.",
         ]
@@ -7242,7 +7638,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#059669", "#D1FAE5"
         _key_ks   = _fmt_ks(_strong_ks)
         _reason = [
-            f"Call premiums are richer than puts (avg Raw Sentiment {_evr_avg:.2f} > 1.2) → call buyers + put sellers → bullish bias.",
+            f"Call premiums are richer than puts (avg parity-adj Sentiment {_evr_avg:.2f} > 1.2) → call buyers + put sellers → bullish bias.",
             f"Net Δ-weighted OI change is POSITIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — call BUYERS are stronger than put sellers.",
             "Buyers, not sellers, are driving the move → upside momentum is STRONG.",
         ]
@@ -7252,7 +7648,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#65A30D", "#F7FEE7"
         _key_ks   = _fmt_ks(_weak_ks)
         _reason = [
-            f"Call premiums are richer than puts (avg Raw Sentiment {_evr_avg:.2f} > 1.2) → bias stays bullish.",
+            f"Call premiums are richer than puts (avg parity-adj Sentiment {_evr_avg:.2f} > 1.2) → bias stays bullish.",
             f"But net Δ-weighted OI change is NEGATIVE at key strikes [{_fmt_ks(_weak_ks)}] — put SELLERS are stronger than call buyers.",
             "The market is supported by sellers rather than driven by buyers → upside momentum is NOT strong.",
         ]
@@ -7262,7 +7658,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#DC2626", "#FEE2E2"
         _key_ks   = _fmt_ks(_strong_ks)
         _reason = [
-            f"Put premiums are richer than calls (avg Raw Sentiment {_evr_avg:.2f} < 0.7) → put buyers + call sellers → bearish bias.",
+            f"Put premiums are richer than calls (avg parity-adj Sentiment {_evr_avg:.2f} < 0.7) → put buyers + call sellers → bearish bias.",
             f"Net Δ-weighted OI change is NEGATIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — put BUYERS are stronger than call sellers.",
             "Buyers of downside protection are driving → downside momentum is STRONG.",
         ]
@@ -7272,7 +7668,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _sc, _sbg = "#EA580C", "#FFF7ED"
         _key_ks   = _fmt_ks(_weak_ks)
         _reason = [
-            f"Put premiums are richer than calls (avg Raw Sentiment {_evr_avg:.2f} < 0.7) → bias stays bearish.",
+            f"Put premiums are richer than calls (avg parity-adj Sentiment {_evr_avg:.2f} < 0.7) → bias stays bearish.",
             f"But net Δ-weighted OI change is POSITIVE at key strikes [{_fmt_ks(_weak_ks)}] — call SELLERS are stronger than put buyers.",
             "The upside is capped by sellers rather than pressed by buyers → downside momentum is NOT strong.",
         ]
@@ -7281,7 +7677,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
         _mom_lbl = "—"
         _sc, _sbg = "#6B7280", "#F9FAFB"
         _key_ks   = "—"
-        _reason = [f"Avg Raw Sentiment is {_evr_avg:.2f} (neutral zone 0.7–1.2) — call and put premiums are balanced, so neither side has the edge."]
+        _reason = [f"Avg parity-adj Sentiment is {_evr_avg:.2f} (neutral zone 0.7–1.2) — call and put premiums are balanced, so neither side has the edge."]
 
     # ── 15-minute final-verdict history ──────────────────────────────────────
     # v14 (ported from Dash v15): the log's level column is now the GEX+Vega
@@ -7589,7 +7985,8 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         except Exception:
             _T_ev = 3 / 365.0
         _ev_bd["ev_c_adj"] = np.maximum(
-            0, _ev_bd["ev_c"] - _ev_bd["strike"] * (1 - np.exp(-RISK_FREE_RATE * _T_ev)))
+            0, _ev_bd["ev_c"] - _ev_bd["strike"] * (1 - np.exp(-RISK_FREE_RATE * _T_ev))
+                + spot * (1 - np.exp(-DIVIDEND_YIELD * _T_ev)))   # v27: dividend term
         _evr_raw_s = (_ev_bd["ev_c_adj"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
         # ★ v17: per-strike initiation map — >1.2 call buyers/put sellers
         # dominant (bullish), <0.7 put buyers/call sellers dominant (bearish),
