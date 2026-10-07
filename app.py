@@ -20,7 +20,13 @@
 ║  v26 — 04-Oct-2026: OCTOBER 2026 SENTIMENT ADDITION panel at the  ║
 ║        very top (Fear·Skew·Positioning·Gamma tiles, divergence    ║
 ║        chart, OI ladder, alert log, snapshot store) — add-on only ║
-║  v27 — 07-Oct-2026: version renamed to v27 (code identical to v26) ║
+║  v27 — 07-Oct-2026: ONE shared history for all visitors — process-  ║
+║        wide fetch cache + locks, server-side tick recording, 30s   ║
+║        background fetcher, daily skew anchor, permanent archive    ║
+║        + GEX×Flip: live state at top, 9-state grid moved to bottom ║
+║        + OCT-2026 panel fixes: skew-adjusted Fear/Skew, IV-based    ║
+║          positioning, OI-magnet gamma tile, 09:20–09:25 median     ║
+║          anchor, holiday/stall guard, 15-min intraday z, 252-day σ ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -56,6 +62,31 @@ _pio.templates["_mobile_fix"] = go.layout.Template(
 _pio.templates.default = "plotly+_mobile_fix"
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+import copy as _v27_copy
+
+# v27: Streamlit re-executes this whole script on every rerun, so plain module-level
+# globals (caches, locks) are re-created EMPTY each time and are never shared between
+# visitors. st.cache_resource returns the SAME object for every rerun and every visitor
+# of this server process — all shared caches and locks now live here.
+@st.cache_resource(show_spinner=False)
+def _v27_shared_state():
+    return {
+        "srv_lock":     threading.Lock(),
+        "srv_cache":    {"payload": None, "source": None, "last_fetch_ts": 0.0},
+        "inflight":     {"v": False},
+        "persist_lock": threading.Lock(),
+        "hist_lock":    threading.Lock(),
+        "bias_lock":    threading.Lock(),
+        "smile_lock":   threading.Lock(),
+        "skew_lock":    threading.Lock(),
+        "vix_lock":     threading.Lock(),
+        "vix_history":  [],
+        "endm_lock":    threading.Lock(),
+        "oct26_lock":   threading.Lock(),
+    }
+
+_SH = _v27_shared_state()
+_V27_HIST_LOCK = _SH["hist_lock"]
 
 warnings.filterwarnings("ignore")
 
@@ -849,7 +880,7 @@ def compute_gamma_regime_matrix(spot, gex, gamma_flip, call_wall=None, put_wall=
 # ─── end v25 GEX × Gamma Flip Regime Matrix core ─────────────────────────────────
 
 
-def render_gamma_regime_matrix_html(r):
+def render_gamma_regime_matrix_html(r, part="all"):
     """v25: Streamlit renderer for compute_gamma_regime_matrix() — returns one
     single-line HTML string (no indentation, so Markdown never treats it as code)."""
     import html as _h
@@ -929,6 +960,14 @@ def render_gamma_regime_matrix_html(r):
             f'Typical |GEX| = median of {r["hist_ticks"]} history ticks across {r["hist_days"]} day(s). '
             'Independent read — does not alter the Bias Summary or any other verdict. '
             'GEX is a model of dealer hedging; on NIFTY many writers do not delta-hedge.</div>')
+    # v27: part='live' → current state only (top); part='grid' → 9-state grid (bottom)
+    if part == "live":
+        return verdict + ('<div style="font-size:11px;color:#6B7280;margin-top:4px;font-style:italic;">'
+                          'Full 9-state reference grid (live cell ◉ highlighted) is at the bottom of the dashboard.</div>')
+    if part == "grid":
+        return (f'<div style="font-size:12px;color:#374151;">Live cell now: <b style="color:{col};">'
+                f'{esc(c["name"])}</b> · {esc(c["tag"])} · confidence {r["score"]}/10</div>'
+                + "".join(grid) + foot)
     return verdict + "".join(grid) + foot
 
 
@@ -4056,8 +4095,8 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
 #     release lock, do the fetch, re-acquire lock, store payload, clear flag.
 #   - If cache stale AND fetch already in progress → return stale payload
 #     (stale-while-revalidate).
-_srv_cache_lock      = threading.Lock()
-_srv_cache           = {"payload": None, "source": None, "last_fetch_ts": 0.0}
+_srv_cache_lock      = _SH["srv_lock"]      # v27: shared across reruns/visitors
+_srv_cache           = _SH["srv_cache"]     # v27: shared across reruns/visitors
 _srv_fetch_in_progress = False     # CI #7 fix: single-flight flag
 
 def _raw_fetch_and_compute(expiry_override=None, history=None):
@@ -4104,7 +4143,7 @@ def _raw_fetch_and_compute(expiry_override=None, history=None):
     return payload, source
 
 
-def get_server_data(expiry_override=None):
+def get_server_data(expiry_override=None, _from_bg=False):
     """
     Returns (payload, source, last_fetch_ts) for ALL visitors.
     Only calls Dhan API when the owner-configured refresh interval has elapsed.
@@ -4133,7 +4172,7 @@ def get_server_data(expiry_override=None):
                 _srv_cache.get("last_fetch_ts", 0.0),
             )
         # Cache stale — check if another thread is already fetching
-        if _srv_fetch_in_progress:
+        if _SH["inflight"]["v"]:   # v27: shared single-flight flag
             # Stale-while-revalidate: return what we have, let the other thread finish
             return (
                 _srv_cache.get("payload"),
@@ -4141,7 +4180,7 @@ def get_server_data(expiry_override=None):
                 _srv_cache.get("last_fetch_ts", 0.0),
             )
         # Claim the fetch slot
-        _srv_fetch_in_progress = True
+        _SH["inflight"]["v"] = True
 
     # ── Phase 2: do the network call WITHOUT holding the lock ──
     try:
@@ -4152,7 +4191,7 @@ def get_server_data(expiry_override=None):
 
     # ── Phase 3: re-acquire lock to update cache + clear flag ──
     with _srv_cache_lock:
-        _srv_fetch_in_progress = False
+        _SH["inflight"]["v"] = False
         if payload is not None:
             _srv_cache["payload"] = payload
             _srv_cache["source"]  = source
@@ -4163,6 +4202,12 @@ def get_server_data(expiry_override=None):
         # fetch with no backoff.
         elif _srv_cache["payload"] is not None:
             _srv_cache["last_fetch_ts"] = time.time() - max(0, interval - 30)  # 30s cooldown
+
+    # v27: record the shared history tick right after a successful fetch.
+    # Background fetches outside market hours are not recorded (as before, after-hours
+    # ticks are only recorded when a visitor is actually viewing).
+    if payload is not None and (not _from_bg or is_market_hours()):
+        _v27_record_history_tick(_srv_cache.get("payload"), _srv_cache.get("last_fetch_ts", 0.0))
 
     return (
         _srv_cache.get("payload"),
@@ -4216,7 +4261,7 @@ _SMILE_HISTORY_FILE = os.path.join(_BASE_DIR, "nifty_smile_history.json")
 # Prevents concurrent visitor sessions from corrupting the JSON files via
 # interleaved read-modify-write cycles (which the previous bare `open(w)` calls
 # allowed — last writer wins, file can be truncated if process is killed mid-write).
-_persist_lock = threading.Lock()
+_persist_lock = _SH["persist_lock"]   # v27: shared across reruns/visitors
 
 # H25 fix: TTL cache for _load_owner_settings. The function was being called
 # 2-3× per rerun from multiple sites (sidebar, get_server_data, banner) and
@@ -4356,29 +4401,37 @@ def _save_smile_history(sh):
             pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# v26 — OCTOBER 2026 SENTIMENT ADDITION panel  (core engine — shared by Dash and
-#        Streamlit editions; independent add-on, no existing logic changed)
+# v26/v27 — OCTOBER 2026 SENTIMENT ADDITION panel  (core engine — shared by Dash
+#        and Streamlit editions; independent add-on, no existing logic changed)
 #
 # What it does
 #   • Records one raw snapshot of the option chain per data fetch (LIVE data and
-#     market hours only) to  <app dir>/oct26_sentiment/ :
-#         raw_YYYY-MM-DD.jsonl    raw per-strike rows of the session's frozen set
+#     market hours only; snapshots identical to the previous one — e.g. an NSE
+#     holiday serving last session's chain — are skipped) to <app dir>/oct26_sentiment/:
+#         raw_YYYY-MM-DD.jsonl    raw per-strike rows
 #         agg_YYYY-MM-DD.jsonl    one aggregate line per snapshot (signals + z)
 #         state_YYYY-MM-DD.json   opening anchors, frozen strike set, alert log
-#   • Frozen strike band: ±2.5σ expected move around the forward, set at the
-#     first snapshot of the session (σ = F × ATM IV × √T), clamped 6–40 strikes.
-#   • Four tiles: ① Fear (ATM IV)  ② Skew (25Δ risk reversal, fixed-delta)
-#                 ③ Positioning (inferred, delta-weighted OI change since open)
-#                 ④ Gamma zone (unsigned OI×gamma — no dealer-sign assumption)
-#   • z-scores vs the SAME TIME OF DAY over prior sessions (needs ≥10 sessions);
-#     a tile colours only when |z| > 1 AND the raw change is economically meaningful;
-#     until then an intraday z is shown and labelled "baseline building".
+#   • Session anchor = MEDIAN of all snapshots taken 09:20–09:25 IST (avoids the
+#     erratic first minutes). If the app starts after 09:25 the first snapshot is
+#     used, the day is tagged "late start" and EXCLUDED from time-of-day baselines.
+#   • Frozen strike band: ±2.5σ around the anchor forward, clamped 6–40 strikes.
+#   • Four tiles:
+#       ① Fear  — ATM IV at the current forward; colour/z/alerts use the
+#                 SKEW-ADJUSTED change (actual − IV the opening smile implies at
+#                 today's forward = sticky-strike expectation)
+#       ② Skew  — 25Δ risk reversal; same skew adjustment
+#       ③ Positioning — OI change classified by the strike's IV change RELATIVE to
+#                 the ATM shift (premium no longer used → no spot / time-decay bias)
+#       ④ Gamma zone — "OI magnet": largest total-OI strike within ±1σ and how
+#                 concentrated it is (× median OI); PIN only if concentrated AND close
+#   • z-scores vs the SAME TIME OF DAY over prior normal sessions (≥10); until then
+#     an intraday z of the 15-min change vs earlier 15-min changes today.
 #   • Headline = confluence count of the 3 directional tiles — no probability.
 #   • On expiry day the IV/skew tiles switch to the NEXT expiry at 13:00 IST
 #     (anchored from 12:30) because the expiring chain is gamma-dominated.
 #
 # Reading caveats (also shown in the panel footer)
-#   • Writer/buyer classification is INFERRED from OI-change × premium-change.
+#   • Writer/buyer classification is still an INFERENCE.
 #   • Event days (RBI, Fed, CPI…) inflate IV regardless of direction — add the
 #     dates to OCT26_EVENT_DATES so they are tagged.
 #   • Thresholds are reasonable defaults, not back-tested optima.
@@ -4391,12 +4444,19 @@ OCT26_MAX_STRIKES_SIDE      = 40
 OCT26_SPREAD_MAX            = 0.10    # max bid-ask spread as fraction of mid for the IV fit
 OCT26_Z_THRESH              = 1.0     # colour only beyond ±1 z
 OCT26_POS_THRESH            = 0.20    # positioning score threshold (−1..+1)
-OCT26_MIN_IV_CHG            = 0.30    # |ATM IV change vs open| (vol pts) needed before IV can colour/alert
-OCT26_MIN_RR_CHG            = 0.20    # |25Δ RR change vs open| (vol pts) needed before skew can colour/alert
+OCT26_POS_IV_DEADBAND       = 0.10    # |strike IV change − ATM shift| (vol pts) below which OI change is unclassified
+OCT26_MIN_IV_CHG            = 0.30    # |skew-adjusted ATM IV change| (vol pts) needed before IV can colour/alert
+OCT26_MIN_RR_CHG            = 0.20    # |skew-adjusted 25Δ RR change| (vol pts) needed before skew can colour/alert
 OCT26_TOD_MIN_SESSIONS      = 10      # sessions needed for time-of-day z
 OCT26_TOD_LOOKBACK_SESSIONS = 60
 OCT26_TOD_WINDOW_MIN        = 10      # ± minutes when matching time of day
-OCT26_INTRADAY_MIN_SNAPS    = 8       # snapshots needed for the fallback intraday z
+OCT26_INTRADAY_CHG_MIN      = 15      # intraday-z fallback: change horizon (minutes)
+OCT26_INTRADAY_MIN_CHGS     = 8       # prior changes needed for the intraday z
+OCT26_ANCHOR_START_HM       = (9, 20) # session anchor = median of snapshots in [09:20, 09:25)
+OCT26_ANCHOR_END_HM         = (9, 25)
+OCT26_PIN_OI_MULT           = 1.5     # magnet must hold ≥ 1.5× the median total OI of strikes within ±1σ
+OCT26_PIN_DIST_SIGMA        = 0.35    # … and spot within 0.35σ (to expiry) of it
+OCT26_TRADING_DAYS          = 252     # σ_day = F × IV × √(1/252) (one trading day)
 OCT26_NEXT_ANCHOR_HM        = (12, 30)
 OCT26_NEXT_SWITCH_HM        = (13, 0)
 OCT26_ALERT_COOLDOWN_MIN    = 30
@@ -4405,9 +4465,8 @@ OCT26_EVENT_DATES           = {
     # "2026-10-08": "RBI MPC",   ← add scheduled event days here (YYYY-MM-DD: label)
 }
 
-_oct26_lock = threading.Lock()
+_oct26_lock = _SH["oct26_lock"]   # v27: shared across reruns/visitors
 _oct26_agg_cache = {}   # path -> (mtime, rows)
-
 
 # ─── small utilities ─────────────────────────────────────────────────────────
 def _oct26_path(kind, day):
@@ -4551,45 +4610,48 @@ def _oct26_forward(df, spot, T, r=None):
     return float(spot)
 
 
-def _oct26_iv_metrics(df, spot, expiry):
-    """ATM IV (OTM-side curve at the forward), 25Δ call/put IV, RR, straddle, σ."""
-    out = {"F": None, "T": None, "atm_iv": None, "iv_c25": None, "iv_p25": None,
-           "rr25": None, "straddle": None, "sigma_pts": None, "sigma_day": None,
-           "n_liquid": 0}
-    if df is None or df.empty or not spot:
-        return out
-    T = _oct26_T_years(expiry)
-    F = _oct26_forward(df, spot, T)
-    out["F"], out["T"] = F, T
 
-    otm_k, otm_iv, c_pts, p_pts = [], [], [], []
+def _oct26_points(df):
+    """Per-strike liquid IV points: [[K, call_iv or None, put_iv or None], ...] (IV in %)."""
+    pts = []
     for _, x in df.iterrows():
         K = float(x["strike"])
         c_ok = _oct26_liquid(x["call_ltp"], x["call_iv"], x.get("call_bid", 0), x.get("call_ask", 0), x.get("call_vol", 0))
         p_ok = _oct26_liquid(x["put_ltp"], x["put_iv"], x.get("put_bid", 0), x.get("put_ask", 0), x.get("put_vol", 0))
-        if c_ok:
-            cd, _, _ = _oct26_b76(F, K, T, x["call_iv"] / 100.0)
-            if cd is not None:
-                c_pts.append((cd, float(x["call_iv"])))
-        if p_ok:
-            _, pdl, _ = _oct26_b76(F, K, T, x["put_iv"] / 100.0)
-            if pdl is not None:
-                p_pts.append((pdl, float(x["put_iv"])))
-        if K >= F and c_ok:
-            otm_k.append(K); otm_iv.append(float(x["call_iv"]))
-        elif K < F and p_ok:
-            otm_k.append(K); otm_iv.append(float(x["put_iv"]))
-    out["n_liquid"] = len(otm_k)
+        if c_ok or p_ok:
+            pts.append([K, float(x["call_iv"]) if c_ok else None, float(x["put_iv"]) if p_ok else None])
+    return pts
 
+
+def _oct26_curve_metrics(pts, F, T):
+    """ATM IV (OTM-side curve interpolated at F), 25Δ call/put IV and RR from IV points."""
+    out = {"atm_iv": None, "iv_c25": None, "iv_p25": None, "rr25": None, "n_liquid": 0}
+    if not pts or not F or not T:
+        return out
+    otm_k, otm_iv, c_pts, p_pts = [], [], [], []
+    for K, civ, piv in pts:
+        if civ is not None:
+            cd, _, _ = _oct26_b76(F, K, T, civ / 100.0)
+            if cd is not None:
+                c_pts.append((cd, civ))
+        if piv is not None:
+            _, pdl, _ = _oct26_b76(F, K, T, piv / 100.0)
+            if pdl is not None:
+                p_pts.append((pdl, piv))
+        if K >= F and civ is not None:
+            otm_k.append(K); otm_iv.append(civ)
+        elif K < F and piv is not None:
+            otm_k.append(K); otm_iv.append(piv)
+    out["n_liquid"] = len(otm_k)
     if len(otm_k) >= 2 and min(otm_k) <= F <= max(otm_k):
         o = np.argsort(otm_k)
         out["atm_iv"] = float(np.interp(F, np.array(otm_k)[o], np.array(otm_iv)[o]))
 
-    def _interp_delta(pts, target):
-        if len(pts) < 2:
+    def _interp_delta(pp, target):
+        if len(pp) < 2:
             return None
-        pts = sorted(pts)
-        xs = np.array([p[0] for p in pts]); ys = np.array([p[1] for p in pts])
+        pp = sorted(pp)
+        xs = np.array([p[0] for p in pp]); ys = np.array([p[1] for p in pp])
         if xs.min() <= target <= xs.max():
             return float(np.interp(target, xs, ys))
         return None
@@ -4598,7 +4660,21 @@ def _oct26_iv_metrics(df, spot, expiry):
     out["iv_p25"] = _interp_delta(p_pts, -0.25)
     if out["iv_c25"] is not None and out["iv_p25"] is not None:
         out["rr25"] = out["iv_c25"] - out["iv_p25"]
+    return out
 
+
+def _oct26_iv_metrics(df, spot, expiry):
+    """Forward, T, curve metrics, straddle and σ-moves for one chain."""
+    out = {"F": None, "T": None, "atm_iv": None, "iv_c25": None, "iv_p25": None, "rr25": None,
+           "straddle": None, "sigma_pts": None, "sigma_day": None, "n_liquid": 0, "pts": []}
+    if df is None or df.empty or not spot:
+        return out
+    T = _oct26_T_years(expiry)
+    F = _oct26_forward(df, spot, T)
+    out["F"], out["T"] = F, T
+    pts = _oct26_points(df)
+    out["pts"] = pts
+    out.update(_oct26_curve_metrics(pts, F, T))
     try:
         atm_row = df.iloc[(df["strike"] - F).abs().argsort().iloc[0]]
         out["straddle"] = float(
@@ -4606,12 +4682,25 @@ def _oct26_iv_metrics(df, spot, expiry):
             _oct26_mid(atm_row["put_ltp"], atm_row.get("put_bid", 0), atm_row.get("put_ask", 0)))
     except Exception:
         pass
-
     if out["atm_iv"]:
         s = out["atm_iv"] / 100.0
         out["sigma_pts"] = float(F * s * np.sqrt(T))
-        out["sigma_day"] = float(F * s * np.sqrt(1.0 / 365.0))
+        out["sigma_day"] = float(F * s * np.sqrt(1.0 / OCT26_TRADING_DAYS))   # one TRADING day
     return out
+
+
+def _oct26_median_points(list_of_pts):
+    """Per-strike median of call/put IV across several snapshots' point lists."""
+    acc = {}
+    for pts in list_of_pts:
+        for K, civ, piv in pts:
+            a = acc.setdefault(float(K), ([], []))
+            if civ is not None:
+                a[0].append(civ)
+            if piv is not None:
+                a[1].append(piv)
+    return [[K, float(np.median(c)) if c else None, float(np.median(p)) if p else None]
+            for K, (c, p) in sorted(acc.items())]
 
 
 def _oct26_freeze_strikes(df, F, sigma_pts):
@@ -4624,28 +4713,45 @@ def _oct26_freeze_strikes(df, F, sigma_pts):
     return [k for k in strikes if F - hw <= k <= F + hw]
 
 
-def _oct26_raw_rows(df, strikes):
+def _oct26_raw_rows(df, strikes=None):
     keep = ["strike", "call_ltp", "call_bid", "call_ask", "call_vol", "call_oi", "call_iv", "call_delta", "call_gamma",
             "put_ltp", "put_bid", "put_ask", "put_vol", "put_oi", "put_iv", "put_delta", "put_gamma"]
-    d = df[df["strike"].isin(strikes)]
+    d = df if strikes is None else df[df["strike"].isin(strikes)]
     cols = [c for c in keep if c in d.columns]
     return d[cols].fillna(0).to_dict("records")
 
 
-def _oct26_positioning(rows_now, open_map, F, T):
-    """Inferred positioning since open on the frozen strike set.
+def _oct26_signature(df, spot):
+    """Fingerprint of the whole chain — identical fingerprints mean the feed is not updating."""
+    try:
+        return [round(float(spot), 2), int(df["call_oi"].sum()), int(df["put_oi"].sum()),
+                int(df.get("call_vol", pd.Series([0])).sum() + df.get("put_vol", pd.Series([0])).sum()),
+                round(float(df["call_ltp"].sum() + df["put_ltp"].sum()), 2)]
+    except Exception:
+        return None
 
-    Per strike & side:  ΔOI = OI_now − OI_open,  ΔP = premium_now − premium_open
-      OI↑ P↓ → writing     OI↑ P↑ → buying     OI↓ P↑ → short covering     OI↓ P↓ → unwinding
-    Direction:  put writing / call buying / call covering → bullish (+1)
-                call writing / put buying / put covering  → bearish (−1)
-                call unwinding −0.5 · put unwinding +0.5
-    Weighted by |ΔOI| × |delta|; score = Σ sign·w / Σ w  ∈ [−1, +1].
+
+def _oct26_positioning(rows_now, open_map, F, T, atm_shift=0.0):
+    """Inferred positioning since the anchor on the frozen strike set.
+
+    Per strike & side:  ΔOI = OI_now − OI_anchor
+                        ΔIV_rel = (IV_now − IV_anchor) − ATM shift (skew-adjusted ATM IV change)
+      OI↑ & ΔIV_rel < 0 → writing        OI↑ & ΔIV_rel > 0 → buying
+      OI↓ & ΔIV_rel > 0 → short covering OI↓ & ΔIV_rel < 0 → long unwinding
+      |ΔIV_rel| < dead-band → unclassified (excluded from the score)
+    Using the strike's IMPLIED VOL instead of its premium removes the two big
+    biases of the old premium test: spot movement (delta) and time decay (theta).
+    Subtracting the ATM shift removes a market-wide IV move, leaving local pressure.
+    Direction: put writing / call buying / call covering → +1 ; call writing /
+    put buying / put covering → −1 ; call unwinding −0.5 · put unwinding +0.5.
+    Weighted by |ΔOI| × |delta|; score = Σ sign·w / Σ w ∈ [−1, +1].
     """
     sign_tbl = {("CE", "writing"): -1, ("CE", "buying"): 1, ("CE", "covering"): 1, ("CE", "unwinding"): -0.5,
                 ("PE", "writing"): 1, ("PE", "buying"): -1, ("PE", "covering"): -1, ("PE", "unwinding"): 0.5}
+    shift = float(atm_shift or 0.0)
     num = den = 0.0
     net_dw = 0.0
+    n_cls = 0
     ladder = []
     for r in rows_now:
         K = float(r["strike"]); o = open_map.get(str(K)) or open_map.get(K)
@@ -4654,21 +4760,27 @@ def _oct26_positioning(rows_now, open_map, F, T):
         rec = {"strike": K}
         for side, pre in (("CE", "call"), ("PE", "put")):
             d_oi = float(r.get(f"{pre}_oi", 0)) - float(o.get(f"{pre}_oi", 0))
-            d_p = float(r.get(f"{pre}_ltp", 0)) - float(o.get(f"{pre}_ltp", 0))
             rec[f"{pre}_doi"] = d_oi
-            iv = _oct26_num(r.get(f"{pre}_iv"), 0) or 0
-            cd, pdl, _ = _oct26_b76(F, K, T, iv / 100.0) if iv > 0.5 else (None, None, None)
-            dlt = abs(cd if side == "CE" else pdl) if cd is not None else abs(_oct26_num(r.get(f"{pre}_delta"), 0) or 0)
-            if d_oi == 0 or dlt == 0:
+            iv_now = _oct26_num(r.get(f"{pre}_iv"), 0) or 0
+            iv_open = _oct26_num(o.get(f"{pre}_iv"), 0) or 0
+            if d_oi == 0 or iv_now <= 0.5 or iv_open <= 0.5:
                 continue
-            cls = ("writing" if d_p < 0 else "buying") if d_oi > 0 else ("covering" if d_p >= 0 else "unwinding")
+            cd, pdl, _ = _oct26_b76(F, K, T, iv_now / 100.0)
+            dlt = abs(cd if side == "CE" else pdl) if cd is not None else abs(_oct26_num(r.get(f"{pre}_delta"), 0) or 0)
+            if dlt == 0:
+                continue
+            d_rel = (iv_now - iv_open) - shift
+            if abs(d_rel) < OCT26_POS_IV_DEADBAND:
+                continue
+            cls = ("writing" if d_rel < 0 else "buying") if d_oi > 0 else ("covering" if d_rel > 0 else "unwinding")
             w = abs(d_oi) * dlt
             num += sign_tbl[(side, cls)] * w
             den += w
+            n_cls += 1
             net_dw += (d_oi * dlt) * (1 if side == "PE" else -1)
         ladder.append(rec)
     score = num / den if den > 0 else 0.0
-    return score, net_dw, ladder
+    return score, net_dw, ladder, n_cls
 
 
 def _oct26_walls(rows):
@@ -4679,22 +4791,42 @@ def _oct26_walls(rows):
     return (float(pw) if pw else None), (float(cw) if cw else None)
 
 
-def _oct26_gamma(rows, F, T):
-    """Unsigned OI×gamma per strike (no dealer-side sign assumption)."""
-    g = []
-    for r in rows:
-        K = float(r["strike"])
-        tot = 0.0
-        for pre in ("call", "put"):
-            iv = _oct26_num(r.get(f"{pre}_iv"), 0) or 0
-            _, _, gm = _oct26_b76(F, K, T, iv / 100.0) if iv > 0.5 else (None, None, None)
-            if gm is None:
-                gm = abs(_oct26_num(r.get(f"{pre}_gamma"), 0) or 0)
-            tot += gm * float(r.get(f"{pre}_oi", 0))
-        g.append((K, tot))
-    g = [x for x in g if x[1] > 0]
-    g.sort(key=lambda x: -x[1])
-    return [k for k, _ in g[:3]]
+def _oct26_magnet(rows, spot, F, T, sigma_pts):
+    """OI magnet: largest total-OI strike within ±1σ of spot, its concentration
+    (× median total OI of those strikes), its share of OI×gamma, and the top-3
+    total-OI strikes (★ on the ladder). Gamma per contract always peaks at the money,
+    so concentration of OI — not OI×gamma alone — decides whether a pin is plausible."""
+    out = {"magnet": None, "mult": None, "share": None, "top": [], "pin": False}
+    try:
+        sig = sigma_pts or (F * 0.12 * np.sqrt(T))
+        half = max(sig, 3 * NIFTY_STEP)
+        near = [r for r in rows if abs(float(r["strike"]) - spot) <= half]
+        if len(near) < 3:
+            return out
+        tot = {float(r["strike"]): float(r.get("call_oi", 0)) + float(r.get("put_oi", 0)) for r in near}
+        med = float(np.median(list(tot.values())))
+        K = max(tot, key=tot.get)
+        out["magnet"] = K
+        out["mult"] = (tot[K] / med) if med > 0 else None
+        out["top"] = [k for k, _ in sorted(tot.items(), key=lambda kv: -kv[1])[:3]]
+        gsum = gk = 0.0
+        for r in rows:
+            k = float(r["strike"]); g = 0.0
+            for pre in ("call", "put"):
+                iv = _oct26_num(r.get(f"{pre}_iv"), 0) or 0
+                _, _, gm = _oct26_b76(F, k, T, iv / 100.0) if iv > 0.5 else (None, None, None)
+                if gm is None:
+                    gm = abs(_oct26_num(r.get(f"{pre}_gamma"), 0) or 0)
+                g += gm * float(r.get(f"{pre}_oi", 0))
+            gsum += g
+            if k == K:
+                gk = g
+        out["share"] = (gk / gsum) if gsum > 0 else None
+        out["pin"] = bool(out["mult"] is not None and out["mult"] >= OCT26_PIN_OI_MULT
+                          and abs(spot - K) <= OCT26_PIN_DIST_SIGMA * sig)
+    except Exception:
+        pass
+    return out
 
 
 # ─── z-scores ────────────────────────────────────────────────────────────────
@@ -4706,15 +4838,19 @@ def _oct26_minutes(ts):
 
 
 def _oct26_tod_z(field, value, now_min, today):
-    """z of `value` vs the same-time-of-day value of `field` over prior sessions."""
+    """z of `value` vs the same-time-of-day value of `field` over prior NORMAL sessions
+    (late-start days and next-expiry IV rows are excluded)."""
     if value is None or now_min is None:
         return None, 0
     days = [d for d in _oct26_days_available() if d < today][-OCT26_TOD_LOOKBACK_SESSIONS:]
     sample = []
     for d in days:
+        rows = _oct26_read_agg(d)
+        if not rows or rows[0].get("late_start"):
+            continue
         best, best_gap = None, None
-        for row in _oct26_read_agg(d):
-            if row.get("iv_src", "front") != "front" and field in ("atm_iv_chg", "rr25_chg"):
+        for row in rows:
+            if row.get("iv_src", "front") != "front" and field != "pos_score":
                 continue
             mm = _oct26_minutes(row.get("ts", ""))
             v = row.get(field)
@@ -4734,22 +4870,82 @@ def _oct26_tod_z(field, value, now_min, today):
     return (float(value) - float(np.mean(sample))) / sd, n
 
 
-def _oct26_intraday_z(series, value):
-    s = [float(v) for v in series if v is not None]
-    if value is None or len(s) < OCT26_INTRADAY_MIN_SNAPS:
+def _oct26_intraday_z(series, value, now_min):
+    """Fallback z: the latest 15-min CHANGE vs earlier 15-min changes today.
+    `series` = [(minute, value), …] of PRIOR snapshots only (current excluded)."""
+    if value is None or now_min is None:
         return None
-    sd = float(np.std(s, ddof=1))
+    s = [(m, float(v)) for m, v in series if m is not None and v is not None]
+    if not s:
+        return None
+
+    def _base(t_min, upto):
+        cand = [v for m, v in s[:upto] if m <= t_min - OCT26_INTRADAY_CHG_MIN]
+        return cand[-1] if cand else None
+
+    prior_chg = []
+    for i, (m, v) in enumerate(s):
+        b = _base(m, i)
+        if b is not None:
+            prior_chg.append(v - b)
+    b_now = _base(now_min, len(s))
+    if b_now is None or len(prior_chg) < OCT26_INTRADAY_MIN_CHGS:
+        return None
+    sd = float(np.std(prior_chg, ddof=1))
     if sd <= 1e-9:
         return None
-    return (float(value) - float(np.mean(s))) / sd
+    return ((float(value) - b_now) - float(np.mean(prior_chg))) / sd
 
 
 # ─── recorder (called once per data fetch) ───────────────────────────────────
+def _oct26_anchor_entry(df, spot, expiry, ts, front):
+    """Compact per-snapshot record kept while the 09:20–09:25 anchor is forming."""
+    lo = (front["F"] or spot) - OCT26_MAX_STRIKES_SIDE * NIFTY_STEP
+    hi = (front["F"] or spot) + OCT26_MAX_STRIKES_SIDE * NIFTY_STEP
+    per = {}
+    for r in _oct26_raw_rows(df):
+        k = float(r["strike"])
+        if lo <= k <= hi:
+            per[str(k)] = {"call_oi": r.get("call_oi", 0), "put_oi": r.get("put_oi", 0),
+                           "call_iv": r.get("call_iv", 0), "put_iv": r.get("put_iv", 0),
+                           "call_ltp": r.get("call_ltp", 0), "put_ltp": r.get("put_ltp", 0)}
+    return {"ts": ts, "F": front["F"], "sigma_pts": front["sigma_pts"], "atm_iv": front["atm_iv"],
+            "rr25": front["rr25"], "pts": front["pts"], "per": per}
+
+
+def _oct26_finalize_anchor(ex, df, buf, late):
+    """Median anchor from the buffered snapshots (or the single late-start snapshot)."""
+    med = lambda xs: float(np.median([x for x in xs if x is not None])) if any(x is not None for x in xs) else None
+    F0 = med([b["F"] for b in buf])
+    sig0 = med([b["sigma_pts"] for b in buf])
+    strikes = _oct26_freeze_strikes(df, F0, sig0)
+    open_map = {}
+    for k in strikes:
+        key = str(float(k))
+        vals = [b["per"].get(key) for b in buf if b["per"].get(key)]
+        if vals:
+            open_map[key] = {f: med([v.get(f) for v in vals])
+                             for f in ("call_oi", "put_oi", "call_iv", "put_iv", "call_ltp", "put_ltp")}
+    rows0 = [dict(strike=float(k), **v) for k, v in open_map.items()]
+    pw0, cw0 = _oct26_walls(rows0)
+    ex.update({
+        "anchored": True, "late_start": bool(late),
+        "frozen_strikes": strikes, "open_ts": buf[-1]["ts"], "anchor_n": len(buf),
+        "anchor_window": None if late else f"{buf[0]['ts'][11:16]}–{buf[-1]['ts'][11:16]}",
+        "open": open_map, "open_F": F0,
+        "open_atm_iv": med([b["atm_iv"] for b in buf]), "open_rr25": med([b["rr25"] for b in buf]),
+        "open_curve": _oct26_median_points([b["pts"] for b in buf]),
+        "open_put_wall": pw0, "open_call_wall": cw0,
+    })
+    ex.pop("anchor_buf", None)
+
+
 def _oct26_record_snapshot(df, spot, expiry, traded_fut, source, force=False):
     """Append one snapshot.  Never raises — the dashboard must not depend on it.
 
-    Gating: LIVE source + market hours (unless force=True for tests), and a
-    minimum spacing so repeated visitor reruns of the same tick are not stored twice.
+    Gating: LIVE source + market hours (unless force=True for tests), a minimum
+    spacing so repeated visitor reruns of the same tick are not stored twice, and
+    a fingerprint check so an unchanged chain (holiday / frozen feed) is skipped.
     """
     try:
         if not force and (("LIVE" not in str(source)) or not is_market_hours()):
@@ -4759,6 +4955,7 @@ def _oct26_record_snapshot(df, spot, expiry, traded_fut, source, force=False):
         now = now_ist()
         today = now.date().isoformat()
         ts = now.strftime("%Y-%m-%dT%H:%M:%S")
+        hm = (now.hour, now.minute)
         try:
             min_gap = max(20, min(int(_load_owner_settings().get("refresh_interval", 60)), 60) - 5)
         except Exception:
@@ -4770,96 +4967,129 @@ def _oct26_record_snapshot(df, spot, expiry, traded_fut, source, force=False):
             if not force and time.time() - float(state.get("last_epoch", 0)) < min_gap:
                 return
 
+            # ── unchanged-feed guard (NSE holiday / stalled feed) ──
+            # The day's first fetch only records a fingerprint; nothing is stored until the
+            # chain has CHANGED at least once today (a holiday feed never changes), and any
+            # later fetch identical to the previous one is skipped (stalled feed).
+            sig_now = _oct26_signature(df, spot)
+            if sig_now is not None:
+                if state.get("first_sig") is None:
+                    state["first_sig"] = state["last_sig"] = sig_now
+                    state["last_epoch"] = time.time()
+                    _oct26_write_json(st_path, state)
+                    return
+                if sig_now == state.get("last_sig"):
+                    return
+                state["last_sig"] = sig_now
+
             front = _oct26_iv_metrics(df, spot, expiry)
             F, T = front["F"] or spot, front["T"] or _oct26_T_years(expiry)
+            fut_px = _oct26_num(traded_fut) or None
+            exps = state.setdefault("expiries", {})
+            ex = exps.get(str(expiry))
+            if ex is None:
+                ex = exps[str(expiry)] = {"anchored": False, "anchor_buf": []}
 
-            ex = state.get("expiries", {}).get(str(expiry))
-            if ex is None:   # first snapshot of the session for this expiry → freeze + anchor
-                strikes = _oct26_freeze_strikes(df, F, front["sigma_pts"])
-                rows0 = _oct26_raw_rows(df, strikes)
-                pw0, cw0 = _oct26_walls(rows0)
-                ex = {
-                    "frozen_strikes": strikes,
-                    "open_ts": ts,
-                    "open": {str(float(r["strike"])): {"call_oi": r.get("call_oi", 0), "put_oi": r.get("put_oi", 0),
-                                                       "call_ltp": r.get("call_ltp", 0), "put_ltp": r.get("put_ltp", 0)}
-                             for r in rows0},
-                    "open_atm_iv": front["atm_iv"], "open_rr25": front["rr25"],
-                    "open_put_wall": pw0, "open_call_wall": cw0,
-                    "next_anchor": None,
-                }
-                state.setdefault("expiries", {})[str(expiry)] = ex
+            # ── session anchor: median of 09:20–09:25 snapshots ──
+            if not ex.get("anchored"):
+                if hm < OCT26_ANCHOR_START_HM:
+                    state["last_epoch"] = time.time()
+                    _oct26_write_json(st_path, state)
+                    return                                   # 09:15–09:20 ignored (erratic open)
+                if hm < OCT26_ANCHOR_END_HM:
+                    ex.setdefault("anchor_buf", []).append(_oct26_anchor_entry(df, spot, expiry, ts, front))
+                    state["last_epoch"] = time.time()
+                    _oct26_append_jsonl(_oct26_path("raw", today),
+                                        {"ts": ts, "expiry": str(expiry), "spot": float(spot), "fut": fut_px,
+                                         "phase": "anchor", "rows": _oct26_raw_rows(df, _oct26_freeze_strikes(
+                                             df, F, front["sigma_pts"]))})
+                    _oct26_write_json(st_path, state)
+                    return
+                buf = ex.get("anchor_buf") or []
+                late = not buf
+                if late:
+                    buf = [_oct26_anchor_entry(df, spot, expiry, ts, front)]
+                _oct26_finalize_anchor(ex, df, buf, late)
+
             strikes = ex["frozen_strikes"]
             rows = _oct26_raw_rows(df, strikes)
 
             # ── expiry-day switch to the next expiry for IV / skew ──
             is_expiry_day = str(expiry)[:10] == today
             iv_src, nxt, next_exp = "front", None, None
-            if is_expiry_day and (now.hour, now.minute) >= OCT26_NEXT_ANCHOR_HM:
+            if is_expiry_day and hm >= OCT26_NEXT_ANCHOR_HM:
                 try:
-                    exps = fetch_dhan_expiry_list() if USE_DHAN else []
-                    later = [e for e in exps if str(e) > str(expiry)]
+                    exps_list = fetch_dhan_expiry_list() if USE_DHAN else []
+                    later = [e for e in exps_list if str(e) > str(expiry)]
                     next_exp = later[0] if later else None
                     if next_exp:
                         ndf, nspot, _ = fetch_dhan_option_chain_cached(next_exp)
                         if ndf is not None and not ndf.empty:
                             nxt = _oct26_iv_metrics(ndf, nspot or spot, next_exp)
                             if ex.get("next_anchor") is None and nxt["atm_iv"] is not None:
-                                ex["next_anchor"] = {"ts": ts, "expiry": next_exp,
-                                                     "atm_iv": nxt["atm_iv"], "rr25": nxt["rr25"]}
+                                ex["next_anchor"] = {"ts": ts, "expiry": next_exp, "atm_iv": nxt["atm_iv"],
+                                                     "rr25": nxt["rr25"], "curve": nxt["pts"]}
                 except Exception:
                     nxt = None
-                if nxt is not None and ex.get("next_anchor") and (now.hour, now.minute) >= OCT26_NEXT_SWITCH_HM:
+                if nxt is not None and ex.get("next_anchor") and hm >= OCT26_NEXT_SWITCH_HM:
                     iv_src = "next"
 
             ivm = nxt if iv_src == "next" else front
             if iv_src == "next":
-                a_iv, a_rr = ex["next_anchor"].get("atm_iv"), ex["next_anchor"].get("rr25")
+                na = ex["next_anchor"]
+                a_iv, a_rr, a_curve = na.get("atm_iv"), na.get("rr25"), na.get("curve") or []
             else:
-                a_iv, a_rr = ex.get("open_atm_iv"), ex.get("open_rr25")
-                if a_iv is None and front["atm_iv"] is not None:
-                    ex["open_atm_iv"] = a_iv = front["atm_iv"]
-                if a_rr is None and front["rr25"] is not None:
-                    ex["open_rr25"] = a_rr = front["rr25"]
+                a_iv, a_rr, a_curve = ex.get("open_atm_iv"), ex.get("open_rr25"), ex.get("open_curve") or []
+            # raw change vs anchor
             atm_iv_chg = (ivm["atm_iv"] - a_iv) if (ivm["atm_iv"] is not None and a_iv is not None) else None
             rr25_chg = (ivm["rr25"] - a_rr) if (ivm["rr25"] is not None and a_rr is not None) else None
+            # skew-adjusted change: actual − what the ANCHOR smile implies at today's forward and time
+            exp_m = _oct26_curve_metrics(a_curve, ivm["F"] or F, ivm["T"] or T) if a_curve else {}
+            atm_iv_exp, rr25_exp = exp_m.get("atm_iv"), exp_m.get("rr25")
+            atm_iv_chg_adj = (ivm["atm_iv"] - atm_iv_exp) if (ivm["atm_iv"] is not None and atm_iv_exp is not None) else atm_iv_chg
+            rr25_chg_adj = (ivm["rr25"] - rr25_exp) if (ivm["rr25"] is not None and rr25_exp is not None) else rr25_chg
 
-            pos_score, pos_dw, _ = _oct26_positioning(rows, ex["open"], F, T)
+            pos_score, pos_dw, _, pos_n = _oct26_positioning(
+                rows, ex["open"], F, T, atm_shift=(atm_iv_chg_adj if iv_src == "front" else 0.0))
             pw, cw = _oct26_walls(rows)
-            gtop = _oct26_gamma(rows, F, T)
-            sig = front["sigma_pts"] or (F * 0.12 * np.sqrt(T))
-            pin = bool(gtop and abs(spot - gtop[0]) <= 0.35 * sig)
+            mag = _oct26_magnet(rows, spot, F, T, front["sigma_pts"])
 
             # ── z-scores ──
-            today_rows = _oct26_read_agg(today)
+            today_rows = [r for r in _oct26_read_agg(today) if r.get("expiry") == str(expiry)]
             now_min = now.hour * 60 + now.minute
-            z = {}
+            z = {"_sessions": 0}
             z_mode = "tod"
-            for fld, val in (("atm_iv_chg", atm_iv_chg), ("rr25_chg", rr25_chg), ("pos_score", pos_score)):
+            z_modes = {}
+            for fld, val in (("atm_iv_chg_adj", atm_iv_chg_adj), ("rr25_chg_adj", rr25_chg_adj), ("pos_score", pos_score)):
                 zz, n_sess = (None, 0)
-                if not (iv_src == "next" and fld != "pos_score"):
+                if not (iv_src == "next" and fld != "pos_score") and not ex.get("late_start"):
                     zz, n_sess = _oct26_tod_z(fld, val, now_min, today)
+                z_modes[fld] = "tod" if zz is not None else "intraday"
                 if zz is None:
                     z_mode = "intraday"
-                    hist = [r.get(fld) for r in today_rows
-                            if fld == "pos_score" or r.get("iv_src", "front") == iv_src]
-                    zz = _oct26_intraday_z(hist + [val], val)
+                    ser = [(_oct26_minutes(r.get("ts", "")), r.get(fld)) for r in today_rows
+                           if fld == "pos_score" or r.get("iv_src", "front") == iv_src]
+                    zz = _oct26_intraday_z(ser, val, now_min)
                 z[fld] = zz
-                z["_sessions"] = max(z.get("_sessions", 0), n_sess)
+                z["_sessions"] = max(z["_sessions"], n_sess)
 
-            fut_px = _oct26_num(traded_fut) or None
             agg = {
                 "ts": ts, "expiry": str(expiry), "iv_src": iv_src, "next_expiry": next_exp,
+                "late_start": bool(ex.get("late_start")),
                 "spot": float(spot), "fut": fut_px, "F": F,
                 "sigma_pts": front["sigma_pts"], "sigma_day": front["sigma_day"],
                 "atm_iv": ivm["atm_iv"], "iv_c25": ivm["iv_c25"], "iv_p25": ivm["iv_p25"], "rr25": ivm["rr25"],
                 "atm_iv_chg": atm_iv_chg, "rr25_chg": rr25_chg,
+                "atm_iv_exp": atm_iv_exp, "rr25_exp": rr25_exp,
+                "atm_iv_chg_adj": atm_iv_chg_adj, "rr25_chg_adj": rr25_chg_adj,
                 "straddle": front["straddle"],
-                "pos_score": pos_score, "pos_dw": pos_dw,
-                "put_wall": pw, "call_wall": cw, "gamma_top": gtop, "pin": pin,
+                "pos_score": pos_score, "pos_dw": pos_dw, "pos_n": pos_n,
+                "put_wall": pw, "call_wall": cw,
+                "magnet": mag["magnet"], "magnet_mult": mag["mult"], "magnet_share": mag["share"],
+                "gamma_top": mag["top"], "pin": mag["pin"],
                 "n_liquid": ivm["n_liquid"], "n_frozen": len(strikes),
-                "iv_z": z.get("atm_iv_chg"), "rr_z": z.get("rr25_chg"), "pos_z": z.get("pos_score"),
-                "z_mode": z_mode, "z_sessions": z.get("_sessions", 0),
+                "iv_z": z.get("atm_iv_chg_adj"), "rr_z": z.get("rr25_chg_adj"), "pos_z": z.get("pos_score"),
+                "z_mode": z_mode, "z_modes": z_modes, "z_sessions": z.get("_sessions", 0),
             }
 
             # ── alerts ──
@@ -4921,13 +5151,13 @@ def _oct26_eval_alerts(agg, today_rows, prior_alerts, now):
     falling = move30 is not None and flat_band is not None and move30 < -flat_band
 
     ivz, rrz = agg.get("iv_z"), agg.get("rr_z")
-    # ignore statistically "large" but economically tiny moves
-    if abs(agg.get("atm_iv_chg") or 0) < OCT26_MIN_IV_CHG:
+    # ignore statistically "large" but economically tiny moves (skew-adjusted changes)
+    if abs(agg.get("atm_iv_chg_adj") or 0) < OCT26_MIN_IV_CHG:
         ivz = None
-    if abs(agg.get("rr25_chg") or 0) < OCT26_MIN_RR_CHG:
+    if abs(agg.get("rr25_chg_adj") or 0) < OCT26_MIN_RR_CHG:
         rrz = None
     if ivz is not None and ivz > OCT26_Z_THRESH and move30 is not None and not falling:
-        _add("iv_bid", "bear", f"ATM IV bid (z {_oct26_zs(ivz)}) while price is not falling — protection demand")
+        _add("iv_bid", "bear", f"ATM IV bid beyond skew (z {_oct26_zs(ivz)}) while price is not falling — protection demand")
     if rrz is not None and rrz < -OCT26_Z_THRESH and rising:
         _add("rr_rally", "bear", f"Put skew steepening (RR z {_oct26_zs(rrz)}) into a rally — divergence")
     if rrz is not None and rrz > OCT26_Z_THRESH and falling:
@@ -4945,10 +5175,10 @@ def _oct26_eval_alerts(agg, today_rows, prior_alerts, now):
             tone = "bull" if agg["call_wall"] > prev["call_wall"] else "bear"
             out.append({"ts": agg["ts"], "hm": t_hm, "rule": "call_wall", "tone": tone,
                         "text": f"Call wall {prev['call_wall']:,.0f} → {agg['call_wall']:,.0f}"})
-        if bool(prev.get("pin")) != bool(agg.get("pin")) and agg.get("gamma_top"):
-            k = agg["gamma_top"][0]
+        if bool(prev.get("pin")) != bool(agg.get("pin")) and agg.get("magnet"):
+            k = agg["magnet"]
             out.append({"ts": agg["ts"], "hm": t_hm, "rule": "pin", "tone": "watch",
-                        "text": (f"Entered pin zone near {k:,.0f}" if agg.get("pin")
+                        "text": (f"Entered pin zone near OI magnet {k:,.0f}" if agg.get("pin")
                                  else f"Left pin zone near {k:,.0f} — free-move")})
 
     r60 = _px_ago(60)
@@ -4964,6 +5194,13 @@ def _oct26_view_model():
     """Latest session's data for the panel; never raises."""
     vm = {"ok": False, "msg": "Waiting for the first LIVE snapshot (market hours 09:15–15:30 IST)."}
     try:
+        today = now_ist().date().isoformat()
+        st_today = _oct26_read_json(_oct26_path("state", today), {})
+        pend = [e for e in (st_today.get("expiries") or {}).values() if not e.get("anchored")]
+        if pend and not _oct26_read_agg(today):
+            n = len(pend[0].get("anchor_buf") or [])
+            return {"ok": False, "msg": f"Session anchor forming — median of snapshots 09:20–09:25 IST "
+                                        f"({n} collected). Tiles start at 09:25."}
         days = _oct26_days_available()
         if not days:
             return vm
@@ -4975,9 +5212,8 @@ def _oct26_view_model():
         state = _oct26_read_json(_oct26_path("state", day), {})
         ex = (state.get("expiries") or {}).get(last.get("expiry"), {})
         rows = [r for r in rows if r.get("expiry") == last.get("expiry")]
-        today = now_ist().date().isoformat()
 
-        # ladder from the latest raw snapshot vs open
+        # ladder from the latest raw snapshot vs anchor
         ladder = []
         try:
             with open(_oct26_path("raw", day), "rb") as f:
@@ -4987,7 +5223,8 @@ def _oct26_view_model():
             if raw_last and ex.get("open"):
                 F = last.get("F") or last.get("spot")
                 T = _oct26_T_years(last.get("expiry"))
-                _, _, ladder = _oct26_positioning(raw_last["rows"], ex["open"], F, T)
+                _, _, ladder, _ = _oct26_positioning(raw_last["rows"], ex["open"], F, T,
+                                                     atm_shift=last.get("atm_iv_chg_adj") or 0.0)
         except Exception:
             ladder = []
         ref = last.get("spot") or 0
@@ -5003,8 +5240,8 @@ def _oct26_view_model():
                 return "bear" if inverse else "bull"
             return "neutral"
 
-        fear_tone = _tone_z(last.get("iv_z"), last.get("atm_iv_chg"), OCT26_MIN_IV_CHG)                 # IV up = fear = bearish
-        skew_tone = _tone_z(last.get("rr_z"), last.get("rr25_chg"), OCT26_MIN_RR_CHG, inverse=True)   # RR down = put skew bid = bearish
+        fear_tone = _tone_z(last.get("iv_z"), last.get("atm_iv_chg_adj"), OCT26_MIN_IV_CHG)               # IV up = fear = bearish
+        skew_tone = _tone_z(last.get("rr_z"), last.get("rr25_chg_adj"), OCT26_MIN_RR_CHG, inverse=True)  # RR down = put skew bid = bearish
         ps = last.get("pos_score") or 0.0
         pos_tone = "bull" if ps >= OCT26_POS_THRESH else ("bear" if ps <= -OCT26_POS_THRESH else "neutral")
         tones = [fear_tone, skew_tone, pos_tone]
@@ -5036,29 +5273,52 @@ def _oct26_view_model():
             tags.append(("Expiry day", "watch"))
         if last.get("iv_src") == "next":
             tags.append((f"IV/skew from next expiry {last.get('next_expiry')}", "info"))
+        if ex.get("late_start"):
+            tags.append((f"Late start — anchor {str(ex.get('open_ts', ''))[11:16]}, day excluded from baseline", "watch"))
         if day in OCT26_EVENT_DATES:
             tags.append((f"Event: {OCT26_EVENT_DATES[day]}", "watch"))
         if day != today or not is_market_hours():
             tags.append((f"Last session {day}" if day != today else "Market closed — last snapshot", "info"))
 
+        anchor_txt = (f"anchor = median {ex.get('anchor_window')} ({ex.get('anchor_n')} snaps)"
+                      if ex.get("anchor_window") else f"anchor {str(ex.get('open_ts', ''))[11:16]}")
         vm = {
             "ok": True, "day": day, "last": last, "rows": rows, "ladder": ladder,
             "alerts": list(reversed(state.get("alerts", [])))[:10],
             "head": head, "head_tone": head_tone,
             "tones": {"fear": fear_tone, "skew": skew_tone, "pos": pos_tone},
             "open_put_wall": ex.get("open_put_wall"), "open_call_wall": ex.get("open_call_wall"),
-            "open_ts": ex.get("open_ts"),
+            "open_ts": ex.get("open_ts"), "anchor_txt": anchor_txt,
             "health": {"snaps": len(rows), "expected": max(expected, len(rows)),
                        "strikes": last.get("n_frozen"), "liquid": last.get("n_liquid"),
                        "stale": stale, "age_s": int(age)},
             "tags": tags,
-            "z_label": ("z vs same time of day, " + str(last.get("z_sessions")) + " sessions")
-                       if last.get("z_mode") == "tod" else
-                       (f"intraday z — baseline building ({last.get('z_sessions', 0)}/{OCT26_TOD_MIN_SESSIONS} sessions)"),
+            "z_label": _oct26_z_label(last),
         }
     except Exception as _e:
         vm = {"ok": False, "msg": f"Panel unavailable this tick ({_e})."}
     return vm
+
+
+def _oct26_z_label(last):
+    """Which baseline each tile's z uses (time-of-day vs intraday 15-min-change fallback)."""
+    names = {"atm_iv_chg_adj": "Fear", "rr25_chg_adj": "Skew", "pos_score": "Positioning"}
+    modes = last.get("z_modes") or {}
+    n = last.get("z_sessions", 0)
+    tod = [names[k] for k, v in modes.items() if v == "tod" and k in names]
+    intr = [names[k] for k, v in modes.items() if v == "intraday" and k in names]
+    if not modes:
+        return "z mode unknown"
+    if last.get("late_start"):
+        return "intraday z of 15-min change (late-start day — same-time baseline not used)"
+    if not tod:
+        return (f"intraday z of 15-min change — baseline building ({n}/{OCT26_TOD_MIN_SESSIONS} sessions)"
+                if n < OCT26_TOD_MIN_SESSIONS else
+                "intraday z of 15-min change (no usable same-time baseline at this time / expiry switch)")
+    if not intr:
+        return f"z vs same time of day, {n} sessions"
+    return (f"z vs same time of day ({n} sessions) for {', '.join(tod)} · intraday 15-min z for "
+            f"{', '.join(intr)} (baseline flat or unavailable)")
 
 
 OCT26_TONE_COL = {"bull": GREEN, "bear": RED, "watch": AMBER, "neutral": MUTED, "info": ACCENT}
@@ -5072,13 +5332,14 @@ def _oct26_fmt(v, fmt="{:.2f}", na="—"):
 def _oct26_tiles(vm):
     """Tile content shared by both renderers: list of dicts."""
     L = vm["last"]
+
     def zl(z):
         if z is None:
             return "z —"
         return f"z {z:+.1f}" if abs(z) <= 5 else ("z > +5" if z > 0 else "z < −5")
-    gt = L.get("gamma_top") or []
     sig = L.get("sigma_pts")
-    dist = (L["spot"] - gt[0]) if gt else None
+    mag, mult, share = L.get("magnet"), L.get("magnet_mult"), L.get("magnet_share")
+    dist = (L["spot"] - mag) if mag else None
     pw, cw = L.get("put_wall"), L.get("call_wall")
     opw, ocw = vm.get("open_put_wall"), vm.get("open_call_wall")
     walls = []
@@ -5086,27 +5347,39 @@ def _oct26_tiles(vm):
         walls.append(f"Put wall {pw:,.0f}" + (f" ({'↑' if pw > opw else '↓'} from {opw:,.0f})" if opw and pw != opw else ""))
     if cw:
         walls.append(f"Call wall {cw:,.0f}" + (f" ({'↑' if cw > ocw else '↓'} from {ocw:,.0f})" if ocw and cw != ocw else ""))
+    if mag and mult is not None:
+        g_val = "PIN LIKELY" if L.get("pin") else ("FREE-MOVE" if mult >= OCT26_PIN_OI_MULT else "NO MAGNET")
+        g_sub = (f"Magnet {mag:,.0f}: {mult:.1f}× median OI · {abs(dist):,.0f} pts "
+                 f"{'above' if dist > 0 else 'below'}" + (f" · {share*100:.0f}% of OI×Γ" if share else ""))
+    else:
+        g_val, g_sub = "—", "—"
     return [
         {"key": "fear", "title": "① FEAR · ATM IV", "tone": vm["tones"]["fear"],
          "value": _oct26_fmt(L.get("atm_iv"), "{:.2f}%"),
-         "sub": _oct26_fmt(L.get("atm_iv_chg"), "{:+.2f} vs open"),
+         "sub": (_oct26_fmt(L.get("atm_iv_chg_adj"), "{:+.2f} skew-adj") + " · "
+                 + _oct26_fmt(L.get("atm_iv_chg"), "{:+.2f} raw vs anchor")),
          "z": zl(L.get("iv_z")), "spark": "atm_iv",
-         "hint": "Fixed-forward ATM IV. Red = IV rising faster than usual for this time of day."},
+         "hint": "ATM IV at the current forward. Colour, z and alerts use the skew-adjusted change: actual IV "
+                 "minus what the anchor smile implies at today's forward (removes moving along the put skew)."},
         {"key": "skew", "title": "② SKEW · 25Δ RR", "tone": vm["tones"]["skew"],
          "value": _oct26_fmt(L.get("rr25"), "{:+.2f} vol"),
-         "sub": _oct26_fmt(L.get("rr25_chg"), "{:+.2f} vs open"),
+         "sub": (_oct26_fmt(L.get("rr25_chg_adj"), "{:+.2f} skew-adj") + " · "
+                 + _oct26_fmt(L.get("rr25_chg"), "{:+.2f} raw")),
          "z": zl(L.get("rr_z")), "spark": "rr25",
-         "hint": "25Δ call IV − 25Δ put IV. More negative = downside protection getting dearer."},
+         "hint": "25Δ call IV − 25Δ put IV. More negative = downside protection dearer. Colour uses the "
+                 "skew-adjusted change versus the anchor smile."},
         {"key": "pos", "title": "③ POSITIONING (inferred)", "tone": vm["tones"]["pos"],
          "value": f"{(L.get('pos_score') or 0):+.2f}",
          "sub": " · ".join(walls) if walls else "walls —",
-         "z": zl(L.get("pos_z")), "spark": "pos_score",
-         "hint": "Δ-weighted OI change since open, classified by OI×premium change. −1 bearish … +1 bullish."},
-        {"key": "gamma", "title": "④ GAMMA ZONE", "tone": "watch" if L.get("pin") else "neutral",
-         "value": ("PIN LIKELY" if L.get("pin") else "FREE-MOVE") if gt else "—",
-         "sub": (f"{abs(dist):,.0f} pts {'above' if dist > 0 else 'below'} {gt[0]:,.0f} (top OI×Γ)" if gt else "—"),
+         "z": zl(L.get("pos_z")) + (f" · {L.get('pos_n')} legs classified" if L.get("pos_n") is not None else ""),
+         "spark": "pos_score",
+         "hint": "Δ-weighted OI change since anchor, classified by each strike's IV change relative to the ATM "
+                 "shift (no spot or time-decay bias). −1 bearish … +1 bullish."},
+        {"key": "gamma", "title": "④ GAMMA ZONE · OI magnet", "tone": "watch" if L.get("pin") else "neutral",
+         "value": g_val, "sub": g_sub,
          "z": (f"1σ to expiry ≈ {sig:,.0f} pts" if sig else ""), "spark": None,
-         "hint": "Unsigned OI×gamma — shows where price may stall; no dealer-direction assumption."},
+         "hint": f"Largest total-OI strike within ±1σ. PIN LIKELY only if it holds ≥{OCT26_PIN_OI_MULT}× the median OI "
+                 f"AND spot is within {OCT26_PIN_DIST_SIGMA}σ. NO MAGNET = OI is evenly spread."},
     ]
 
 
@@ -5159,7 +5432,7 @@ def _oct26_figures(vm):
     ks = [f"{r['strike']:,.0f}" for r in lad]
     gt = set(vm["last"].get("gamma_top") or [])
     lf = make_subplots(rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.02,
-                       subplot_titles=("Put ΔOI since open", "Call ΔOI since open"))
+                       subplot_titles=("Put ΔOI since anchor", "Call ΔOI since anchor"))
     lf.add_trace(go.Bar(y=ks, x=[r.get("put_doi", 0) for r in lad], orientation="h", name="Put ΔOI",
                         marker_color=[GREEN if r.get("put_doi", 0) >= 0 else "#A7F3D0" for r in lad]), 1, 1)
     lf.add_trace(go.Bar(y=ks, x=[r.get("call_doi", 0) for r in lad], orientation="h", name="Call ΔOI",
@@ -5182,7 +5455,7 @@ def _oct26_figures(vm):
     lf.update_layout(height=max(300, 18 * len(lad) + 80), margin=dict(l=60, r=10, t=40, b=20),
                      paper_bgcolor="#fff", plot_bgcolor="#F9FAFB", showlegend=False, bargap=0.25,
                      font=dict(color=TEXT, size=10),
-                     title=dict(text="OI change ladder · ★ = top OI×gamma strikes", font=dict(size=12), x=0.01))
+                     title=dict(text="OI change ladder (since anchor) · ★ = largest total OI within ±1σ", font=dict(size=12), x=0.01))
     lf.update_annotations(font_size=11)
 
     sparks = {}
@@ -5196,15 +5469,117 @@ def _oct26_figures(vm):
     return div, lf, sparks
 
 
-OCT26_FOOTER = ("Reading notes: writer/buyer labels are inferred from OI × premium change, not observed · "
-                "gamma zone is unsigned (no dealer-side assumption) · event days and expiry afternoons inflate IV · "
+
+
+OCT26_FOOTER = ("Reading notes: writer/buyer labels are inferred from OI change × strike-IV change, not observed · "
+                "Fear/Skew colour uses skew-adjusted changes (sticky-strike expectation removed) · "
+                "gamma zone = OI magnet, no dealer-side assumption · event days and expiry afternoons inflate IV · "
                 "thresholds are defaults, not back-tested — validate on your stored snapshots.")
 # ══ END v26 OCTOBER 2026 SENTIMENT ADDITION core ══════════════════════════════
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v27 — ONE SHARED HISTORY (independent of number / frequency of visitors)
+#   • A history tick is recorded ONCE per real Dhan fetch, server-side, keyed by
+#     the fetch id (_fetch_ts).  Visitor reruns call the same idempotent function,
+#     so N visitors (or zero visitors) → exactly one tick per fetch.
+#   • Rolling file nifty_history.json keeps the last 500 ticks exactly as before
+#     (engines see the same window), and every tick is ALSO appended to a
+#     permanent daily archive:  nifty_history_archive/YYYY-MM-DD.jsonl
+# ═══════════════════════════════════════════════════════════════════════════════
+_V27_ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_history_archive")
+
+
+def _v27_record_history_tick(payload, fetch_ts):
+    """Append one history tick for this fetch id (idempotent, never raises)."""
+    try:
+        if not payload or not fetch_ts:
+            return
+        m = payload["metrics"]
+        _recs = payload.get("df_band") or []
+        _cot = sum(r.get("call_oi", 0) for r in _recs)      # same formula as the visitor path
+        _pot = sum(r.get("put_oi", 0) for r in _recs)
+        entry = build_history_entry(
+            m, payload["spot"], _cot, _pot, payload["expiry"],
+            synth_excess=payload.get("synth_excess"),
+            basis_gap=payload.get("basis_gap"),
+            traded_basis=payload.get("traded_basis"),
+        )
+        entry["_fetch_ts"] = fetch_ts
+        with _V27_HIST_LOCK:
+            hist = _load_history()
+            if any(h.get("_fetch_ts") == fetch_ts for h in hist[-20:]):
+                return                      # already recorded by another caller
+            hist.append(entry)
+            _save_history(hist[-500:])
+            try:
+                os.makedirs(_V27_ARCHIVE_DIR, exist_ok=True)
+                _day = str(entry.get("ts", ""))[:10] or date.today().isoformat()
+                with open(os.path.join(_V27_ARCHIVE_DIR, f"{_day}.jsonl"), "a") as _af:
+                    _af.write(json.dumps(_oct26_clean(entry), allow_nan=False) + "\n")
+            except Exception as _ae:
+                print(f"[v27] archive write skipped: {_ae}", flush=True)
+    except Exception as _e:
+        print(f"[v27] history tick skipped: {_e}", flush=True)
+
+
+_V27_SKEW_ANCHOR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_skew_anchor.json")
+
+
+def _v27_daily_skew_anchor(current_value):
+    """v27: S4 opening skew anchor fixed ONCE PER TRADING DAY for every visitor
+    (was per browser session, so a visitor joining at 11:00 anchored at 11:00)."""
+    today = date.today().isoformat()
+    with _SH["skew_lock"]:
+        try:
+            with open(_V27_SKEW_ANCHOR_FILE, "r") as _f:
+                _a = json.load(_f)
+            if _a.get("date") == today and isinstance(_a.get("value"), (int, float)):
+                return float(_a["value"])
+        except Exception:
+            pass
+        try:
+            _atomic_json_write(_V27_SKEW_ANCHOR_FILE, {"date": today, "value": float(current_value)})
+        except Exception:
+            pass
+        return float(current_value)
+
+
+@st.cache_resource(show_spinner=False)
+def _v27_start_background_fetcher():
+    """v27: one daemon thread per server process (same design as the Dash edition).
+    During market hours it keeps the shared cache — and therefore the shared
+    history — ticking even when nobody has the dashboard open."""
+    import logging as _lg
+    for _ln in ("streamlit.runtime.scriptrunner_utils.script_run_context",
+                "streamlit.runtime.scriptrunner.script_run_context",
+                "streamlit.runtime.caching.cache_data_api"):
+        _lg.getLogger(_ln).setLevel(_lg.ERROR)
+
+    def _loop():
+        print("[v27 BgFetch] background fetcher started (30s interval, market hours).", flush=True)
+        while True:
+            try:
+                if is_market_hours():
+                    _sel = _load_owner_settings().get("selected_expiry")
+                    get_server_data(_sel, _from_bg=True)
+            except Exception as _bfe:
+                print(f"[v27 BgFetch] error: {_bfe}", flush=True)
+            time.sleep(30)
+
+    _t = threading.Thread(target=_loop, daemon=True, name="v27-BgFetcher")
+    _t.start()
+    return _t
+
+
+_v27_start_background_fetcher()
+
+
 # ── Session state initialisation (loads server-side data for every new visitor) ─
-if "history" not in st.session_state:
-    st.session_state.history = _load_history()          # seed from disk on new session
+# v27: always read the single shared history from disk (was: seeded once per session)
+st.session_state.history = _load_history()
 
 if "bias_history" not in st.session_state:
     _bh_disk = _load_bias_history()
@@ -5214,8 +5589,8 @@ if "bias_history" not in st.session_state:
         float(_bh_disk[-1].get("_ts_unix", 0)) if _bh_disk else 0.0
     )
 
-if "iv_smile_history" not in st.session_state:
-    st.session_state.iv_smile_history = _load_smile_history()
+# v27: always read the shared smile history from disk
+st.session_state.iv_smile_history = _load_smile_history()
 
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = 0.0
@@ -5450,6 +5825,10 @@ else:
 # CI #10 fix: render the data-status banner HERE (after fetch) so it can inspect
 # `data_source` and distinguish a real API ERROR from genuine DEMO MODE.
 _data_status_banner(USE_DHAN, mh, USE_DEMO_MODE, _effective_refresh, data_source=data_source)
+# v27: the payload object is now shared by all visitors — work on a private copy so
+# no rerun can mutate the shared cache.
+if payload is not None:
+    payload = _v27_copy.deepcopy(payload)
 
 if payload is None:
     st.error("❌ Could not fetch option chain data. Please check your API credentials or try again.")
@@ -5481,9 +5860,10 @@ hist_entry    = build_history_entry(
 # produce exactly ONE history entry — not one per visitor per refresh.
 hist_entry["_fetch_ts"] = _payload_fetch_ts
 # Only append if this is a genuinely new Dhan data fetch (fetch_ts changed)
-if not history or history[-1].get("_fetch_ts", 0) != _payload_fetch_ts:
-    history.append(hist_entry)
-    _save_history(history)   # persist new tick to disk (rolling ~500-tick window)
+# v27: ONE shared history — idempotent server-side recorder (dedup on fetch id),
+# then re-read the shared file so every visitor sees the identical history.
+_v27_record_history_tick(payload, _payload_fetch_ts)
+history = _load_history()
 history = history[-500:]
 st.session_state.history = history
 
@@ -5560,8 +5940,8 @@ _s34_breakdown = _s34_bias.get("signal_breakdown", {})
 # This naturally resets at the start of each new session (Streamlit restarts) and
 # requires zero stored history beyond the current session.
 _current_norm_skew = _s34_bias.get("norm_skew", 30.0)
-if "opening_norm_skew" not in st.session_state or st.session_state.opening_norm_skew is None:
-    st.session_state.opening_norm_skew = _current_norm_skew
+# v27: anchor fixed once per trading day for all visitors (was once per browser session)
+st.session_state.opening_norm_skew = _v27_daily_skew_anchor(_current_norm_skew)
 _delta_skew = _current_norm_skew - st.session_state.opening_norm_skew
 # 15 pct-point intraday change → full ±3 pts; sign: rising skew = bearish (negative)
 _s4_intra = max(-3.0, min(3.0, -(_delta_skew / 15.0) * 3.0))
@@ -5632,13 +6012,14 @@ _s34_breakdown = _s34_bias.get("signal_breakdown", {})
 # Module C: India VIX
 _vix_raw           = fetch_india_vix_ltp()
 # Maintain a lightweight intraday VIX history in session_state for spike detection
-if "vix_history" not in st.session_state:
-    st.session_state.vix_history = []
+# v27: one VIX history shared by all visitors of this server process
+_v27_vix = _SH["vix_history"]
 if _vix_raw > 0:
-    if (not st.session_state.vix_history or
-            st.session_state.vix_history[-1] != _vix_raw):
-        st.session_state.vix_history.append(_vix_raw)
-        st.session_state.vix_history = st.session_state.vix_history[-30:]
+    with _SH["vix_lock"]:
+        if not _v27_vix or _v27_vix[-1] != _vix_raw:
+            _v27_vix.append(_vix_raw)
+            del _v27_vix[:-30]
+st.session_state.vix_history = list(_v27_vix)
 _vix_data          = classify_vix_signal(_vix_raw, st.session_state.vix_history)
 
 # Aggregate into Enhanced Price Bias
@@ -5816,31 +6197,33 @@ _now_bias = time.time()
 # Dedup on server fetch timestamp, not wall-clock time.
 # Reading from disk catches entries written by OTHER visitor sessions, preventing
 # duplicate bias points from multiple simultaneous visitors.
-_bh_disk_cur = _load_bias_history()
-_last_bh_fetch_ts = float(_bh_disk_cur[-1].get("_fetch_ts", 0)) if _bh_disk_cur else 0.0
+# v27: read-dedup-append-write is atomic across visitors
+with _SH["bias_lock"]:
+    _bh_disk_cur = _load_bias_history()
+    _last_bh_fetch_ts = float(_bh_disk_cur[-1].get("_fetch_ts", 0)) if _bh_disk_cur else 0.0
 
-if _payload_fetch_ts != _last_bh_fetch_ts:
-    # Start from the freshest disk state so no visitor session goes out of sync
-    _bh_tmp = _bh_disk_cur
-    _bh_tmp.append({
-        "ts":        datetime.fromtimestamp(_payload_fetch_ts, tz=IST).strftime("%H:%M"),
-        "_ts_unix":  _payload_fetch_ts,
-        "_fetch_ts": _payload_fetch_ts,   # server fetch id — used for cross-session dedup
-        "spot":      spot,
-        "score":     float(_s34_score),
-        "direction": _s34_bias["direction"],
-        "s1":        _s34_breakdown.get("S1 Net OI",     0.0),
-        "s2":        _s34_breakdown.get("S2 Momentum",   0.0),
-        "s3":        _s34_breakdown.get("S3 Key Levels", 0.0),
-        "s4":        _s34_breakdown.get("S4 IV Skew",    0.0),
-        "s5":        _s34_breakdown.get("S5 Term Str",   0.0),
-        "s6":        _s34_breakdown.get("S6 Velocity",   0.0),
-        # Fix #4: store norm_skew so adaptive NORMAL_SKEW_BASELINE can self-calibrate
-        "norm_skew": float(_s34_bias.get("norm_skew", 30.0)),
-    })
-    st.session_state.bias_history = _bh_tmp[-60:]   # ~5 hrs at data-refresh cadence
-    st.session_state.bias_history_last_ts = _now_bias
-    _save_bias_history(st.session_state.bias_history)   # persist for mid-session joiners
+    if _payload_fetch_ts != _last_bh_fetch_ts:
+        # Start from the freshest disk state so no visitor session goes out of sync
+        _bh_tmp = _bh_disk_cur
+        _bh_tmp.append({
+            "ts":        datetime.fromtimestamp(_payload_fetch_ts, tz=IST).strftime("%H:%M"),
+            "_ts_unix":  _payload_fetch_ts,
+            "_fetch_ts": _payload_fetch_ts,   # server fetch id — used for cross-session dedup
+            "spot":      spot,
+            "score":     float(_s34_score),
+            "direction": _s34_bias["direction"],
+            "s1":        _s34_breakdown.get("S1 Net OI",     0.0),
+            "s2":        _s34_breakdown.get("S2 Momentum",   0.0),
+            "s3":        _s34_breakdown.get("S3 Key Levels", 0.0),
+            "s4":        _s34_breakdown.get("S4 IV Skew",    0.0),
+            "s5":        _s34_breakdown.get("S5 Term Str",   0.0),
+            "s6":        _s34_breakdown.get("S6 Velocity",   0.0),
+            # Fix #4: store norm_skew so adaptive NORMAL_SKEW_BASELINE can self-calibrate
+            "norm_skew": float(_s34_bias.get("norm_skew", 30.0)),
+        })
+        st.session_state.bias_history = _bh_tmp[-60:]   # ~5 hrs at data-refresh cadence
+        st.session_state.bias_history_last_ts = _now_bias
+        _save_bias_history(st.session_state.bias_history)   # persist for mid-session joiners
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -6183,7 +6566,7 @@ def _render_oct26_panel_streamlit(vm):
     <div style="font-size:10px;font-weight:700;color:{MUTED};letter-spacing:0.6px;">CONFLUENCE</div>
     <div style="font-size:20px;font-weight:800;color:{hc};">{vm['head']}</div>
     <div style="font-size:11px;color:{MUTED};">{'Fut' if L.get('fut') else 'Spot'} {px:,.1f} · last snapshot {L['ts'][11:16]} IST
-      · anchors from {(vm.get('open_ts') or '')[11:16]}</div>
+      · {vm.get('anchor_txt', '')}</div>
   </div>
   <div style="flex:2 1 300px;padding:4px 6px;">
     <div>{tags_html}</div>
@@ -6238,6 +6621,7 @@ with _slot_oct26:
         _render_oct26_panel_streamlit(_oct26_view_model())
     except Exception as _oct26_e:
         st.caption(f"OCTOBER 2026 SENTIMENT ADDITION panel unavailable this tick: {_oct26_e}")
+_v27_grm_for_bottom = None   # v27: set by the Final Decision Matrix; 9-state grid renders at the bottom
 _slot_summary = st.container()   # Shantanu's Final Decision Matrix — very top of dashboard
 _slot_sv    = st.container()   # v10: Shantanu's View — renders at the very top of the dashboard
 _slot_s3    = st.container()   # Section 3 — Key Price Levels
@@ -7781,7 +8165,7 @@ with _ls_col3:
 
 _ENDM_HIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "endm_verdict_history_streamlit.json")
-_ENDM_HIST_FLOCK = threading.Lock()
+_ENDM_HIST_FLOCK = _SH["endm_lock"]   # v27: shared across reruns/visitors
 
 
 def _endm_hist_file_load():
@@ -8691,9 +9075,9 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
 
         # ── IV Smile Live Interpretation (full-width, powered by session history) ─
         # Maintain intraday rolling history for trend-aware classification
-        if "iv_smile_history" not in st.session_state:
-            st.session_state["iv_smile_history"] = []
-        _iv_hist = st.session_state["iv_smile_history"]
+        # v27: shared smile history — always start from the file on disk
+        _iv_hist = _load_smile_history()
+        st.session_state["iv_smile_history"] = _iv_hist
 
         # Compute OTM wing excesses for this tick and append to session state
         _iv_atm      = safe_num(m.get("atm", spot))
@@ -8716,11 +9100,14 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                 "skew_asymmetry":  _iv_pwe - _iv_cwe,
             }
             # Deduplicate same-timestamp reruns; keep rolling 20-tick window (~5 hrs)
-            if not _iv_hist or _iv_hist[-1]["ts"] != _iv_tick["ts"]:
-                _iv_hist.append(_iv_tick)
-                if len(_iv_hist) > 20:
-                    _iv_hist.pop(0)
-                _save_smile_history(_iv_hist)   # persist for mid-session joiners
+            with _SH["smile_lock"]:   # v27: atomic re-read + dedup + append across visitors
+                _iv_hist = _load_smile_history()
+                if not any(h.get("ts") == _iv_tick["ts"] for h in _iv_hist[-5:]):
+                    _iv_hist.append(_iv_tick)
+                    if len(_iv_hist) > 20:
+                        _iv_hist.pop(0)
+                    _save_smile_history(_iv_hist)   # persist for mid-session joiners
+                st.session_state["iv_smile_history"] = _iv_hist
 
         _iv_sc = classify_iv_smile_scenario(df_band, m, spot, _iv_hist)
         if _iv_sc:
@@ -8963,7 +9350,8 @@ with _slot_summary:
             history=history, momentum=m.get("momentum"),
             vix_change=(_grm_vix.get("vix_change") if _grm_vix.get("available") else None),
             above_vwap=_grm_vwap.get("above_vwap"), expiry=expiry, now=now_ist())
-        st.markdown(render_gamma_regime_matrix_html(_grm), unsafe_allow_html=True)
+        st.markdown(render_gamma_regime_matrix_html(_grm, part="live"), unsafe_allow_html=True)   # v27: current state only
+        _v27_grm_for_bottom = _grm                                                               # v27: grid at bottom
     except Exception as _grm_err:
         st.info(f"GEX × Gamma Flip Regime Matrix — collecting data ({_grm_err}).")
 
@@ -9624,6 +10012,15 @@ if not df_band_disp.empty:
         "C OI":"{:,}","P OI":"{:,}","C OI Chg":"{:+,}","P OI Chg":"{:+,}",
         "C Δ":"{:.3f}","P Δ":"{:.3f}","C IV":"{:.1f}%","P IV":"{:.1f}%","Strike":"{:,}"
     }), width='stretch', hide_index=True)
+
+
+# v27: GEX × Gamma Flip 9-state reference grid — bottom of the dashboard
+if _v27_grm_for_bottom and _v27_grm_for_bottom.get("available"):
+    try:
+        st.markdown('<div class="section-header">📐 GEX × Gamma Flip Regime Matrix — 9 indicative states (reference)</div>', unsafe_allow_html=True)
+        st.markdown(render_gamma_regime_matrix_html(_v27_grm_for_bottom, part="grid"), unsafe_allow_html=True)
+    except Exception as _v27_ge:
+        st.caption(f"GEX × Gamma Flip grid unavailable ({_v27_ge})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
