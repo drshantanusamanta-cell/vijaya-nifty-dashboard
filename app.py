@@ -27,6 +27,10 @@
 ║        + OCT-2026 panel fixes: skew-adjusted Fear/Skew, IV-based    ║
 ║          positioning, OI-magnet gamma tile, 09:20–09:25 median     ║
 ║          anchor, holiday/stall guard, 15-min intraday z, 252-day σ ║
+║  v28 — 08-Oct-2026: fetch single-flight flag can no longer stick    ║
+║        (try/finally); cold-start visitors wait for the background   ║
+║        fetch instead of "Could not fetch"; API-ERROR banner shows   ║
+║        the real Dhan error (e.g. expired token)                     ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -73,7 +77,8 @@ def _v27_shared_state():
     return {
         "srv_lock":     threading.Lock(),
         "srv_cache":    {"payload": None, "source": None, "last_fetch_ts": 0.0},
-        "inflight":     {"v": False},
+        "inflight":     {"v": False, "since": 0.0},
+        "last_err":     {"v": ""},       # v28: last Dhan error, shown in the API ERROR banner
         "persist_lock": threading.Lock(),
         "hist_lock":    threading.Lock(),
         "bias_lock":    threading.Lock(),
@@ -1017,6 +1022,17 @@ class DhanAPIError(Exception):
 
 
 def _dhan_post(url, payload, timeout=15):
+    """v28: thin wrapper — records the last Dhan error so the banner can show it."""
+    try:
+        _r = _dhan_post_raw(url, payload, timeout)
+        _SH["last_err"]["v"] = ""
+        return _r
+    except DhanAPIError as _e:
+        _SH["last_err"]["v"] = f"{url.rsplit('/v2/', 1)[-1]}: {_e}"
+        raise
+
+
+def _dhan_post_raw(url, payload, timeout=15):
     """H1+H2+H3 fix: POST to a Dhan endpoint with full validation + retry.
 
     Returns the parsed JSON body on success.
@@ -4171,27 +4187,64 @@ def get_server_data(expiry_override=None, _from_bg=False):
                 _srv_cache.get("source", "N/A"),
                 _srv_cache.get("last_fetch_ts", 0.0),
             )
-        # Cache stale — check if another thread is already fetching
-        if _SH["inflight"]["v"]:   # v27: shared single-flight flag
+        # Cache stale — check if another thread is already fetching.
+        # v28 FIX: a claim older than 120 s is treated as dead (its thread was
+        # interrupted) and reclaimed, so one bad fetch can never freeze the cache.
+        _inflight_live = (_SH["inflight"]["v"]
+                          and (now - _SH["inflight"].get("since", 0.0)) < 120)
+        if _inflight_live and _srv_cache["payload"] is not None:
             # Stale-while-revalidate: return what we have, let the other thread finish
             return (
                 _srv_cache.get("payload"),
                 _srv_cache.get("source", "N/A"),
                 _srv_cache.get("last_fetch_ts", 0.0),
             )
-        # Claim the fetch slot
-        _SH["inflight"]["v"] = True
+        if not _inflight_live:
+            # Claim the fetch slot
+            _SH["inflight"]["v"] = True
+            _SH["inflight"]["since"] = now
+            _we_fetch = True
+        else:
+            _we_fetch = False   # no data yet AND another thread is fetching → wait below
+
+    # v28 FIX: on a cold start (no payload yet) the background fetcher usually
+    # holds the slot. Previously the visitor got payload=None → "Could not fetch
+    # option chain data" + st.stop(). Now we wait for that fetch to finish.
+    if not _we_fetch:
+        _deadline = time.time() + 90
+        while time.time() < _deadline:
+            time.sleep(0.5)
+            with _srv_cache_lock:
+                if _srv_cache["payload"] is not None or not _SH["inflight"]["v"]:
+                    break
+        return (
+            _srv_cache.get("payload"),
+            _srv_cache.get("source", "N/A"),
+            _srv_cache.get("last_fetch_ts", 0.0),
+        )
 
     # ── Phase 2: do the network call WITHOUT holding the lock ──
+    # v28 FIX: try/finally. Streamlit's StopException / RerunException derive from
+    # BaseException, so `except Exception` let them skip Phase 3 and the SHARED
+    # in-flight flag stayed True forever → cache never refreshed again (frozen or
+    # permanently empty dashboard) until the server was restarted.
+    payload, source = None, "API ERROR"
     try:
         _hist_for_ivr = _load_history()
         payload, source = _raw_fetch_and_compute(expiry_to_use, history=_hist_for_ivr)
-    except Exception:
+    except Exception as _gsd_e:
         payload, source = None, "API ERROR"
+        try:
+            _SH["last_err"]["v"] = f"compute error: {_gsd_e}"
+            print(f"[get_server_data] fetch/compute failed: {_gsd_e!r}", flush=True)
+        except Exception:
+            pass
+    finally:
+        with _srv_cache_lock:
+            _SH["inflight"]["v"] = False
 
-    # ── Phase 3: re-acquire lock to update cache + clear flag ──
+    # ── Phase 3: re-acquire lock to update cache ──
     with _srv_cache_lock:
-        _SH["inflight"]["v"] = False
         if payload is not None:
             _srv_cache["payload"] = payload
             _srv_cache["source"]  = source
@@ -5701,8 +5754,14 @@ def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs, data_sour
         bg, border = "#FEF2F2", "#DC2626"
         dot = ""
         headline = "API ERROR — showing fallback demo data"
-        detail   = ("Dhan API call failed (timeout, rate-limit, or auth issue) · "
-                    "Values shown are <strong>simulated</strong>, not real market data · "
+        _last_err = (_SH["last_err"]["v"] or "unknown — see server logs")
+        import html as _html_mod
+        _tok_hint = (" · <strong>Dhan access tokens expire every 24 h — generate a new one and "
+                     "update DHAN_ACCESS_TOKEN in Streamlit secrets</strong>"
+                     if any(t in _last_err.lower() for t in ("401", "token", "auth", "dh-901", "dh-906"))
+                     else "")
+        detail   = ("Dhan API call failed · Values shown are <strong>simulated</strong>, not real market data · "
+                    f"Last error: <code>{_html_mod.escape(_last_err[:180])}</code>{_tok_hint} · "
                     "Will auto-retry on next refresh")
         label_bg, label_fg = "#DC2626", "#ffffff"
         label_text = "● API ERROR"
