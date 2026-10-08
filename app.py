@@ -27,7 +27,7 @@
 ║        + OCT-2026 panel fixes: skew-adjusted Fear/Skew, IV-based    ║
 ║          positioning, OI-magnet gamma tile, 09:20–09:25 median     ║
 ║          anchor, holiday/stall guard, 15-min intraday z, 252-day σ ║
-║  v28 — 08-Oct-2026: fetch single-flight flag can no longer stick    ║
+║  v28.1 — 08-Oct-2026: option-chain throttle ≥3.2 s + 20 s dedupe cache, single-flight flag can no longer stick    ║
 ║        (try/finally); cold-start visitors wait for the background   ║
 ║        fetch instead of "Could not fetch"; API-ERROR banner shows   ║
 ║        the real Dhan error (e.g. expired token)                     ║
@@ -78,7 +78,10 @@ def _v27_shared_state():
         "srv_lock":     threading.Lock(),
         "srv_cache":    {"payload": None, "source": None, "last_fetch_ts": 0.0},
         "inflight":     {"v": False, "since": 0.0},
-        "last_err":     {"v": ""},       # v28: last Dhan error, shown in the API ERROR banner
+        "last_err":     {"v": ""},
+        "oc_lock":      threading.Lock(),   # v28.1: global option-chain throttle (all threads/visitors)
+        "oc_last":      {"t": 0.0},
+        "resp_cache":   {},                 # v28.1: (url, payload) -> (ts, body), 20 s       # v28: last Dhan error, shown in the API ERROR banner
         "persist_lock": threading.Lock(),
         "hist_lock":    threading.Lock(),
         "bias_lock":    threading.Lock(),
@@ -1003,11 +1006,12 @@ def _get_dhan_session():
             s = _requests.Session()
             if Retry is not None:
                 retry = Retry(
-                    total=3,
-                    backoff_factor=0.5,            # 0.5, 1, 2 seconds
+                    total=2,
+                    backoff_factor=1.5,            # v28.1: 1.5s, 3s — gentler on Dhan's 1-req/3s option-chain limit
                     status_forcelist=(429, 500, 502, 503, 504),
                     allowed_methods=("GET", "POST"),
                     respect_retry_after_header=True,
+                    raise_on_status=False,   # v28.1: return the final 429/5xx so we log "HTTP 429", not "Max retries"
                 )
                 adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
                 s.mount("https://", adapter)
@@ -1047,10 +1051,62 @@ def _dhan_post_raw(url, payload, timeout=15):
         "Content-Type": "application/json",
     }
     sess = _get_dhan_session()
+    # v28.1: option-chain calls (front, back OI band, back ATM IV, roll check) used to
+    # fire back-to-back and from several threads at once, breaching Dhan's
+    # 1-request-per-3-seconds option-chain limit → 429s → "network error: Max retries".
+    # Identical requests within 20 s are now served from a shared cache, and the
+    # remaining option-chain calls are spaced ≥3.2 s apart process-wide.
+    _is_oc = "/v2/optionchain" in url
+    _ck = (url, json.dumps(payload, sort_keys=True))
+    if _is_oc:
+        _hit = _SH["resp_cache"].get(_ck)
+        if _hit and time.time() - _hit[0] < 20:
+            return _hit[1]
+    _oc_guard = _SH["oc_lock"] if _is_oc else None
+    if _oc_guard:
+        _oc_guard.acquire()
     try:
-        resp = sess.post(url, headers=headers, json=payload, timeout=timeout)
-    except _requests.RequestException as e:
-        raise DhanAPIError(f"network error: {e}")
+        if _is_oc:
+            _hit = _SH["resp_cache"].get(_ck)          # another thread may have just fetched it
+            if _hit and time.time() - _hit[0] < 20:
+                return _hit[1]
+            _wait = 3.2 - (time.time() - _SH["oc_last"]["t"])
+            if _wait > 0:
+                time.sleep(_wait)
+        try:
+            resp = sess.post(url, headers=headers, json=payload, timeout=timeout)
+        except _requests.RequestException as e:
+            raise DhanAPIError(f"network error ({_net_cause(e)}): {e}")
+        finally:
+            if _is_oc:
+                _SH["oc_last"]["t"] = time.time()
+        _data = _dhan_validate(resp)
+        if _is_oc:
+            _SH["resp_cache"][_ck] = (time.time(), _data)
+            if len(_SH["resp_cache"]) > 50:
+                _SH["resp_cache"].clear()
+        return _data
+    finally:
+        if _oc_guard:
+            _oc_guard.release()
+
+
+def _net_cause(e):
+    """v28.1: one-word root cause of a requests failure, for logs and the banner."""
+    t = repr(e).lower()
+    if "429" in t or "too many" in t:              return "RATE-LIMITED 429"
+    if "nameresolution" in t or "name or service" in t or "getaddrinfo" in t:
+                                                   return "DNS failure"
+    if "timeout" in t or "timed out" in t:         return "TIMEOUT"
+    if "ssl" in t or "certificate" in t:           return "SSL error"
+    if "proxy" in t:                               return "proxy error"
+    if "refused" in t:                             return "connection refused"
+    if "reset" in t or "aborted" in t:             return "connection reset"
+    if "5" in t and "error responses" in t:        return "Dhan server 5xx"
+    return type(e).__name__
+
+
+def _dhan_validate(resp):
 
     # H1 fix: check HTTP status code (was missing — JSONDecodeError was silently swallowed)
     if resp.status_code >= 400:
@@ -5759,7 +5815,12 @@ def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs, data_sour
         _tok_hint = (" · <strong>Dhan access tokens expire every 24 h — generate a new one and "
                      "update DHAN_ACCESS_TOKEN in Streamlit secrets</strong>"
                      if any(t in _last_err.lower() for t in ("401", "token", "auth", "dh-901", "dh-906"))
-                     else "")
+                     else (" · <strong>Dhan is rate-limiting this server (429). Make sure only ONE copy of the "
+                           "dashboard is running with these credentials (check old Streamlit Cloud apps / local runs)</strong>"
+                           if "429" in _last_err else
+                           " · <strong>The server cannot reach api.dhan.co — check its internet/DNS/firewall</strong>"
+                           if any(t in _last_err for t in ("DNS", "TIMEOUT", "refused", "SSL", "proxy", "reset"))
+                           else ""))
         detail   = ("Dhan API call failed · Values shown are <strong>simulated</strong>, not real market data · "
                     f"Last error: <code>{_html_mod.escape(_last_err[:180])}</code>{_tok_hint} · "
                     "Will auto-retry on next refresh")
@@ -6649,11 +6710,11 @@ def _render_oct26_panel_streamlit(vm):
   <div style="font-size:11px;font-weight:700;color:{col};">{t['z']}</div>
 </div>""", unsafe_allow_html=True)
                 if t["spark"]:
-                    st.plotly_chart(sparks[t["spark"]], use_container_width=True,
+                    st.plotly_chart(sparks[t["spark"]], width='stretch',
                                     config={"displayModeBar": False, "staticPlot": True},
                                     key=f"oct26_spark_{t['key']}")
 
-    st.plotly_chart(div_fig, use_container_width=True, config={"displayModeBar": False}, key="oct26_divergence")
+    st.plotly_chart(div_fig, width='stretch', config={"displayModeBar": False}, key="oct26_divergence")
 
     tone_icon = {"bear": "▼", "bull": "▲", "watch": "●", "info": "·"}
     log_html = "".join(
@@ -6664,7 +6725,7 @@ def _render_oct26_panel_streamlit(vm):
         for a in vm["alerts"]) or f'<div style="color:{MUTED};font-size:12px;">No alerts yet this session.</div>'
     c_lad, c_log = st.columns([7, 5])
     with c_lad:
-        st.plotly_chart(lad_fig, use_container_width=True, config={"displayModeBar": False}, key="oct26_ladder")
+        st.plotly_chart(lad_fig, width='stretch', config={"displayModeBar": False}, key="oct26_ladder")
     with c_log:
         st.markdown(f'<div class="card" style="max-height:460px;overflow-y:auto;">'
                     f'<div style="font-weight:700;font-size:12px;color:{ACCENT};margin-bottom:6px;">'
@@ -7060,7 +7121,7 @@ with _ph_hidden_s34chart.container():
                 tickfont=dict(size=9, color=_B_CYAN),
             ),
         )
-        st.plotly_chart(_bf, width='stretch', config={"displayModeBar": False})  # H23 fix: was use_container_width=True
+        st.plotly_chart(_bf, width='stretch', config={"displayModeBar": False})  # H23 fix: was width='stretch'
     elif len(_bh_data) == 1:
         st.caption("⏳ Chart will appear after the second 5-minute snapshot is recorded.")
 _ph_hidden_s34chart.empty()        # v20: Section 3&4 Bias chart visual output suppressed
@@ -7194,7 +7255,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 xaxis=dict(title="Strike", tickfont=dict(size=9)),
                 font=dict(color="#1A1A2E", size=11),
             )
-            st.plotly_chart(_gc1_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(_gc1_fig, width='stretch', config={"displayModeBar": False})
 
         with _gc_col2:
             # ─────────────────────────────────────────────────────────────────────
@@ -7261,7 +7322,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 xaxis=dict(title="Strike", tickfont=dict(size=9)),
                 font=dict(color="#1A1A2E", size=11),
             )
-            st.plotly_chart(_gv_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(_gv_fig, width='stretch', config={"displayModeBar": False})
 
         # ─────────────────────────────────────────────────────────────────────────
         # ATM BAND VEGA EXPOSURE DIFF vs SPOT — dual-axis time-series
@@ -7432,7 +7493,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                     hovermode="x unified",
                     font=dict(color="#1A1A2E", size=11),
                 )
-                st.plotly_chart(_vr_fig, use_container_width=True,
+                st.plotly_chart(_vr_fig, width='stretch',
                                 config={"displayModeBar": False})
 
             # ── Chart B: OI-Weighted Vega Ratio  (ΣOI×call_vega / ΣOI×put_vega) ────
@@ -7500,7 +7561,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                     hovermode="x unified",
                     font=dict(color="#1A1A2E", size=11),
                 )
-                st.plotly_chart(_vo_fig, use_container_width=True,
+                st.plotly_chart(_vo_fig, width='stretch',
                                 config={"displayModeBar": False})
         else:
             st.info("⏳ ATM Band Vega Ratio charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
@@ -7614,7 +7675,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                     hovermode="x unified",
                     font=dict(color="#1A1A2E", size=11),
                 )
-                st.plotly_chart(_ev_fig, use_container_width=True,
+                st.plotly_chart(_ev_fig, width='stretch',
                                 config={"displayModeBar": False})
 
             # ── Chart B: OI-Weighted CE/PE EV Ratio (Call EV×OI / Put EV×OI) ────
@@ -7682,7 +7743,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                     hovermode="x unified",
                     font=dict(color="#1A1A2E", size=11),
                 )
-                st.plotly_chart(_evo_fig, use_container_width=True,
+                st.plotly_chart(_evo_fig, width='stretch',
                                 config={"displayModeBar": False})
         else:
             st.info("⏳ Sentiment Z-Score charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
@@ -8603,7 +8664,7 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
                 st.markdown(
                     '<div style="font-size:12px;font-weight:800;color:#5C35CC;margin:12px 0 6px 0;">'
                     '🕒 Final Verdict History — 15-min log (today)</div>', unsafe_allow_html=True)
-                st.dataframe(pd.DataFrame(_endm["history"]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_endm["history"]), width='stretch', hide_index=True)
 
             with st.expander("📊 Strike-by-Strike Buyer/Seller Matrix Breakdown", expanded=False):
                 st.caption(
@@ -8633,7 +8694,7 @@ with _slot_sv:   # v10: display Shantanu's View just below Section 4
                     _endm_df.rename(columns={"NDM": "NDM (Δ×ΔOI)", "EVR": "Raw Sentiment"})
                             .style.map(_endm_style, subset=["Enhanced NDM", "NDM (Δ×ΔOI)"])
                             .map(_endm_read_style, subset=["Reading"]),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True
                 )
         # ── End Enhanced NDM ──────────────────────────────────────────────────────
