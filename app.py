@@ -17,10 +17,14 @@
 ║  v25 — 15-Sep-2026: GEX × Gamma Flip Regime Matrix (3×3 live cell, ║
 ║        confidence + levels) added inside Shantanu's Final Decision ║
 ║        Matrix — independent add-on, no existing logic changed      ║
-║  v26 — 25-Sep-2026: Δ-Wtd Ratio R & Normalised Score S charts      ║
-║        (1A/2A Total OI · 1B/2B Intraday ΔOI) added to the top;     ║
-║        Regime Matrix top = live cell only, 9-cell grid moved to    ║
-║        the bottom of the dashboard. No existing logic changed      ║
+║  v27 — 07-Oct-2026: ONE shared history for all visitors — process-  ║
+║        wide fetch cache + locks, server-side tick recording, 30s   ║
+║        background fetcher, daily skew anchor, permanent archive    ║
+║        + GEX×Flip: live state at top, 9-state grid moved to bottom ║
+║        + FDM: synthetic-forward bias ladder (OI-weighted) + 25Δ RR ║
+║          noise-filtered: like-for-like Δ, quote noise floor, MAD   ║
+║          trim, weighted median, 3-snapshot confirmation, mid IVs  ║
+║        · October 2026 Sentiment panel REMOVED from this edition    ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -56,6 +60,31 @@ _pio.templates["_mobile_fix"] = go.layout.Template(
 _pio.templates.default = "plotly+_mobile_fix"
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+import copy as _v27_copy
+
+# v27: Streamlit re-executes this whole script on every rerun, so plain module-level
+# globals (caches, locks) are re-created EMPTY each time and are never shared between
+# visitors. st.cache_resource returns the SAME object for every rerun and every visitor
+# of this server process — all shared caches and locks now live here.
+@st.cache_resource(show_spinner=False)
+def _v27_shared_state():
+    return {
+        "srv_lock":     threading.Lock(),
+        "srv_cache":    {"payload": None, "source": None, "last_fetch_ts": 0.0},
+        "inflight":     {"v": False, "ts": 0.0},
+        "persist_lock": threading.Lock(),
+        "hist_lock":    threading.Lock(),
+        "bias_lock":    threading.Lock(),
+        "smile_lock":   threading.Lock(),
+        "skew_lock":    threading.Lock(),
+        "vix_lock":     threading.Lock(),
+        "vix_history":  [],
+        "endm_lock":    threading.Lock(),
+        "fdmb_lock":    threading.Lock(),
+    }
+
+_SH = _v27_shared_state()
+_V27_HIST_LOCK = _SH["hist_lock"]
 
 warnings.filterwarnings("ignore")
 
@@ -855,8 +884,6 @@ def render_gamma_regime_matrix_html(r, part="all"):
     import html as _h
     esc = lambda s: _h.escape(str(s))
     if not r or not r.get("available"):
-        if part == "grid":          # v26: bottom reference grid needs a live snapshot
-            return ""
         _why = esc((r or {}).get("reason", "no data"))
         return ('<div style="background:#F9FAFB;border:2px solid #6B7280;border-radius:10px;'
                 'padding:12px 16px;margin-top:12px;"><div style="font-size:11px;font-weight:700;'
@@ -931,182 +958,15 @@ def render_gamma_regime_matrix_html(r, part="all"):
             f'Typical |GEX| = median of {r["hist_ticks"]} history ticks across {r["hist_days"]} day(s). '
             'Independent read — does not alter the Bias Summary or any other verdict. '
             'GEX is a model of dealer hedging; on NIFTY many writers do not delta-hedge.</div>')
-    # v26: part="verdict" → live cell only (top) · part="grid" → 9-cell grid (bottom)
-    if part == "verdict":
-        return verdict
+    # v27: part='live' → current state only (top); part='grid' → 9-state grid (bottom)
+    if part == "live":
+        return verdict + ('<div style="font-size:11px;color:#6B7280;margin-top:4px;font-style:italic;">'
+                          'Full 9-state reference grid (live cell ◉ highlighted) is at the bottom of the dashboard.</div>')
     if part == "grid":
-        return "".join(grid) + foot
+        return (f'<div style="font-size:12px;color:#374151;">Live cell now: <b style="color:{col};">'
+                f'{esc(c["name"])}</b> · {esc(c["tag"])} · confidence {r["score"]}/10</div>'
+                + "".join(grid) + foot)
     return verdict + "".join(grid) + foot
-
-
-# ─── v26 ADDITION: Δ-weighted strike-wise Ratio (R) & Normalised Score (S) ──────
-# Four independent charts for the top panel (Shantanu's Final Decision Matrix).
-# Pure read-only: consumes only the ±10 structural band (payload["df_band"]) and
-# spot. Nothing upstream is modified; no verdict, score or state file reads it.
-#
-#   a = Call leg × |Call Δ|        b = Put leg × |Put Δ|
-#   1A  R  (Total OI)   = a / b                         baseline 1
-#   1B  R  (Intraday ΔOI) = a / b  (ΔOI legs)            baseline 1
-#   2A  S  (Total OI)   = (a − b) / (a + b)             range −1 … +1
-#   2B  S  (Intraday ΔOI) = (a − b) / (|a| + |b|)        range −1 … +1
-#
-# Colour convention = Section-4 charts 1 & 2 (Δ-Weighted Net OI):
-#   RED   = call side dominant (call writing → resistance / bearish tilt)
-#   GREEN = put side dominant  (put writing → support / bullish tilt)
-#   GREY  = illiquid, masked (pinned to baseline, never imputed as a signal)
-# 1B uses the dashboard's existing four-quadrant colouring (the ΔOI ratio is
-# sign-ambiguous: build-vs-build and unwind-vs-unwind both print positive).
-# 2B uses |a|+|b| in the denominator: identical to the stated formula when both
-# sides are building, and it keeps S bounded with the correct sign when one or
-# both sides are unwinding (the sign of 2B always equals the sign of Section-4
-# chart 2, Δ-Weighted OI Change Momentum).
-# Liquidity floor = same rule as Section 4 (2 % of the band's largest leg).
-DWRS_R_CAP = 5.0   # display cap for R bars (true value always shown on hover)
-
-
-def compute_dw_ratio_score(df_band, spot):
-    """Return a DataFrame with R / S for total OI and intraday ΔOI per strike,
-    plus liquidity masks. Empty DataFrame when data is missing."""
-    df = pd.DataFrame(df_band)
-    need = ["strike", "call_oi", "put_oi", "call_oi_chg", "put_oi_chg",
-            "call_delta", "put_delta"]
-    if df.empty or any(c not in df.columns for c in need):
-        return pd.DataFrame()
-    df = df.sort_values("strike").reset_index(drop=True)
-    for c in need:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(float)
-    cda, pda = df["call_delta"].abs(), df["put_delta"].abs()
-
-    a_oi, b_oi = df["call_oi"] * cda, df["put_oi"] * pda
-    a_ch, b_ch = df["call_oi_chg"] * cda, df["put_oi_chg"] * pda
-
-    out = pd.DataFrame({"strike": df["strike"]})
-    out["a_oi"], out["b_oi"], out["a_ch"], out["b_ch"] = a_oi, b_oi, a_ch, b_ch
-    out["doi_c"], out["doi_p"] = df["call_oi_chg"], df["put_oi_chg"]
-    out["R_oi"]  = a_oi / b_oi.replace(0, np.nan)
-    out["R_chg"] = a_ch / b_ch.replace(0, np.nan)
-    _den_oi = (a_oi + b_oi).replace(0, np.nan)
-    _den_ch = (a_ch.abs() + b_ch.abs()).replace(0, np.nan)
-    out["S_oi"]  = (a_oi - b_oi) / _den_oi
-    out["S_chg"] = (a_ch - b_ch) / _den_ch
-
-    _oi_floor  = 0.02 * max(float(df["call_oi"].max()), float(df["put_oi"].max()), 1.0)
-    _chg_floor = 0.02 * max(float(df["call_oi_chg"].abs().max()),
-                            float(df["put_oi_chg"].abs().max()), 1.0)
-    _c_ok  = df["call_oi"] > _oi_floor
-    _p_ok  = df["put_oi"]  > _oi_floor
-    _cc_ok = df["call_oi_chg"].abs() > _chg_floor
-    _pc_ok = df["put_oi_chg"].abs()  > _chg_floor
-    # R needs BOTH legs liquid (a thin denominator makes the ratio explode).
-    out["liq_R_oi"]  = _c_ok & _p_ok & out["R_oi"].notna() & np.isfinite(out["R_oi"])
-    out["liq_R_chg"] = _cc_ok & _pc_ok & out["R_chg"].notna() & np.isfinite(out["R_chg"])
-    # S is bounded, so ONE liquid leg is enough (a one-sided strike reads ±1).
-    out["liq_S_oi"]  = (_c_ok | _p_ok) & out["S_oi"].notna()
-    out["liq_S_chg"] = (_cc_ok | _pc_ok) & out["S_chg"].notna()
-    return out
-
-
-def _dwrs_quad(dc_, dp_):
-    if dc_ >= 0 and dp_ < 0:  return "#EF4444", "Call build + Put unwind (bearish)"
-    if dc_ < 0 and dp_ >= 0:  return "#22C55E", "Put build + Call unwind (bullish)"
-    if dc_ >= 0 and dp_ >= 0: return "#F59E0B", "Both building (contested)"
-    return "#64748B", "Both unwinding (de-risking)"
-
-
-def _dwrs_style(f, title, y_title, spot):
-    f.add_vline(x=spot, line_width=2, line_dash="dash", line_color=CYAN,
-                annotation_text=f"Spot {spot:,.0f}", annotation_position="top",
-                annotation_font=dict(size=9, color=CYAN))
-    f.update_layout(
-        title=dict(text=title, x=0.02, xanchor="left", font=dict(color="#1A1A2E", size=11)),
-        height=275, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
-        margin=dict(l=45, r=18, t=52, b=42), font=dict(color="#1A1A2E", size=11),
-        hoverlabel=dict(bgcolor="#fff", font_color="#1A1A2E", font_size=11),
-        showlegend=False,
-        xaxis=dict(title=dict(text="Strike", font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
-        yaxis=dict(title=dict(text=y_title, font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
-    )
-    return f
-
-
-def build_dw_ratio_score_figs(df_band, spot):
-    """v26: return {"1A","1B","2A","2B": plotly Figure} or {} when no data."""
-    d = compute_dw_ratio_score(df_band, spot)
-    if d.empty:
-        return {}
-    spot = float(spot)
-    grey = "#D1D5DB"
-    xs = list(d["strike"])
-    figs = {}
-
-    # ── 1A · R on total OI (baseline 1) ──────────────────────────────────────
-    cols, cd, ys = [], [], []
-    for v, ok, a, b in zip(d["R_oi"], d["liq_R_oi"], d["a_oi"], d["b_oi"]):
-        if not ok:
-            cols.append(grey); ys.append(0.0); cd.append("illiquid — masked"); continue
-        cols.append(RED if v >= 1 else GREEN)
-        ys.append(min(v, DWRS_R_CAP) - 1.0)
-        cd.append(f"R {v:.3f}{' (capped)' if v > DWRS_R_CAP else ''}<br>"
-                  f"CE Δ×OI {a:,.0f} · PE Δ×OI {b:,.0f}")
-    f = go.Figure(go.Bar(x=xs, y=ys, base=1.0, marker_color=cols, customdata=cd,
-                         hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
-    f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
-                annotation_text="Baseline 1.0", annotation_position="bottom right",
-                annotation_font=dict(size=9, color=MUTED))
-    figs["1A"] = _dwrs_style(f, "1A · Δ-Wtd Ratio R · TOTAL OI = (CE OI×|Δc|)/(PE OI×|Δp|) · "
-                                "Red>1 call side · Green<1 put side · Grey=illiquid",
-                             f"R (cap {DWRS_R_CAP:g})", spot)
-
-    # ── 1B · R on intraday ΔOI (baseline 1, four-quadrant colour) ────────────
-    cols, cd, ys = [], [], []
-    for v, ok, dc_, dp_, a, b in zip(d["R_chg"], d["liq_R_chg"], d["doi_c"], d["doi_p"],
-                                     d["a_ch"], d["b_ch"]):
-        if not ok:
-            cols.append(grey); ys.append(0.0); cd.append("illiquid — masked"); continue
-        c_, lbl = _dwrs_quad(dc_, dp_)
-        cols.append(c_)
-        vv = max(min(v, DWRS_R_CAP), -DWRS_R_CAP)
-        ys.append(vv - 1.0)
-        cd.append(f"{lbl}<br>R {v:.3f}{' (capped)' if abs(v) > DWRS_R_CAP else ''}<br>"
-                  f"CE Δ×ΔOI {a:+,.0f} · PE Δ×ΔOI {b:+,.0f}")
-    f = go.Figure(go.Bar(x=xs, y=ys, base=1.0, marker_color=cols, customdata=cd,
-                         hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
-    f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
-                annotation_text="Baseline 1.0", annotation_position="bottom right",
-                annotation_font=dict(size=9, color=MUTED))
-    figs["1B"] = _dwrs_style(f, "1B · Δ-Wtd Ratio R · INTRADAY ΔOI · Red=C-build/P-unwind · "
-                                "Green=P-build/C-unwind · Amber=both build · Slate=both unwind",
-                             f"R ΔOI (cap ±{DWRS_R_CAP:g})", spot)
-
-    # ── 2A / 2B · S (range −1 … +1, zero line) ───────────────────────────────
-    def _s_fig(vals, liq, a_s, b_s, title, y_title, quad=False):
-        cols, cd, ys = [], [], []
-        for i, (v, ok, a, b) in enumerate(zip(vals, liq, a_s, b_s)):
-            if not ok:
-                cols.append(grey); ys.append(0.0); cd.append("illiquid — masked"); continue
-            cols.append(RED if v > 0 else (GREEN if v < 0 else MUTED))
-            ys.append(float(v))
-            _q = (_dwrs_quad(d["doi_c"].iloc[i], d["doi_p"].iloc[i])[1] + "<br>") if quad else ""
-            cd.append(f"{_q}S {v:+.3f}<br>CE {a:+,.0f} · PE {b:+,.0f}")
-        f = go.Figure(go.Bar(x=xs, y=ys, marker_color=cols, customdata=cd,
-                             hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
-        f.add_hline(y=0.0, line_width=1.5, line_dash="dash", line_color=MUTED,
-                    annotation_text="Balanced 0", annotation_position="bottom right",
-                    annotation_font=dict(size=9, color=MUTED))
-        _dwrs_style(f, title, y_title, spot)
-        f.update_yaxes(range=[-1.08, 1.08], tickvals=[-1, -0.5, 0, 0.5, 1])
-        return f
-
-    figs["2A"] = _s_fig(d["S_oi"], d["liq_S_oi"], d["a_oi"], d["b_oi"],
-                        "2A · Normalised Δ-Wtd Score S · TOTAL OI = (a−b)/(a+b) · "
-                        "Red>0 call side · Green<0 put side · Grey=illiquid",
-                        "S (−1 … +1)")
-    figs["2B"] = _s_fig(d["S_chg"], d["liq_S_chg"], d["a_ch"], d["b_ch"],
-                        "2B · Normalised Δ-Wtd Score S · INTRADAY ΔOI = (a−b)/(|a|+|b|) · "
-                        "Red>0 net call-side flow · Green<0 net put-side flow",
-                        "S ΔOI (−1 … +1)", quad=True)
-    return figs
-# ─── end v26 Δ-weighted R & S ───────────────────────────────────────────────────
 
 
 # ─── Data fetchers ────────────────────────────────────────────────────────────
@@ -4233,8 +4093,8 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
 #     release lock, do the fetch, re-acquire lock, store payload, clear flag.
 #   - If cache stale AND fetch already in progress → return stale payload
 #     (stale-while-revalidate).
-_srv_cache_lock      = threading.Lock()
-_srv_cache           = {"payload": None, "source": None, "last_fetch_ts": 0.0}
+_srv_cache_lock      = _SH["srv_lock"]      # v27: shared across reruns/visitors
+_srv_cache           = _SH["srv_cache"]     # v27: shared across reruns/visitors
 _srv_fetch_in_progress = False     # CI #7 fix: single-flight flag
 
 def _raw_fetch_and_compute(expiry_override=None, history=None):
@@ -4275,10 +4135,12 @@ def _raw_fetch_and_compute(expiry_override=None, history=None):
         "ts_ist":        ist_str(),
         "is_live":       is_market_hours() and USE_DHAN,
     }
+    # v27: synthetic-forward bias ladder + 25Δ RR (Final Decision Matrix) — once per fetch
+    payload["fdm_bias"] = _fdmb_snapshot(df, spot, expiry)
     return payload, source
 
 
-def get_server_data(expiry_override=None):
+def get_server_data(expiry_override=None, _from_bg=False):
     """
     Returns (payload, source, last_fetch_ts) for ALL visitors.
     Only calls Dhan API when the owner-configured refresh interval has elapsed.
@@ -4307,7 +4169,8 @@ def get_server_data(expiry_override=None):
                 _srv_cache.get("last_fetch_ts", 0.0),
             )
         # Cache stale — check if another thread is already fetching
-        if _srv_fetch_in_progress:
+        # v27 fix: a fetch older than 120 s is treated as dead (its thread was stopped)
+        if _SH["inflight"]["v"] and (now - _SH["inflight"].get("ts", 0.0)) < 120:   # shared single-flight flag
             # Stale-while-revalidate: return what we have, let the other thread finish
             return (
                 _srv_cache.get("payload"),
@@ -4315,28 +4178,39 @@ def get_server_data(expiry_override=None):
                 _srv_cache.get("last_fetch_ts", 0.0),
             )
         # Claim the fetch slot
-        _srv_fetch_in_progress = True
+        _SH["inflight"]["v"] = True
+        _SH["inflight"]["ts"] = now
 
     # ── Phase 2: do the network call WITHOUT holding the lock ──
+    # v27 fix: Streamlit stops a visitor's script run (page reload, new rerun, tab
+    # closed) by raising a BaseException inside it. Phase 3 therefore runs in a
+    # `finally`, otherwise the SHARED in-flight flag stayed True for ever and every
+    # visitor got "Could not fetch option chain data" until the server restarted.
+    payload, source = None, "API ERROR"
     try:
-        _hist_for_ivr = _load_history()
-        payload, source = _raw_fetch_and_compute(expiry_to_use, history=_hist_for_ivr)
-    except Exception:
-        payload, source = None, "API ERROR"
+        try:
+            _hist_for_ivr = _load_history()
+            payload, source = _raw_fetch_and_compute(expiry_to_use, history=_hist_for_ivr)
+        except Exception:
+            payload, source = None, "API ERROR"
+    finally:
+        # ── Phase 3: re-acquire lock to update cache + clear flag (always) ──
+        with _srv_cache_lock:
+            _SH["inflight"]["v"] = False
+            if payload is not None:
+                _srv_cache["payload"] = payload
+                _srv_cache["source"]  = source
+                _srv_cache["last_fetch_ts"] = time.time()
+            # If payload is None (fetch failed), keep the previous stale payload
+            # but bump last_fetch_ts by a short cooldown to prevent retry storms.
+            elif _srv_cache["payload"] is not None:
+                _srv_cache["last_fetch_ts"] = time.time() - max(0, interval - 30)  # 30s cooldown
 
-    # ── Phase 3: re-acquire lock to update cache + clear flag ──
-    with _srv_cache_lock:
-        _srv_fetch_in_progress = False
-        if payload is not None:
-            _srv_cache["payload"] = payload
-            _srv_cache["source"]  = source
-            _srv_cache["last_fetch_ts"] = time.time()
-        # If payload is None (fetch failed), keep the previous stale payload
-        # but bump last_fetch_ts by a short cooldown to prevent retry storms.
-        # CI #4 / H7 fix: was 0.0 → every subsequent visitor retried the failed
-        # fetch with no backoff.
-        elif _srv_cache["payload"] is not None:
-            _srv_cache["last_fetch_ts"] = time.time() - max(0, interval - 30)  # 30s cooldown
+    # v27: record the shared history tick right after a successful fetch.
+    # Background fetches outside market hours are not recorded (as before, after-hours
+    # ticks are only recorded when a visitor is actually viewing).
+    if payload is not None and (not _from_bg or is_market_hours()):
+        _v27_record_history_tick(_srv_cache.get("payload"), _srv_cache.get("last_fetch_ts", 0.0))
 
     return (
         _srv_cache.get("payload"),
@@ -4390,7 +4264,7 @@ _SMILE_HISTORY_FILE = os.path.join(_BASE_DIR, "nifty_smile_history.json")
 # Prevents concurrent visitor sessions from corrupting the JSON files via
 # interleaved read-modify-write cycles (which the previous bare `open(w)` calls
 # allowed — last writer wins, file can be truncated if process is killed mid-write).
-_persist_lock = threading.Lock()
+_persist_lock = _SH["persist_lock"]   # v27: shared across reruns/visitors
 
 # H25 fix: TTL cache for _load_owner_settings. The function was being called
 # 2-3× per rerun from multiple sites (sidebar, get_server_data, banner) and
@@ -4529,9 +4403,473 @@ def _save_smile_history(sh):
         except Exception:
             pass
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v27 — SYNTHETIC-FORWARD BIAS LADDER + 25Δ RR SKEW  (inside Shantanu's Final
+#        Decision Matrix; computed ONCE per data fetch, server-side, attached to
+#        the payload as payload["fdm_bias"] — independent add-on)
+#
+#   Per strike K (ATM ± 5, mid prices):
+#       F_K   = K + (C_mid − P_mid) · e^(rT)          put-call-parity synthetic forward
+#       P_K   = F_K − Spot                              synthetic forward premium (pts)
+#       w_K   = |ΔOI_call · Δ_call| + |ΔOI_put · Δ_put| delta-weighted OI change (vs previous day)
+#       u_K   = (call half-spread + put half-spread) · e^(rT)   quote uncertainty of F_K
+#   NOISE CONTROLS (v27.1)
+#     1. like-for-like change: Δ = weighted median of (P_K now − P_K previous) over strikes
+#        present in BOTH snapshots, using the SAME (current) weights → no composition /
+#        weight-jump effects
+#     2. noise floor from the quotes: floor = 1.2533 · weighted-median(√(u_now² + u_prev²)) / √n_eff;
+#        a change smaller than the floor reads "within quote noise"
+#     3. clean inputs: both legs need a live bid & ask with spread ≤ 5 % of mid; strikes whose
+#        F_K is > 3 MAD from the median F are dropped as stale/outliers; Bias = WEIGHTED MEDIAN
+#     4. confirmation: RISING / FALLING is "confirmed" only after 3 consecutive snapshots in
+#        the same direction, each beyond its noise floor; a 3-snapshot EMA of Δ is also shown
+#     5. 25Δ RR from IVs solved from MID prices (not LTP), on liquid strikes within ATM ± 10,
+#        with its own spread-based noise floor and the same 3-snapshot confirmation
+#   Direction uses only previous snapshots (no anchor, no z-score):
+#       rising  → call buyers / put sellers gaining (bullish)
+#       falling → put buyers / call sellers gaining (bearish)
+# ═══════════════════════════════════════════════════════════════════════════════
+FDMB_STRIKES     = 5      # ladder: ATM ± 5
+FDMB_RR_STRIKES  = 10     # 25Δ RR uses liquid strikes within ATM ± 10
+FDMB_SPREAD_MAX  = 0.05   # max bid-ask spread / mid for a leg to be used
+FDMB_MAD_K       = 3.0    # outlier trim: |F_K − median F| > 3 MAD
+FDMB_CONFIRM_N   = 3      # consecutive snapshots needed to confirm a direction
+FDMB_EMA_SPAN    = 3      # EMA span (snapshots) for the smoothed change
+FDMB_HIST_KEEP   = 10
+FDMB_STATE_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fdm_bias_state.json")
+_fdmb_lock = _SH["fdmb_lock"]   # shared across reruns/visitors
+
+
+def _v27_json_clean(o):
+    """Strict-JSON-safe copy (NaN/inf → None, numpy → python)."""
+    if isinstance(o, dict):
+        return {str(k): _v27_json_clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_v27_json_clean(v) for v in o]
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating, float)):
+        f = float(o)
+        return f if np.isfinite(f) else None
+    return o
+
+
+def _fdmb_quote(ltp, bid, ask):
+    """(mid, half_spread, ok) — ok only for a live two-sided quote with spread ≤ FDMB_SPREAD_MAX of mid."""
+    try:
+        bid, ask = float(bid or 0), float(ask or 0)
+        if bid > 0 and ask > bid:
+            mid = 0.5 * (bid + ask)
+            return mid, 0.5 * (ask - bid), (ask - bid) / mid <= FDMB_SPREAD_MAX
+    except Exception:
+        pass
+    return float(ltp or 0), None, False
+
+
+def _fdmb_T(expiry_str):
+    """Calendar time to expiry 15:30 IST in years, floored at 5 minutes."""
+    try:
+        ed = datetime.strptime(str(expiry_str)[:10], "%Y-%m-%d")
+        secs = (IST.localize(ed.replace(hour=15, minute=30)) - now_ist()).total_seconds()
+    except Exception:
+        secs = 3 * 86400
+    return max(secs, 300.0) / (365.0 * 86400.0)
+
+
+def _fdmb_wmedian(vals, wts):
+    """Weighted median; falls back to the plain median when all weights are zero."""
+    pairs = [(v, w) for v, w in zip(vals, wts) if v is not None and np.isfinite(v)]
+    if not pairs:
+        return None
+    if sum(w for _, w in pairs) <= 0:
+        return float(np.median([v for v, _ in pairs]))
+    pairs.sort()
+    tot = sum(w for _, w in pairs)
+    acc = 0.0
+    for v, w in pairs:
+        acc += w
+        if acc >= 0.5 * tot:
+            return float(v)
+    return float(pairs[-1][0])
+
+
+def _fdmb_neff(wts):
+    s1, s2 = sum(wts), sum(w * w for w in wts)
+    return (s1 * s1 / s2) if s2 > 0 else float(len(wts) or 1)
+
+
+def _fdmb_rr25(df, spot, T, atm):
+    """25Δ RR from IVs solved from MID prices on liquid strikes within ATM ± FDMB_RR_STRIKES.
+    Returns (ivc25, ivp25, rr25, rr_unc) in vol points; rr_unc from half-spread / vega."""
+    r = RISK_FREE_RATE
+    lo, hi = atm - FDMB_RR_STRIKES * NIFTY_STEP, atm + FDMB_RR_STRIKES * NIFTY_STEP
+    c_pts, p_pts = [], []
+    for _, x in df[df["strike"].between(lo, hi)].iterrows():
+        K = float(x["strike"])
+        for side, pre, pts in (("CE", "call", c_pts), ("PE", "put", p_pts)):
+            mid, hs, ok = _fdmb_quote(x.get(f"{pre}_ltp", 0), x.get(f"{pre}_bid", 0), x.get(f"{pre}_ask", 0))
+            if not ok:
+                continue
+            iv = _solve_iv(mid, spot, K, T, r, side)
+            if iv is None or not np.isfinite(iv) or iv <= 0.005:
+                continue
+            dlt, _, _, vega = _bs_greeks(spot, K, T, r, iv, side)
+            if vega <= 0:
+                continue
+            pts.append((float(dlt), iv * 100.0, hs / vega))      # (delta, IV %, IV uncertainty vol pts)
+
+    def _interp(pts, target):
+        pts = sorted(pts)
+        if len(pts) < 2:
+            return None, None
+        xs = np.array([p[0] for p in pts])
+        if not (xs.min() <= target <= xs.max()):
+            return None, None
+        return (float(np.interp(target, xs, [p[1] for p in pts])),
+                float(np.interp(target, xs, [p[2] for p in pts])))
+    ivc, uc = _interp(c_pts, 0.25)
+    ivp, up = _interp(p_pts, -0.25)
+    if ivc is None or ivp is None:
+        return ivc, ivp, None, None
+    return ivc, ivp, ivc - ivp, float(np.sqrt((uc or 0) ** 2 + (up or 0) ** 2))
+
+
+def _fdmb_confirm(hist, key, floor_key, n=FDMB_CONFIRM_N):
+    """Count consecutive latest snapshots (incl. current) whose change in `key` exceeds its
+    noise floor in the same direction. Returns (direction 'up'/'down'/None, count)."""
+    k, sign = 0, 0
+    for h in reversed(hist):
+        d, fl = h.get(key), h.get(floor_key) or 0.0
+        if d is None or abs(d) <= fl:
+            break
+        s = 1 if d > 0 else -1
+        if sign == 0:
+            sign = s
+        if s != sign:
+            break
+        k += 1
+    return ("up" if sign > 0 else "down" if sign < 0 else None), k
+
+
+def _fdmb_ema(vals, span=FDMB_EMA_SPAN):
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    a, e = 2.0 / (span + 1.0), vals[0]
+    for v in vals[1:]:
+        e = a * v + (1 - a) * e
+    return float(e)
+
+
+def _fdmb_snapshot(df, spot, expiry):
+    """Compute the current synthetic-forward bias + 25Δ RR with the noise controls above,
+    compare with the previous snapshot (persisted in fdm_bias_state.json) and store this one.
+    Called once per real data fetch. Never raises."""
+    try:
+        if df is None or df.empty or not spot:
+            return None
+        r = RISK_FREE_RATE
+        T = _fdmb_T(expiry)
+        growth = float(np.exp(r * T))
+        ks = sorted(float(k) for k in df["strike"].dropna().unique())
+        atm = min(ks, key=lambda k: abs(k - spot))
+        i0 = ks.index(atm)
+        keep = set(ks[max(0, i0 - FDMB_STRIKES): i0 + FDMB_STRIKES + 1])
+
+        rows = []
+        for _, x in df[df["strike"].isin(keep)].sort_values("strike").iterrows():
+            K = float(x["strike"])
+            c, chs, cok = _fdmb_quote(x.get("call_ltp", 0), x.get("call_bid", 0), x.get("call_ask", 0))
+            p, phs, pok = _fdmb_quote(x.get("put_ltp", 0), x.get("put_bid", 0), x.get("put_ask", 0))
+            cd = abs(float(x.get("call_delta", 0) or 0)) or 0.5
+            pdl = abs(float(x.get("put_delta", 0) or 0)) or 0.5
+            c_w = abs(float(x.get("call_oi_chg", 0) or 0)) * cd
+            p_w = abs(float(x.get("put_oi_chg", 0) or 0)) * pdl
+            rec = {"K": K, "c_w": c_w, "p_w": p_w, "w": c_w + p_w, "used": False,
+                   "why": None, "F": None, "prem": None, "unc": None}
+            if not (cok and pok) or c <= 0 or p <= 0:
+                rec["why"] = "wide/no quote"
+            else:
+                F_K = K + (c - p) * growth
+                rec.update({"F": float(F_K), "prem": float(F_K - spot), "unc": float((chs + phs) * growth), "used": True})
+            rows.append(rec)
+
+        used = [rr for rr in rows if rr["used"]]
+        if len(used) >= 3:                                   # outlier trim (stale quotes)
+            Fs = np.array([rr["F"] for rr in used])
+            med = float(np.median(Fs))
+            mad = float(np.median(np.abs(Fs - med)))
+            lim = FDMB_MAD_K * max(mad * 1.4826, 0.5)
+            for rr in used:
+                if abs(rr["F"] - med) > lim:
+                    rr["used"], rr["why"] = False, "outlier (stale?)"
+        used = [rr for rr in rows if rr["used"]]
+        if not used:
+            return None
+
+        wts = [rr["w"] for rr in used]
+        wsum = sum(wts)
+        weighted = wsum > 0
+        bias = _fdmb_wmedian([rr["prem"] for rr in used], wts if weighted else [1.0] * len(used))
+        for rr in rows:
+            rr["wpct"] = (rr["w"] / wsum) if (rr["used"] and wsum > 0) else None
+        level_unc = 1.2533 * _fdmb_wmedian([rr["unc"] for rr in used], wts if weighted else [1.0] * len(used)) \
+            / np.sqrt(_fdmb_neff(wts if weighted else [1.0] * len(used)))
+
+        ivc, ivp, rr25, rr_unc = _fdmb_rr25(df, spot, T, atm)
+        now_ts = now_ist().strftime("%Y-%m-%dT%H:%M:%S")
+        cur = {"ts": now_ts, "expiry": str(expiry), "spot": float(spot), "bias": float(bias),
+               "weighted": weighted, "level_unc": float(level_unc), "rr25": rr25, "rr_unc": rr_unc,
+               "ivc25": ivc, "ivp25": ivp, "fair_carry": float(spot * (growth - 1.0)),
+               "synth_f": float(spot + bias), "n_used": len(used), "n_total": len(rows), "rows": rows}
+
+        with _fdmb_lock:
+            try:
+                with open(FDMB_STATE_FILE, "r") as f:
+                    st_ = json.load(f)
+            except Exception:
+                st_ = {}
+            prev, hist = st_.get("last"), st_.get("hist") or []
+            if prev and (prev.get("expiry") != cur["expiry"] or str(prev.get("ts", ""))[:10] != now_ts[:10]):
+                prev, hist = None, []                        # new day or new expiry → start over
+
+            # 1+2. like-for-like change over common strikes with current weights + quote noise floor
+            d_like = floor = d_raw = None
+            n_common = 0
+            if prev:
+                pmap = {pr["K"]: pr for pr in prev.get("rows", []) if pr.get("used")}
+                diffs, dw, du = [], [], []
+                for rr in used:
+                    pr = pmap.get(rr["K"])
+                    if pr is None:
+                        continue
+                    rr["d_prem"] = rr["prem"] - pr["prem"]
+                    diffs.append(rr["d_prem"]); dw.append(rr["w"] if weighted else 1.0)
+                    du.append(float(np.sqrt(rr["unc"] ** 2 + (pr.get("unc") or 0) ** 2)))
+                n_common = len(diffs)
+                if diffs:
+                    d_like = _fdmb_wmedian(diffs, dw)
+                    floor = 1.2533 * _fdmb_wmedian(du, dw) / np.sqrt(_fdmb_neff(dw))
+                if prev.get("bias") is not None:
+                    d_raw = cur["bias"] - prev["bias"]
+            d_rr = (rr25 - prev["rr25"]) if (prev and rr25 is not None and prev.get("rr25") is not None) else None
+            rr_floor = (float(np.sqrt((rr_unc or 0) ** 2 + (prev.get("rr_unc") or 0) ** 2))
+                        if (prev and d_rr is not None) else None)
+
+            hist = (hist + [{"ts": now_ts, "d": d_like, "fl": floor, "drr": d_rr, "flrr": rr_floor}])[-FDMB_HIST_KEEP:]
+            b_dir, b_n = _fdmb_confirm(hist, "d", "fl")
+            r_dir, r_n = _fdmb_confirm(hist, "drr", "flrr")
+            cur.update({"prev_ts": prev.get("ts") if prev else None, "d_like": d_like, "floor": floor,
+                        "d_raw": d_raw, "n_common": n_common, "d_rr25": d_rr, "rr_floor": rr_floor,
+                        "ema_d": _fdmb_ema([h.get("d") for h in hist][-FDMB_EMA_SPAN * 2:]),
+                        "ema_drr": _fdmb_ema([h.get("drr") for h in hist][-FDMB_EMA_SPAN * 2:]),
+                        "b_dir": b_dir, "b_n": b_n, "r_dir": r_dir, "r_n": r_n})
+            tmp = FDMB_STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(_v27_json_clean({"last": cur, "hist": hist}), f, allow_nan=False)
+            os.replace(tmp, FDMB_STATE_FILE)
+        return _v27_json_clean(cur)
+    except Exception as _e:
+        try:
+            print(f"[FDM-bias] skipped: {_e}", flush=True)
+        except Exception:
+            pass
+        return None
+
+
+def _fdmb_html(fb):
+    """Synthetic-forward bias tile + 25Δ RR tile + strike ladder, as one HTML string."""
+    if not fb:
+        return ('<div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;padding:10px 14px;'
+                'margin-top:12px;font-size:12px;color:#6B7280;">Synthetic-forward bias &amp; 25Δ RR — waiting for '
+                'the first option-chain snapshot with clean two-sided quotes.</div>')
+    G, R_, M, A = "#059669", "#DC2626", "#6B7280", "#D97706"
+    f = lambda v, fmt: "—" if v is None else fmt.format(v)
+    prev_hm = str(fb.get("prev_ts") or "")[11:16]
+
+    def _status(d, floor, dirn, n, up_txt, dn_txt):
+        """(colour, headline, detail) from the like-for-like change, its noise floor and confirmation."""
+        if d is None:
+            return M, "No previous snapshot yet", "direction appears from the second snapshot"
+        fl = floor or 0.0
+        if dirn and n >= FDMB_CONFIRM_N:
+            col, word = (G, "RISING") if dirn == "up" else (R_, "FALLING")
+            return col, f"{'▲' if dirn == 'up' else '▼'} {word} · confirmed ({n} snapshots)", \
+                up_txt if dirn == "up" else dn_txt
+        if abs(d) <= fl:
+            return M, "≈ within quote noise", f"Δ {d:+.2f} vs noise ±{fl:.2f}"
+        k = n if dirn else 1
+        return A, f"{'▲' if d > 0 else '▼'} {'rising' if d > 0 else 'falling'} — awaiting confirmation ({k}/{FDMB_CONFIRM_N})", \
+            up_txt if d > 0 else dn_txt
+
+    bc, bh, bd = _status(fb.get("d_like"), fb.get("floor"), fb.get("b_dir"), fb.get("b_n", 0),
+                         "call buyers / put sellers gaining (bullish)", "put buyers / call sellers gaining (bearish)")
+    rc, rh, rd = _status(fb.get("d_rr25"), fb.get("rr_floor"), fb.get("r_dir"), fb.get("r_n", 0),
+                         "put skew easing / calls bid (bullish)", "put skew steepening (bearish)")
+    lab = "font-size:10.5px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.04em;"
+    small = f"font-size:11px;color:{M};margin-top:3px;"
+    tile = ("flex:1 1 300px;background:#fff;border:1px solid #E5E7EB;border-top:4px solid {c};"
+            "border-radius:10px;padding:10px 14px;")
+    t1 = (f'<div style="{tile.format(c=bc)}"><div style="{lab}">Synthetic forward − spot · OI-weighted median</div>'
+          f'<div style="font-size:22px;font-weight:800;color:#111;font-family:monospace;">{f(fb.get("bias"), "{:+.2f}")} pts'
+          f'<span style="font-size:12px;color:{M};font-weight:600;"> ±{f(fb.get("level_unc"), "{:.2f}")}</span></div>'
+          f'<div style="font-size:13px;font-weight:800;color:{bc};">{bh}</div>'
+          f'<div style="font-size:12px;font-weight:600;color:{bc};">{bd}</div>'
+          f'<div style="{small}">Like-for-like Δ {f(fb.get("d_like"), "{:+.2f}")} (noise ±{f(fb.get("floor"), "{:.2f}")}, '
+          f'{fb.get("n_common", 0)} common strikes) · 3-snap EMA Δ {f(fb.get("ema_d"), "{:+.2f}")} · '
+          f'raw Δ {f(fb.get("d_raw"), "{:+.2f}")} vs {prev_hm or "—"}</div>'
+          f'<div style="{small}">Synthetic F {f(fb.get("synth_f"), "{:,.1f}")} · spot {f(fb.get("spot"), "{:,.1f}")} · '
+          f'fair carry ≈ {f(fb.get("fair_carry"), "{:+.1f}")} pts · {fb.get("n_used")}/{fb.get("n_total")} strikes clean'
+          + ("" if fb.get("weighted") else " · <b>unweighted</b> (no OI change yet)") + '</div></div>')
+    t2 = (f'<div style="{tile.format(c=rc)}"><div style="{lab}">25Δ risk reversal skew · from mid prices</div>'
+          f'<div style="font-size:22px;font-weight:800;color:#111;font-family:monospace;">{f(fb.get("rr25"), "{:+.2f}")} vol</div>'
+          f'<div style="font-size:13px;font-weight:800;color:{rc};">{rh}</div>'
+          f'<div style="font-size:12px;font-weight:600;color:{rc};">{rd}</div>'
+          f'<div style="{small}">Δ {f(fb.get("d_rr25"), "{:+.2f}")} (noise ±{f(fb.get("rr_floor"), "{:.2f}")}) · '
+          f'3-snap EMA Δ {f(fb.get("ema_drr"), "{:+.2f}")}</div>'
+          f'<div style="{small}">25Δ call IV {f(fb.get("ivc25"), "{:.2f}")}% · 25Δ put IV {f(fb.get("ivp25"), "{:.2f}")}% · '
+          f'negative = puts dearer</div></div>')
+
+    th = 'style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;padding:4px 6px;text-align:right;"'
+    hdr = "".join(f"<th {th}>{h}</th>" for h in ("Strike", "Synthetic F", "F − spot", "± quote", "Δ vs prev",
+                                                  "Call ΔOI×Δ", "Put ΔOI×Δ", "Weight", "Status"))
+    spot = fb.get("spot") or 0
+    body = []
+    for rr in fb.get("rows", []):
+        near = abs(rr["K"] - spot) <= 25
+        bg = "background:#EEF2FF;" if near else ""
+        d, u = rr.get("d_prem"), rr.get("unc")
+        dc = M if (d is None or (u is not None and abs(d) <= u)) else (G if d > 0 else R_)
+        stt = "used" if rr.get("used") else (rr.get("why") or "excluded")
+        sc = M if rr.get("used") else A
+        op = "" if rr.get("used") else "opacity:.6;"
+        body.append(
+            f'<tr style="{bg}{op}"><td style="font-weight:800;">{rr["K"]:,.0f}</td>'
+            f'<td>{f(rr.get("F"), "{:,.1f}")}</td><td>{f(rr.get("prem"), "{:+.1f}")}</td><td>{f(u, "{:.1f}")}</td>'
+            f'<td style="color:{dc};font-weight:700;">{f(d, "{:+.2f}")}</td>'
+            f'<td>{rr["c_w"]:,.0f}</td><td>{rr["p_w"]:,.0f}</td>'
+            f'<td>{f(rr.get("wpct"), "{:.0%}")}</td><td style="color:{sc};">{stt}</td></tr>')
+    table = ('<div style="overflow-x:auto;margin-top:8px;"><table style="width:100%;border-collapse:collapse;'
+             'font-size:12px;font-family:monospace;text-align:right;background:#fff;" cellpadding="3">'
+             f'<tr>{hdr}</tr>' + "".join(body) + '</table></div>')
+    note = ('<div style="font-size:10.5px;color:#6B7280;margin-top:5px;">'
+            'Synthetic F = K + (call mid − put mid)·e<sup>rT</sup> · weight = |call ΔOI × Δ| + |put ΔOI × Δ| (OI change vs previous day) · '
+            'Bias = weighted MEDIAN of (F − spot) over clean strikes (both legs two-sided, spread ≤ 5% of mid; '
+            '&gt; 3 MAD from the median F dropped as stale) · Direction: like-for-like change over strikes present in both snapshots '
+            'with the same weights, compared with a noise floor built from the bid-ask spreads; confirmed after 3 consecutive '
+            'snapshots beyond the floor · Δ cells are grey when inside that strike\'s own quote noise.</div>')
+    return ('<div style="margin-top:12px;">'
+            '<div style="font-size:12px;font-weight:700;color:#5C35CC;margin-bottom:6px;">'
+            'SYNTHETIC-FORWARD BIAS LADDER · 25Δ RR SKEW (ATM ±5) · noise-filtered</div>'
+            f'<div style="display:flex;flex-wrap:wrap;gap:10px;">{t1}{t2}</div>' + table + note + '</div>')
+# ══ END v27 synthetic-forward bias ════════════════════════════════════════════
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v27 — ONE SHARED HISTORY (independent of number / frequency of visitors)
+#   • A history tick is recorded ONCE per real Dhan fetch, server-side, keyed by
+#     the fetch id (_fetch_ts).  Visitor reruns call the same idempotent function,
+#     so N visitors (or zero visitors) → exactly one tick per fetch.
+#   • Rolling file nifty_history.json keeps the last 500 ticks exactly as before
+#     (engines see the same window), and every tick is ALSO appended to a
+#     permanent daily archive:  nifty_history_archive/YYYY-MM-DD.jsonl
+# ═══════════════════════════════════════════════════════════════════════════════
+_V27_ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_history_archive")
+
+
+def _v27_record_history_tick(payload, fetch_ts):
+    """Append one history tick for this fetch id (idempotent, never raises)."""
+    try:
+        if not payload or not fetch_ts:
+            return
+        m = payload["metrics"]
+        _recs = payload.get("df_band") or []
+        _cot = sum(r.get("call_oi", 0) for r in _recs)      # same formula as the visitor path
+        _pot = sum(r.get("put_oi", 0) for r in _recs)
+        entry = build_history_entry(
+            m, payload["spot"], _cot, _pot, payload["expiry"],
+            synth_excess=payload.get("synth_excess"),
+            basis_gap=payload.get("basis_gap"),
+            traded_basis=payload.get("traded_basis"),
+        )
+        entry["_fetch_ts"] = fetch_ts
+        with _V27_HIST_LOCK:
+            hist = _load_history()
+            if any(h.get("_fetch_ts") == fetch_ts for h in hist[-20:]):
+                return                      # already recorded by another caller
+            hist.append(entry)
+            _save_history(hist[-500:])
+            try:
+                os.makedirs(_V27_ARCHIVE_DIR, exist_ok=True)
+                _day = str(entry.get("ts", ""))[:10] or date.today().isoformat()
+                with open(os.path.join(_V27_ARCHIVE_DIR, f"{_day}.jsonl"), "a") as _af:
+                    _af.write(json.dumps(_v27_json_clean(entry), allow_nan=False) + "\n")
+            except Exception as _ae:
+                print(f"[v27] archive write skipped: {_ae}", flush=True)
+    except Exception as _e:
+        print(f"[v27] history tick skipped: {_e}", flush=True)
+
+
+_V27_SKEW_ANCHOR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_skew_anchor.json")
+
+
+def _v27_daily_skew_anchor(current_value):
+    """v27: S4 opening skew anchor fixed ONCE PER TRADING DAY for every visitor
+    (was per browser session, so a visitor joining at 11:00 anchored at 11:00)."""
+    today = date.today().isoformat()
+    with _SH["skew_lock"]:
+        try:
+            with open(_V27_SKEW_ANCHOR_FILE, "r") as _f:
+                _a = json.load(_f)
+            if _a.get("date") == today and isinstance(_a.get("value"), (int, float)):
+                return float(_a["value"])
+        except Exception:
+            pass
+        try:
+            _atomic_json_write(_V27_SKEW_ANCHOR_FILE, {"date": today, "value": float(current_value)})
+        except Exception:
+            pass
+        return float(current_value)
+
+
+@st.cache_resource(show_spinner=False)
+def _v27_start_background_fetcher():
+    """v27: one daemon thread per server process (same design as the Dash edition).
+    During market hours it keeps the shared cache — and therefore the shared
+    history — ticking even when nobody has the dashboard open."""
+    import logging as _lg
+    for _ln in ("streamlit.runtime.scriptrunner_utils.script_run_context",
+                "streamlit.runtime.scriptrunner.script_run_context",
+                "streamlit.runtime.caching.cache_data_api"):
+        _lg.getLogger(_ln).setLevel(_lg.ERROR)
+
+    def _loop():
+        print("[v27 BgFetch] background fetcher started (30s interval, market hours).", flush=True)
+        while True:
+            try:
+                if is_market_hours():
+                    _sel = _load_owner_settings().get("selected_expiry")
+                    get_server_data(_sel, _from_bg=True)
+            except Exception as _bfe:
+                print(f"[v27 BgFetch] error: {_bfe}", flush=True)
+            time.sleep(30)
+
+    _t = threading.Thread(target=_loop, daemon=True, name="v27-BgFetcher")
+    _t.start()
+    return _t
+
+
+_v27_start_background_fetcher()
+
+
 # ── Session state initialisation (loads server-side data for every new visitor) ─
-if "history" not in st.session_state:
-    st.session_state.history = _load_history()          # seed from disk on new session
+# v27: always read the single shared history from disk (was: seeded once per session)
+st.session_state.history = _load_history()
 
 if "bias_history" not in st.session_state:
     _bh_disk = _load_bias_history()
@@ -4541,8 +4879,8 @@ if "bias_history" not in st.session_state:
         float(_bh_disk[-1].get("_ts_unix", 0)) if _bh_disk else 0.0
     )
 
-if "iv_smile_history" not in st.session_state:
-    st.session_state.iv_smile_history = _load_smile_history()
+# v27: always read the shared smile history from disk
+st.session_state.iv_smile_history = _load_smile_history()
 
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = 0.0
@@ -4776,7 +5114,20 @@ else:
 
 # CI #10 fix: render the data-status banner HERE (after fetch) so it can inspect
 # `data_source` and distinguish a real API ERROR from genuine DEMO MODE.
+# v27 fix: on a cold start another thread (background fetcher or another visitor) may
+# already be fetching — wait for its result instead of failing immediately.
+if payload is None:
+    with st.spinner("Waiting for the first NIFTY option-chain fetch…"):
+        for _v27_w in range(80):          # up to ~40 s
+            time.sleep(0.5)
+            payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
+            if payload is not None:
+                break
 _data_status_banner(USE_DHAN, mh, USE_DEMO_MODE, _effective_refresh, data_source=data_source)
+# v27: the payload object is now shared by all visitors — work on a private copy so
+# no rerun can mutate the shared cache.
+if payload is not None:
+    payload = _v27_copy.deepcopy(payload)
 
 if payload is None:
     st.error("❌ Could not fetch option chain data. Please check your API credentials or try again.")
@@ -4808,9 +5159,10 @@ hist_entry    = build_history_entry(
 # produce exactly ONE history entry — not one per visitor per refresh.
 hist_entry["_fetch_ts"] = _payload_fetch_ts
 # Only append if this is a genuinely new Dhan data fetch (fetch_ts changed)
-if not history or history[-1].get("_fetch_ts", 0) != _payload_fetch_ts:
-    history.append(hist_entry)
-    _save_history(history)   # persist new tick to disk (rolling ~500-tick window)
+# v27: ONE shared history — idempotent server-side recorder (dedup on fetch id),
+# then re-read the shared file so every visitor sees the identical history.
+_v27_record_history_tick(payload, _payload_fetch_ts)
+history = _load_history()
 history = history[-500:]
 st.session_state.history = history
 
@@ -4887,8 +5239,8 @@ _s34_breakdown = _s34_bias.get("signal_breakdown", {})
 # This naturally resets at the start of each new session (Streamlit restarts) and
 # requires zero stored history beyond the current session.
 _current_norm_skew = _s34_bias.get("norm_skew", 30.0)
-if "opening_norm_skew" not in st.session_state or st.session_state.opening_norm_skew is None:
-    st.session_state.opening_norm_skew = _current_norm_skew
+# v27: anchor fixed once per trading day for all visitors (was once per browser session)
+st.session_state.opening_norm_skew = _v27_daily_skew_anchor(_current_norm_skew)
 _delta_skew = _current_norm_skew - st.session_state.opening_norm_skew
 # 15 pct-point intraday change → full ±3 pts; sign: rising skew = bearish (negative)
 _s4_intra = max(-3.0, min(3.0, -(_delta_skew / 15.0) * 3.0))
@@ -4959,13 +5311,14 @@ _s34_breakdown = _s34_bias.get("signal_breakdown", {})
 # Module C: India VIX
 _vix_raw           = fetch_india_vix_ltp()
 # Maintain a lightweight intraday VIX history in session_state for spike detection
-if "vix_history" not in st.session_state:
-    st.session_state.vix_history = []
+# v27: one VIX history shared by all visitors of this server process
+_v27_vix = _SH["vix_history"]
 if _vix_raw > 0:
-    if (not st.session_state.vix_history or
-            st.session_state.vix_history[-1] != _vix_raw):
-        st.session_state.vix_history.append(_vix_raw)
-        st.session_state.vix_history = st.session_state.vix_history[-30:]
+    with _SH["vix_lock"]:
+        if not _v27_vix or _v27_vix[-1] != _vix_raw:
+            _v27_vix.append(_vix_raw)
+            del _v27_vix[:-30]
+st.session_state.vix_history = list(_v27_vix)
 _vix_data          = classify_vix_signal(_vix_raw, st.session_state.vix_history)
 
 # Aggregate into Enhanced Price Bias
@@ -5143,31 +5496,33 @@ _now_bias = time.time()
 # Dedup on server fetch timestamp, not wall-clock time.
 # Reading from disk catches entries written by OTHER visitor sessions, preventing
 # duplicate bias points from multiple simultaneous visitors.
-_bh_disk_cur = _load_bias_history()
-_last_bh_fetch_ts = float(_bh_disk_cur[-1].get("_fetch_ts", 0)) if _bh_disk_cur else 0.0
+# v27: read-dedup-append-write is atomic across visitors
+with _SH["bias_lock"]:
+    _bh_disk_cur = _load_bias_history()
+    _last_bh_fetch_ts = float(_bh_disk_cur[-1].get("_fetch_ts", 0)) if _bh_disk_cur else 0.0
 
-if _payload_fetch_ts != _last_bh_fetch_ts:
-    # Start from the freshest disk state so no visitor session goes out of sync
-    _bh_tmp = _bh_disk_cur
-    _bh_tmp.append({
-        "ts":        datetime.fromtimestamp(_payload_fetch_ts, tz=IST).strftime("%H:%M"),
-        "_ts_unix":  _payload_fetch_ts,
-        "_fetch_ts": _payload_fetch_ts,   # server fetch id — used for cross-session dedup
-        "spot":      spot,
-        "score":     float(_s34_score),
-        "direction": _s34_bias["direction"],
-        "s1":        _s34_breakdown.get("S1 Net OI",     0.0),
-        "s2":        _s34_breakdown.get("S2 Momentum",   0.0),
-        "s3":        _s34_breakdown.get("S3 Key Levels", 0.0),
-        "s4":        _s34_breakdown.get("S4 IV Skew",    0.0),
-        "s5":        _s34_breakdown.get("S5 Term Str",   0.0),
-        "s6":        _s34_breakdown.get("S6 Velocity",   0.0),
-        # Fix #4: store norm_skew so adaptive NORMAL_SKEW_BASELINE can self-calibrate
-        "norm_skew": float(_s34_bias.get("norm_skew", 30.0)),
-    })
-    st.session_state.bias_history = _bh_tmp[-60:]   # ~5 hrs at data-refresh cadence
-    st.session_state.bias_history_last_ts = _now_bias
-    _save_bias_history(st.session_state.bias_history)   # persist for mid-session joiners
+    if _payload_fetch_ts != _last_bh_fetch_ts:
+        # Start from the freshest disk state so no visitor session goes out of sync
+        _bh_tmp = _bh_disk_cur
+        _bh_tmp.append({
+            "ts":        datetime.fromtimestamp(_payload_fetch_ts, tz=IST).strftime("%H:%M"),
+            "_ts_unix":  _payload_fetch_ts,
+            "_fetch_ts": _payload_fetch_ts,   # server fetch id — used for cross-session dedup
+            "spot":      spot,
+            "score":     float(_s34_score),
+            "direction": _s34_bias["direction"],
+            "s1":        _s34_breakdown.get("S1 Net OI",     0.0),
+            "s2":        _s34_breakdown.get("S2 Momentum",   0.0),
+            "s3":        _s34_breakdown.get("S3 Key Levels", 0.0),
+            "s4":        _s34_breakdown.get("S4 IV Skew",    0.0),
+            "s5":        _s34_breakdown.get("S5 Term Str",   0.0),
+            "s6":        _s34_breakdown.get("S6 Velocity",   0.0),
+            # Fix #4: store norm_skew so adaptive NORMAL_SKEW_BASELINE can self-calibrate
+            "norm_skew": float(_s34_bias.get("norm_skew", 30.0)),
+        })
+        st.session_state.bias_history = _bh_tmp[-60:]   # ~5 hrs at data-refresh cadence
+        st.session_state.bias_history_last_ts = _now_bias
+        _save_bias_history(st.session_state.bias_history)   # persist for mid-session joiners
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -5482,6 +5837,7 @@ def _render_enhanced_bias_panel(eb, vwap_or, ts, vix, cd, spot_px, metrics):
 # WITHOUT moving any code: every section still computes exactly where it always
 # did — it just renders into its reserved slot. Zero calculation changes.
 # ═══════════════════════════════════════════════════════════════════════════════
+_v27_grm_for_bottom = None   # v27: set by the Final Decision Matrix; 9-state grid renders at the bottom
 _slot_summary = st.container()   # Shantanu's Final Decision Matrix — very top of dashboard
 _slot_sv    = st.container()   # v10: Shantanu's View — renders at the very top of the dashboard
 _slot_s3    = st.container()   # Section 3 — Key Price Levels
@@ -7025,7 +7381,7 @@ with _ls_col3:
 
 _ENDM_HIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "endm_verdict_history_streamlit.json")
-_ENDM_HIST_FLOCK = threading.Lock()
+_ENDM_HIST_FLOCK = _SH["endm_lock"]   # v27: shared across reruns/visitors
 
 
 def _endm_hist_file_load():
@@ -7935,9 +8291,9 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
 
         # ── IV Smile Live Interpretation (full-width, powered by session history) ─
         # Maintain intraday rolling history for trend-aware classification
-        if "iv_smile_history" not in st.session_state:
-            st.session_state["iv_smile_history"] = []
-        _iv_hist = st.session_state["iv_smile_history"]
+        # v27: shared smile history — always start from the file on disk
+        _iv_hist = _load_smile_history()
+        st.session_state["iv_smile_history"] = _iv_hist
 
         # Compute OTM wing excesses for this tick and append to session state
         _iv_atm      = safe_num(m.get("atm", spot))
@@ -7960,11 +8316,14 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                 "skew_asymmetry":  _iv_pwe - _iv_cwe,
             }
             # Deduplicate same-timestamp reruns; keep rolling 20-tick window (~5 hrs)
-            if not _iv_hist or _iv_hist[-1]["ts"] != _iv_tick["ts"]:
-                _iv_hist.append(_iv_tick)
-                if len(_iv_hist) > 20:
-                    _iv_hist.pop(0)
-                _save_smile_history(_iv_hist)   # persist for mid-session joiners
+            with _SH["smile_lock"]:   # v27: atomic re-read + dedup + append across visitors
+                _iv_hist = _load_smile_history()
+                if not any(h.get("ts") == _iv_tick["ts"] for h in _iv_hist[-5:]):
+                    _iv_hist.append(_iv_tick)
+                    if len(_iv_hist) > 20:
+                        _iv_hist.pop(0)
+                    _save_smile_history(_iv_hist)   # persist for mid-session joiners
+                st.session_state["iv_smile_history"] = _iv_hist
 
         _iv_sc = classify_iv_smile_scenario(df_band, m, spot, _iv_hist)
         if _iv_sc:
@@ -8207,46 +8566,16 @@ with _slot_summary:
             history=history, momentum=m.get("momentum"),
             vix_change=(_grm_vix.get("vix_change") if _grm_vix.get("available") else None),
             above_vwap=_grm_vwap.get("above_vwap"), expiry=expiry, now=now_ist())
-        # v26: top shows the LIVE CELL only; the full 9-cell grid renders at the
-        # bottom of the dashboard (same _grm object, see "v26 BOTTOM" below).
-        st.markdown(render_gamma_regime_matrix_html(_grm, part="verdict"), unsafe_allow_html=True)
+        st.markdown(render_gamma_regime_matrix_html(_grm, part="live"), unsafe_allow_html=True)   # v27: current state only
+        _v27_grm_for_bottom = _grm                                                               # v27: grid at bottom
     except Exception as _grm_err:
-        _grm = None
         st.info(f"GEX × Gamma Flip Regime Matrix — collecting data ({_grm_err}).")
 
-    # ── v26: Δ-Weighted Ratio R & Normalised Score S — INDEPENDENT ADD-ON ───
-    # Reads only payload["df_band"] (±10 structural band) and spot. Writes
-    # nothing; no verdict or state file reads it. Failure is contained here.
+    # ── v27: Synthetic-forward bias ladder + 25Δ RR skew (inside the Final Decision Matrix) ──
     try:
-        _dwrs_figs = build_dw_ratio_score_figs(payload["df_band"], spot)
-        if _dwrs_figs:
-            st.markdown(
-                '<div style="font-size:12px;font-weight:700;color:#6B7280;'
-                'text-transform:uppercase;margin:14px 0 4px;">'
-                'Δ-Weighted Strike-wise Sentiment · Ratio R (1A/1B) &amp; Normalised Score S (2A/2B)</div>',
-                unsafe_allow_html=True)
-            _dw_r1c1, _dw_r1c2 = st.columns(2)
-            with _dw_r1c1:
-                st.plotly_chart(_dwrs_figs["1A"], width='stretch', config={"displayModeBar": False},
-                                key="dwrs_1A")
-            with _dw_r1c2:
-                st.plotly_chart(_dwrs_figs["1B"], width='stretch', config={"displayModeBar": False},
-                                key="dwrs_1B")
-            _dw_r2c1, _dw_r2c2 = st.columns(2)
-            with _dw_r2c1:
-                st.plotly_chart(_dwrs_figs["2A"], width='stretch', config={"displayModeBar": False},
-                                key="dwrs_2A")
-            with _dw_r2c2:
-                st.plotly_chart(_dwrs_figs["2B"], width='stretch', config={"displayModeBar": False},
-                                key="dwrs_2B")
-            st.caption("a = CE leg × |Δc| · b = PE leg × |Δp| · R = a/b · S = (a−b)/(a+b); "
-                       "2B uses |a|+|b| so S stays in −1…+1 when a side is unwinding. "
-                       "Red = call side dominant · Green = put side dominant · Grey = illiquid (masked). "
-                       "OI cannot show who opened the position — colours assume writers dominate.")
-        else:
-            st.info("Δ-Weighted R & S charts — waiting for band data.")
-    except Exception as _dwrs_err:
-        st.info(f"Δ-Weighted R & S charts — collecting data ({_dwrs_err}).")
+        st.markdown(_fdmb_html(payload.get("fdm_bias")), unsafe_allow_html=True)
+    except Exception as _fdmb_e:
+        st.caption(f"Synthetic-forward bias unavailable this tick ({_fdmb_e})")
 
     st.markdown(
         '<div style="font-size:12px;font-weight:700;color:#6B7280;'
@@ -8907,18 +9236,13 @@ if not df_band_disp.empty:
     }), width='stretch', hide_index=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# v26 BOTTOM: GEX × Gamma Flip Regime Matrix — full 9-cell reference grid
-# (moved from the top panel; same _grm object, live cell still highlighted ◉)
-# ─────────────────────────────────────────────────────────────────────────────
-try:
-    _grm_bottom = globals().get("_grm")
-    if _grm_bottom and _grm_bottom.get("available"):
-        st.markdown('<div class="section-header"> GEX × Gamma Flip Regime Matrix  9-Cell Reference · Explanation</div>',
-                    unsafe_allow_html=True)
-        st.markdown(render_gamma_regime_matrix_html(_grm_bottom, part="grid"), unsafe_allow_html=True)
-except Exception as _grm_b_err:
-    st.info(f"GEX × Gamma Flip Regime Matrix grid — collecting data ({_grm_b_err}).")
+# v27: GEX × Gamma Flip 9-state reference grid — bottom of the dashboard
+if _v27_grm_for_bottom and _v27_grm_for_bottom.get("available"):
+    try:
+        st.markdown('<div class="section-header">📐 GEX × Gamma Flip Regime Matrix — 9 indicative states (reference)</div>', unsafe_allow_html=True)
+        st.markdown(render_gamma_regime_matrix_html(_v27_grm_for_bottom, part="grid"), unsafe_allow_html=True)
+    except Exception as _v27_ge:
+        st.caption(f"GEX × Gamma Flip grid unavailable ({_v27_ge})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
