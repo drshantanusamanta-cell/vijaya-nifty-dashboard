@@ -31,6 +31,9 @@
 ║  v29 — 10-Oct-2026: Dhan API v2.5 — next-expiry chain refreshed   ║
 ║        every 60 s via ONE shared de-duplicated fetch (auto 5-min  ║
 ║        fall-back on rate-limit) · average_price → ladder column   ║
+║  v30 — 10-Oct-2026: REMOVED Shantanu's View (Buyer/Seller Matrix) ║
+║        and Combined Flow × Premium Read — no other section used   ║
+║        them (their helper functions remain, now unused)           ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -7830,122 +7833,7 @@ def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=N
 # Data sources: Section 4 (df_band), Section 2 (momentum), Greek Risk Framework
 # ═══════════════════════════════════════════════════════════════════
 
-with _slot_sv:   # v10: display Shantanu's View just below Section 4
-    st.markdown(
-        '<div style="font-size:20px;font-weight:900;color:#7C3AED;letter-spacing:0.5px;'    'padding:14px 0 6px 0;border-bottom:2px solid #7C3AED;margin-bottom:12px;">'    '🎯 Shantanu\'s View — Buyer / Seller Matrix (Raw Sentiment × Δ-Wtd OI Change Momentum)</div>',
-        unsafe_allow_html=True
-    )
-
-    if df_band_records:
-        # ── Enhanced NDM v10 — per-strike Buyer/Seller Matrix ─────────────────────
-        st.caption(
-            "BIAS comes from the Raw Sentiment per strike: >1.2 = Call buyers & Put sellers → BULLISH; "
-            "<0.7 = Put buyers & Call sellers → BEARISH (0.7-1.2 is a NEUTRAL zone — no longer treated as bearish). "
-            "MOMENTUM comes from the Δ-weighted OI change per strike: "
-            "with EVR>1.2, positive NDM = Call BUYERS stronger → strong upside; negative NDM = Put SELLERS stronger → "
-            "bullish but weak. Exactly opposite for EVR<0.7. Strong opposite sellers on BOTH sides of spot → "
-            "range-bound, pinning the ATM."
-        )
-
-        if "_endm_hist_store" not in st.session_state:
-            st.session_state["_endm_hist_store"] = {"date": None, "rows": []}
-        _endm = _compute_enhanced_ndm(df_band_records, m, spot, st.session_state["_endm_hist_store"],
-                                       gv_levels=_gv_levels_snapshot)
-        _endm_df      = _endm["df"]
-        _endm_total_e = _endm["enhanced_total"]
-        _endm_total_r = _endm["raw_total"]
-        _endm_sc      = _endm["sc"]
-        _endm_sbg     = _endm["sbg"]
-        _endm_rc = "#059669" if _endm_total_r > 0 else "#DC2626" if _endm_total_r < 0 else "#6B7280"
-        _endm_ec = "#059669" if _endm_total_e > 0 else "#DC2626" if _endm_total_e < 0 else "#6B7280"
-
-        # Suppress note during first 15 min of session
-        _now_ist_sv = now_ist()
-        _endm_suppress = (_now_ist_sv.hour == 9 and _now_ist_sv.minute < 30)
-        if _endm_suppress:
-            st.warning(
-                "⚠️ Enhanced NDM suppressed during 09:15–09:30: gap-open premium spikes make "
-                "buyer/seller classification unreliable. Signal activates after 09:30."
-            )
-        else:
-            _rsn_html = "".join(
-                f'<div style="font-size:11px;color:#374151;line-height:1.55;">&bull; {_r}</div>'
-                for _r in _endm.get("reason", [])
-            )
-            _ec1, _ec2, _ec3 = st.columns([1, 1, 2])
-            with _ec1:
-                st.markdown(f"""
-            <div style="background:#F8F7FF;border:1.5px solid #7C3AED;border-radius:10px;
-                        padding:14px 16px;text-align:center;">
-              <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
-                          letter-spacing:0.5px;margin-bottom:4px;">Enhanced NDM</div>
-              <div style="font-size:24px;font-weight:900;color:{_endm_ec};">{_endm_total_e:+,}</div>
-              <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Per-strike Buyer/Seller Adjusted</div>
-            </div>""", unsafe_allow_html=True)
-            with _ec2:
-                st.markdown(f"""
-            <div style="background:#F9FAFB;border:1.5px solid #E5E7EB;border-radius:10px;
-                        padding:14px 16px;text-align:center;">
-              <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
-                          letter-spacing:0.5px;margin-bottom:4px;">Raw NDM</div>
-              <div style="font-size:24px;font-weight:900;color:{_endm_rc};">{_endm_total_r:+,}</div>
-              <div style="font-size:10px;color:#9CA3AF;margin-top:3px;">Standard Formula</div>
-            </div>""", unsafe_allow_html=True)
-            with _ec3:
-                st.markdown(f"""
-            <div style="background:{_endm_sbg};border:1.5px solid {_endm_sc};border-radius:10px;
-                        padding:14px 16px;">
-              <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;
-                          letter-spacing:0.5px;margin-bottom:6px;">Final Verdict — Matrix (avg EVR {_endm['evr_avg']:.3f})</div>
-              <div style="font-size:13px;font-weight:800;color:{_endm_sc};line-height:1.5;">
-                {_endm['verdict']}</div>
-              <div style="margin-top:6px;">{_rsn_html}</div>
-            </div>""", unsafe_allow_html=True)
-
-            # 15-minute Final Verdict history
-            if _endm.get("history"):
-                st.markdown(
-                    '<div style="font-size:12px;font-weight:800;color:#5C35CC;margin:12px 0 6px 0;">'
-                    '🕒 Final Verdict History — 15-min log (today)</div>', unsafe_allow_html=True)
-                st.dataframe(pd.DataFrame(_endm["history"]), use_container_width=True, hide_index=True)
-
-            with st.expander("📊 Strike-by-Strike Buyer/Seller Matrix Breakdown", expanded=False):
-                st.caption(
-                    f"Avg Raw Sentiment this tick: **{_endm['evr_avg']:.3f}** → bias **{_endm['bias']}**. "
-                    "Per strike: EVR>1.2 = bullish bias · EVR<0.7 = bearish bias · 0.7-1.2 = neutral (no dominant "
-                    "aggressor). The NDM (Δ×ΔOI) sign then decides "
-                    "WHO is stronger at that strike — buyers (strong momentum) or sellers (weak momentum)."
-                )
-
-                def _endm_style(val):
-                    if isinstance(val, (int, float)):
-                        if val > 0:
-                            return "color:#059669;font-weight:700"
-                        elif val < 0:
-                            return "color:#DC2626;font-weight:700"
-                    return ""
-
-                def _endm_read_style(val):
-                    if isinstance(val, str):
-                        if "BULLISH" in val:
-                            return "color:#059669;font-weight:700"
-                        if "BEARISH" in val:
-                            return "color:#DC2626;font-weight:700"
-                    return ""
-
-                st.dataframe(
-                    _endm_df.rename(columns={"NDM": "NDM (Δ×ΔOI)", "EVR": "Raw Sentiment"})
-                            .style.map(_endm_style, subset=["Enhanced NDM", "NDM (Δ×ΔOI)"])
-                            .map(_endm_read_style, subset=["Reading"]),
-                    use_container_width=True,
-                    hide_index=True
-                )
-        # ── End Enhanced NDM ──────────────────────────────────────────────────────
-
-    else:
-        st.info("⏳ Shantanu's View: Waiting for option chain data to initialise.")
-
-# ══ END SHANTANU'S VIEW ═══════════════════════════════════════════════
+# v30: Shantanu's View — Buyer/Seller Matrix REMOVED (fed no other section; _slot_sv stays empty)
 
 with _slot_s3:   # v8: render into top-of-dashboard slot (display order only)
     st.markdown('<div class="section-header"> Section 3  Key Price Levels</div>', unsafe_allow_html=True)
@@ -8367,74 +8255,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         except Exception as _je:
             print(f"[s4-journal] {_je}", flush=True)
 
-        # ★ v13: Combined Flow × Premium initiation read — merges each ATM
-        # strike's OI-change quadrant (WHO is building/unwinding) with the
-        # parity-adjusted EV pressure (WHO initiates: buyers paying up vs
-        # writers pressing premium). Premium pressure overrides the quadrant
-        # where they disagree. Rolling 15-tick (~15 min) history persisted
-        # to JSON exactly like the smile history. Rendered into Shantanu's View.
-        try:
-            _vsum = _wsum = 0.0
-            _sub = _ev_bd[_liq_ev_chg]
-            for _, _r in _sub.iterrows():
-                _dcx, _dpx = float(_r["call_oi_chg"]), float(_r["put_oi_chg"])
-                _evr_k = _s4_evmap.get(int(_r["strike"]))
-                if _evr_k is not None and _evr_k > 1.2:
-                    _v = 1
-                elif _evr_k is not None and _evr_k < 0.7:
-                    _v = -1
-                elif _dcx >= 0 and _dpx < 0:
-                    _v = -1
-                elif _dcx < 0 and _dpx >= 0:
-                    _v = 1
-                else:
-                    _v = 0
-                _w = (abs(_dcx) * abs(float(_r["call_delta"])) * float(_r["ev_c"]) +
-                      abs(_dpx) * abs(float(_r["put_delta"]))  * float(_r["ev_p"]))
-                _vsum += _v * _w; _wsum += _w
-            _ifrac  = _vsum / max(_wsum, 1e-9)
-            _ilabel = ("BULLISH" if _ifrac > 0.3 else
-                       ("BEARISH" if _ifrac < -0.3 else "NEUTRAL / CONTESTED"))
-            _S4I_FILE = os.path.join(_BASE_DIR, "nifty_s4_interp_history.json")
-            try:
-                with open(_S4I_FILE) as _fh:
-                    _ihist = json.load(_fh)
-            except Exception:
-                _ihist = []
-            _its = str(payload.get("ts_ist", ""))
-            if not _ihist or _ihist[-1].get("ts") != _its:
-                _ihist.append({"ts": _its, "label": _ilabel, "frac": round(_ifrac, 2)})
-                _ihist = _ihist[-15:]
-                try:
-                    _atomic_json_write(_S4I_FILE, _ihist)
-                except Exception:
-                    pass
-            _amap   = {"BULLISH": "▲", "BEARISH": "▼"}
-            _arrows = " ".join(_amap.get(e.get("label"), "•") for e in _ihist)
-            _nb = sum(1 for e in _ihist if e.get("label") == "BULLISH")
-            _ns = sum(1 for e in _ihist if e.get("label") == "BEARISH")
-            _icol = {"BULLISH": "#22C55E", "BEARISH": "#EF4444"}.get(_ilabel, "#F59E0B")
-            with _slot_sv:
-                st.markdown(
-                    f'<div style="background:#F9FAFB;border:1.5px solid {_icol};'
-                    f'border-radius:10px;padding:12px 16px;margin-top:10px;">'
-                    f'<div style="display:flex;align-items:center;flex-wrap:wrap;margin-bottom:6px;">'
-                    f'<span style="font-size:11px;font-weight:700;color:#6B7280;'
-                    f'text-transform:uppercase;margin-right:8px;">🧭 Combined Flow × Premium Read (Section 4)</span>'
-                    f'<span style="background:{_icol};color:#fff;border-radius:5px;'
-                    f'padding:2px 10px;font-size:12px;font-weight:800;">{_ilabel} · {_ifrac:+.2f}</span></div>'
-                    f'<div style="font-size:11.5px;color:#374151;margin-bottom:6px;">'
-                    f'In plain English: for every ATM strike we ask two questions — WHO is adding or '
-                    f'removing positions (the OI-change quadrant), and WHO is setting the price '
-                    f'(Shantanu&#39;s Proprietary Strike-wise Sentiment: buyers paying up, or writers pressing it down). '
-                    f'When the two disagree, premium pressure wins, because it reveals the aggressive side. '
-                    f'The verdict is the premium-weighted sum of those per-strike answers '
-                    f'(−1 fully bearish … +1 fully bullish).</div>'
-                    f'<div style="font-size:11px;color:#6B7280;font-family:monospace;">'
-                    f'Last 15 min ({len(_ihist)} ticks): {_arrows} &nbsp;·&nbsp; {_nb}▲ / {_ns}▼</div></div>',
-                    unsafe_allow_html=True)
-        except Exception as _ie:
-            print(f"[s4-interp] {_ie}", flush=True)
+        # v30: Combined Flow × Premium Read REMOVED (display-only; fed no other section)
 
         # ── IV Smile Live Interpretation (full-width, powered by session history) ─
         # Maintain intraday rolling history for trend-aware classification
