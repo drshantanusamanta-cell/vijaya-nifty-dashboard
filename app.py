@@ -25,6 +25,9 @@
 ║          noise-filtered: like-for-like Δ, quote noise floor, MAD   ║
 ║          trim, weighted median, 3-snapshot confirmation, mid IVs  ║
 ║        · October 2026 Sentiment panel REMOVED from this edition    ║
+║  v28 — 10-Oct-2026: FDM alert log (time + NIFTY spot) when bias   ║
+║        AND 25Δ RR are confirmed in the same direction, below the  ║
+║        ladder · October 2026 Sentiment panel stays removed        ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -4437,6 +4440,8 @@ FDMB_MAD_K       = 3.0    # outlier trim: |F_K − median F| > 3 MAD
 FDMB_CONFIRM_N   = 3      # consecutive snapshots needed to confirm a direction
 FDMB_EMA_SPAN    = 3      # EMA span (snapshots) for the smoothed change
 FDMB_HIST_KEEP   = 10
+FDMB_ALERT_KEEP  = 60     # v28: joint-confirmation alerts kept per day (shown newest first)
+FDMB_ALERT_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fdm_alert_archive")
 FDMB_STATE_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fdm_bias_state.json")
 _fdmb_lock = _SH["fdmb_lock"]   # shared across reruns/visitors
 
@@ -4665,9 +4670,29 @@ def _fdmb_snapshot(df, spot, expiry):
                         "ema_d": _fdmb_ema([h.get("d") for h in hist][-FDMB_EMA_SPAN * 2:]),
                         "ema_drr": _fdmb_ema([h.get("drr") for h in hist][-FDMB_EMA_SPAN * 2:]),
                         "b_dir": b_dir, "b_n": b_n, "r_dir": r_dir, "r_n": r_n})
+            # v28: joint-confirmation alert — logged ONCE when both tiles first show a confirmed
+            # move in the SAME direction (re-arms after the joint state breaks or flips).
+            today = now_ts[:10]
+            alerts = [a for a in (st_.get("alerts") or []) if str(a.get("ts", ""))[:10] == today]
+            prev_joint = st_.get("joint") if str(st_.get("joint_day", "")) == today else None
+            joint = b_dir if (b_dir and b_dir == r_dir and b_n >= FDMB_CONFIRM_N and r_n >= FDMB_CONFIRM_N) else None
+            if joint and joint != prev_joint:
+                a_new = {"ts": now_ts, "dir": joint, "spot": float(spot), "expiry": str(expiry),
+                         "bias": float(bias), "d_like": d_like, "rr25": rr25, "d_rr25": d_rr,
+                         "b_n": b_n, "r_n": r_n}
+                alerts = (alerts + [a_new])[-FDMB_ALERT_KEEP:]
+                try:                                         # permanent daily archive
+                    os.makedirs(FDMB_ALERT_DIR, exist_ok=True)
+                    with open(os.path.join(FDMB_ALERT_DIR, f"{today}.jsonl"), "a") as _af:
+                        _af.write(json.dumps(_v27_json_clean(a_new), allow_nan=False) + "\n")
+                except Exception as _ae:
+                    print(f"[FDM-bias] alert archive skipped: {_ae}", flush=True)
+            cur.update({"joint": joint, "alerts": list(reversed(alerts))})
             tmp = FDMB_STATE_FILE + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(_v27_json_clean({"last": cur, "hist": hist}), f, allow_nan=False)
+                json.dump(_v27_json_clean({"last": {k: v for k, v in cur.items() if k != "alerts"}, "hist": hist,
+                                           "alerts": alerts, "joint": joint, "joint_day": today}),
+                          f, allow_nan=False)
             os.replace(tmp, FDMB_STATE_FILE)
         return _v27_json_clean(cur)
     except Exception as _e:
@@ -4753,6 +4778,44 @@ def _fdmb_html(fb):
     table = ('<div style="overflow-x:auto;margin-top:8px;"><table style="width:100%;border-collapse:collapse;'
              'font-size:12px;font-family:monospace;text-align:right;background:#fff;" cellpadding="3">'
              f'<tr>{hdr}</tr>' + "".join(body) + '</table></div>')
+    # v28: joint-confirmation alert log (both tiles confirmed in the same direction)
+    alerts = fb.get("alerts") or []
+    jt = fb.get("joint")
+    j_txt = ("▲ BOTH CONFIRMED UP — active" if jt == "up" else "▼ BOTH CONFIRMED DOWN — active" if jt == "down"
+             else "no joint confirmation right now")
+    j_col = G if jt == "up" else R_ if jt == "down" else M
+    lth = 'style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;padding:4px 6px;text-align:right;"'
+    lhdr = "".join(f"<th {lth}>{h}</th>" for h in ("Time (IST)", "Signal", "NIFTY spot", "Spot now vs alert",
+                                                   "F − spot", "Bias Δ", "25Δ RR", "RR Δ"))
+    lrows = []
+    for a in alerts:
+        up = a.get("dir") == "up"
+        ac = G if up else R_
+        mv = (spot - a["spot"]) if (spot and a.get("spot")) else None
+        mc = M if mv is None else (G if (mv > 0) == up and mv != 0 else R_ if mv != 0 else M)
+        lrows.append(
+            f'<tr><td style="font-weight:800;">{str(a.get("ts", ""))[11:19]}</td>'
+            f'<td style="color:{ac};font-weight:800;">{"▲ BULLISH" if up else "▼ BEARISH"}</td>'
+            f'<td style="font-weight:700;">{f(a.get("spot"), "{:,.2f}")}</td>'
+            f'<td style="color:{mc};font-weight:700;">{f(mv, "{:+.1f}")}</td>'
+            f'<td>{f(a.get("bias"), "{:+.2f}")}</td><td>{f(a.get("d_like"), "{:+.2f}")}</td>'
+            f'<td>{f(a.get("rr25"), "{:+.2f}")}</td><td>{f(a.get("d_rr25"), "{:+.2f}")}</td></tr>')
+    if not lrows:
+        lrows.append(f'<tr><td colspan="8" style="text-align:left;color:{M};font-family:sans-serif;">'
+                     'No joint confirmation yet today — an entry appears when BOTH tiles show a confirmed '
+                     'move in the same direction.</td></tr>')
+    alert_log = ('<div style="margin-top:10px;background:#fff;border:1px solid #E5E7EB;border-radius:10px;padding:8px 10px;">'
+                 '<div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px;align-items:baseline;">'
+                 '<div style="font-size:12px;font-weight:700;color:#5C35CC;">🔔 ALERT LOG · both tiles confirmed, same '
+                 'direction (today, newest first)</div>'
+                 f'<div style="font-size:11.5px;font-weight:800;color:{j_col};">{j_txt}</div></div>'
+                 '<div style="overflow-x:auto;max-height:260px;overflow-y:auto;margin-top:4px;">'
+                 '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:monospace;'
+                 f'text-align:right;" cellpadding="3"><tr>{lhdr}</tr>' + "".join(lrows) + '</table></div>'
+                 '<div style="font-size:10.5px;color:#6B7280;margin-top:4px;">One entry per new joint signal: '
+                 'logged when the bias AND the 25Δ RR are both confirmed (3 snapshots beyond noise) in the same '
+                 'direction; it re-arms only after that joint state breaks or flips. Shared by all visitors, '
+                 'cleared at the start of each day, archived to fdm_alert_archive/YYYY-MM-DD.jsonl.</div></div>')
     note = ('<div style="font-size:10.5px;color:#6B7280;margin-top:5px;">'
             'Synthetic F = K + (call mid − put mid)·e<sup>rT</sup> · weight = |call ΔOI × Δ| + |put ΔOI × Δ| (OI change vs previous day) · '
             'Bias = weighted MEDIAN of (F − spot) over clean strikes (both legs two-sided, spread ≤ 5% of mid; '
@@ -4762,7 +4825,7 @@ def _fdmb_html(fb):
     return ('<div style="margin-top:12px;">'
             '<div style="font-size:12px;font-weight:700;color:#5C35CC;margin-bottom:6px;">'
             'SYNTHETIC-FORWARD BIAS LADDER · 25Δ RR SKEW (ATM ±5) · noise-filtered</div>'
-            f'<div style="display:flex;flex-wrap:wrap;gap:10px;">{t1}{t2}</div>' + table + note + '</div>')
+            f'<div style="display:flex;flex-wrap:wrap;gap:10px;">{t1}{t2}</div>' + table + alert_log + note + '</div>')
 # ══ END v27 synthetic-forward bias ════════════════════════════════════════════
 
 
