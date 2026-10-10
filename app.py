@@ -28,6 +28,9 @@
 ║  v28 — 10-Oct-2026: FDM alert log (time + NIFTY spot) when bias   ║
 ║        AND 25Δ RR are confirmed in the same direction, below the  ║
 ║        ladder · October 2026 Sentiment panel stays removed        ║
+║  v29 — 10-Oct-2026: Dhan API v2.5 — next-expiry chain refreshed   ║
+║        every 60 s via ONE shared de-duplicated fetch (auto 5-min  ║
+║        fall-back on rate-limit) · average_price → ladder column   ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -1072,6 +1075,71 @@ def _dhan_get_csv(url, timeout=25):
         raise DhanAPIError(f"network error fetching CSV: {e}")
 
 
+
+@st.cache_resource(show_spinner=False)
+def _v29_oc_store():
+    """Process-wide (shared across reruns and visitors)."""
+    return {"lock": threading.Lock(), "data": {}, "backoff_until": 0.0}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v29 — ONE shared, de-duplicated option-chain fetch per expiry (Dhan API v2.5)
+#   Dhan v2.5 (09-Feb-2026) allows several UNIQUE option-chain requests (different
+#   expiries) inside the same 3-second window; an IDENTICAL request still needs 3 s.
+#   • Every /v2/optionchain call goes through _v29_oc_raw(expiry, max_age):
+#       – max_age = 0   → front expiry: always a fresh call (de-duplicated only if the
+#                          same expiry was fetched < 3.2 s ago)
+#       – max_age = 60  → next expiry: shared by term-structure, roll-detection and the
+#                          inter-expiry roll signal (was 3 separate calls every 5 min)
+#   • Auto fall-back: if Dhan answers with a rate-limit error, next-expiry refresh drops
+#     back to 5 min for 15 min, and the last good next-expiry chain (≤ 10 min old) is
+#     served meanwhile. The FRONT expiry never receives stale data — errors still raise.
+# ═══════════════════════════════════════════════════════════════════════════════
+V29_BACK_TTL        = 60      # s — next-expiry refresh (was 300)
+V29_BACK_TTL_SLOW   = 300     # s — used for 15 min after a rate-limit error
+V29_BACKOFF_SECS    = 900
+V29_SAME_REQ_GAP    = 3.2     # s — never repeat an identical request faster than this
+V29_STALE_MAX       = 600     # s — oldest next-expiry chain served after an error
+
+
+def _v29_back_age():
+    st_ = _v29_oc_store()
+    return V29_BACK_TTL_SLOW if time.time() < st_["backoff_until"] else V29_BACK_TTL
+
+
+def _v29_is_rate_limit(e):
+    m = str(e).lower()
+    return ("429" in m) or ("rate" in m and "limit" in m) or ("too many" in m) or ("dh-904" in m)
+
+
+def _v29_oc_raw(expiry, max_age=0):
+    """Raw /v2/optionchain JSON for `expiry`, shared by every caller (see block comment)."""
+    st_ = _v29_oc_store()
+    sec = DHAN_SECURITY["NIFTY"]
+    with st_["lock"]:
+        hit = st_["data"].get(expiry)
+        age = (time.time() - hit[0]) if hit else None
+        if hit and (age < V29_SAME_REQ_GAP or (max_age > 0 and age < max_age)):
+            return hit[1]
+        try:
+            resp = _dhan_post(
+                "https://api.dhan.co/v2/optionchain",
+                {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"], "Expiry": expiry},
+                timeout=20,
+            )
+        except Exception as e:
+            if _v29_is_rate_limit(e):
+                st_["backoff_until"] = time.time() + V29_BACKOFF_SECS
+                print(f"[v29] option-chain rate limit hit ({expiry}) — next-expiry refresh slowed "
+                      f"to {V29_BACK_TTL_SLOW}s for {V29_BACKOFF_SECS // 60} min", flush=True)
+            if max_age > 0 and hit and age < V29_STALE_MAX:
+                return hit[1]                    # next expiry only: serve last good chain
+            raise
+        st_["data"][expiry] = (time.time(), resp)
+        for k in [k for k, v in st_["data"].items() if time.time() - v[0] > 3600]:
+            st_["data"].pop(k, None)             # forget expiries not asked for in an hour
+        return resp
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_dhan_expiry_list():
     if not USE_DHAN:
@@ -1095,7 +1163,7 @@ def fetch_dhan_expiry_list():
         return []
 
 
-def fetch_dhan_option_chain(expiry=None):
+def fetch_dhan_option_chain(expiry=None, _max_age=0):
     if not USE_DHAN:
         return pd.DataFrame(), 0.0, ""
 
@@ -1123,11 +1191,7 @@ def fetch_dhan_option_chain(expiry=None):
         return pd.DataFrame(), 0.0, ""
 
     try:
-        resp = _dhan_post(
-            "https://api.dhan.co/v2/optionchain",
-            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"], "Expiry": expiry},
-            timeout=20,
-        )
+        resp = _v29_oc_raw(expiry, max_age=_max_age)    # v29: shared, de-duplicated fetch
     except (DhanAPIError, Exception) as e:
         try:
             print(f"[fetch_dhan_option_chain] chain fetch error: {e}", flush=True)
@@ -1170,6 +1234,7 @@ def fetch_dhan_option_chain(expiry=None):
             "call_gamma": safe_num(cg.get("gamma", 0)),
             "call_theta": safe_num(cg.get("theta", 0)),
             "call_vega": safe_num(cg.get("vega", 0)),
+            "call_avg": safe_num(ce.get("average_price", 0)),            # v29: day's average traded price
             "put_ltp": safe_num(pe.get("last_price", 0)),
             "put_oi": _safe_int(pe.get("oi", 0)),                        # H6 fix
             "put_prev_oi": _safe_int(pe.get("previous_oi", 0)),          # H6 fix
@@ -1182,6 +1247,7 @@ def fetch_dhan_option_chain(expiry=None):
             "put_gamma": safe_num(pg.get("gamma", 0)),
             "put_theta": safe_num(pg.get("theta", 0)),
             "put_vega": safe_num(pg.get("vega", 0)),
+            "put_avg": safe_num(pe.get("average_price", 0)),             # v29: day's average traded price
         })
 
     if spot == 0 and oc:
@@ -1240,9 +1306,9 @@ def fetch_dhan_option_chain(expiry=None):
 # triggered a fresh Dhan POST, violating the ~1-req/3s rate limit and doubling
 # API spend. 5-min TTL is sufficient because roll-detection doesn't need
 # per-minute granularity.
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)    # v29: was 300
 def fetch_dhan_option_chain_cached(expiry=None):
-    return fetch_dhan_option_chain(expiry)
+    return fetch_dhan_option_chain(expiry, _max_age=_v29_back_age())
 
 
 def fetch_demo_option_chain():
@@ -1290,6 +1356,8 @@ def fetch_demo_option_chain():
             "put_iv": round(iv_p * 100, 2),
             "put_delta": round(pd2, 4), "put_gamma": round(pg, 6),
             "put_theta": round(pt, 4), "put_vega": round(pv, 4),
+            "call_avg": round(max(0.05, c_price * (1 + np.random.normal(0, 0.03))), 2),   # v29 demo
+            "put_avg": round(max(0.05, p_price * (1 + np.random.normal(0, 0.03))), 2),
         })
     expiry = (date.today() + timedelta(days=3)).strftime("%Y-%m-%d")
     return pd.DataFrame(rows), round(spot, 2), expiry
@@ -2944,7 +3012,7 @@ def compute_vwap_opening_range(candles):
 
 
 # ── Module B: Term Structure (front vs back expiry ATM IV) ───────────────────
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)   # v29: 60 s (raw chain shared via _v29_oc_raw)
 def fetch_back_expiry_atm_iv(back_expiry: str):
     """
     Fetch the back-month option chain and return ATM IV only.
@@ -2957,12 +3025,7 @@ def fetch_back_expiry_atm_iv(back_expiry: str):
     sec = DHAN_SECURITY["NIFTY"]
     try:
         # H1+H2+H3 fix: shared helper.
-        resp = _dhan_post(
-            "https://api.dhan.co/v2/optionchain",
-            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
-             "Expiry": back_expiry},
-            timeout=15,
-        )
+        resp = _v29_oc_raw(back_expiry, max_age=_v29_back_age())   # v29: shared, 60 s
         data = resp.get("data", {}) or {}
         spot = float(data.get("last_price") or data.get("ltp") or 0)
         oc   = data.get("oc", {}) or {}
@@ -2993,7 +3056,7 @@ def fetch_back_expiry_atm_iv(back_expiry: str):
 
 
 # ─── Roll Detection — Inter-Expiry OI Comparison ────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)  # Fix #5: was ttl=60; 5-min matches fetch_back_expiry_atm_iv and avoids rate-limit pressure
+@st.cache_data(ttl=60, show_spinner=False)   # v29: 60 s (raw chain shared via _v29_oc_raw)
 def fetch_back_expiry_oi_band(back_expiry: str):
     """
     Fetch strike-level OI + OI change for the back expiry — lightweight version.
@@ -3007,12 +3070,7 @@ def fetch_back_expiry_oi_band(back_expiry: str):
     sec = DHAN_SECURITY["NIFTY"]
     try:
         # H1+H2+H3 fix: shared helper.
-        resp = _dhan_post(
-            "https://api.dhan.co/v2/optionchain",
-            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"],
-             "Expiry": back_expiry},
-            timeout=15,
-        )
+        resp = _v29_oc_raw(back_expiry, max_age=_v29_back_age())   # v29: shared, 60 s
         data = resp.get("data", {}) or {}
         oc   = data.get("oc", {}) or {}
         if not oc:
@@ -4593,6 +4651,12 @@ def _fdmb_snapshot(df, spot, expiry):
             p_w = abs(float(x.get("put_oi_chg", 0) or 0)) * pdl
             rec = {"K": K, "c_w": c_w, "p_w": p_w, "w": c_w + p_w, "used": False,
                    "why": None, "F": None, "prem": None, "unc": None}
+            for _pre, _k in (("call", "c_vs_avg"), ("put", "p_vs_avg")):        # v29: LTP vs day average
+                try:
+                    _l, _a = float(x.get(f"{_pre}_ltp", 0) or 0), float(x.get(f"{_pre}_avg", 0) or 0)
+                    rec[_k] = (_l / _a - 1.0) if (_l > 0 and _a > 0) else None
+                except Exception:
+                    rec[_k] = None
             if not (cok and pok) or c <= 0 or p <= 0:
                 rec["why"] = "wide/no quote"
             else:
@@ -4622,12 +4686,17 @@ def _fdmb_snapshot(df, spot, expiry):
         level_unc = 1.2533 * _fdmb_wmedian([rr["unc"] for rr in used], wts if weighted else [1.0] * len(used)) \
             / np.sqrt(_fdmb_neff(wts if weighted else [1.0] * len(used)))
 
+        # v29: OI-weighted median of (call LTP vs its day average) − (put LTP vs its day average)
+        _va = [((rr["c_vs_avg"] - rr["p_vs_avg"]), rr["w"]) for rr in used
+               if rr.get("c_vs_avg") is not None and rr.get("p_vs_avg") is not None]
+        avg_tilt = _fdmb_wmedian([v for v, _ in _va], [w if weighted else 1.0 for _, w in _va]) if _va else None
         ivc, ivp, rr25, rr_unc = _fdmb_rr25(df, spot, T, atm)
         now_ts = now_ist().strftime("%Y-%m-%dT%H:%M:%S")
         cur = {"ts": now_ts, "expiry": str(expiry), "spot": float(spot), "bias": float(bias),
                "weighted": weighted, "level_unc": float(level_unc), "rr25": rr25, "rr_unc": rr_unc,
                "ivc25": ivc, "ivp25": ivp, "fair_carry": float(spot * (growth - 1.0)),
-               "synth_f": float(spot + bias), "n_used": len(used), "n_total": len(rows), "rows": rows}
+               "synth_f": float(spot + bias), "n_used": len(used), "n_total": len(rows), "rows": rows,
+               "avg_tilt": avg_tilt}
 
         with _fdmb_lock:
             try:
@@ -4746,7 +4815,10 @@ def _fdmb_html(fb):
           f'raw Δ {f(fb.get("d_raw"), "{:+.2f}")} vs {prev_hm or "—"}</div>'
           f'<div style="{small}">Synthetic F {f(fb.get("synth_f"), "{:,.1f}")} · spot {f(fb.get("spot"), "{:,.1f}")} · '
           f'fair carry ≈ {f(fb.get("fair_carry"), "{:+.1f}")} pts · {fb.get("n_used")}/{fb.get("n_total")} strikes clean'
-          + ("" if fb.get("weighted") else " · <b>unweighted</b> (no OI change yet)") + '</div></div>')
+          + ("" if fb.get("weighted") else " · <b>unweighted</b> (no OI change yet)") + '</div>'
+          + (f'<div style="{small}">Day-average tilt (call vs avg − put vs avg, OI-weighted): '
+             f'<b>{fb["avg_tilt"]:+.1%}</b> · context only — mostly reflects spot\'s move since the open</div>'
+             if fb.get("avg_tilt") is not None else "") + '</div>')
     t2 = (f'<div style="{tile.format(c=rc)}"><div style="{lab}">25Δ risk reversal skew · from mid prices</div>'
           f'<div style="font-size:22px;font-weight:800;color:#111;font-family:monospace;">{f(fb.get("rr25"), "{:+.2f}")} vol</div>'
           f'<div style="font-size:13px;font-weight:800;color:{rc};">{rh}</div>'
@@ -4758,7 +4830,15 @@ def _fdmb_html(fb):
 
     th = 'style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;padding:4px 6px;text-align:right;"'
     hdr = "".join(f"<th {th}>{h}</th>" for h in ("Strike", "Synthetic F", "F − spot", "± quote", "Δ vs prev",
-                                                  "Call ΔOI×Δ", "Put ΔOI×Δ", "Weight", "Status"))
+                                                  "Call ΔOI×Δ", "Put ΔOI×Δ", "Weight",
+                                                  "LTP vs day avg C / P", "Status"))
+
+    def _avgc(v):                                       # v29
+        if v is None:
+            return '<span style="color:#9CA3AF;">—</span>'
+        c = G if v > 0.02 else R_ if v < -0.02 else M
+        return f'<span style="color:{c};">{v:+.1%}</span>'
+
     spot = fb.get("spot") or 0
     body = []
     for rr in fb.get("rows", []):
@@ -4774,7 +4854,9 @@ def _fdmb_html(fb):
             f'<td>{f(rr.get("F"), "{:,.1f}")}</td><td>{f(rr.get("prem"), "{:+.1f}")}</td><td>{f(u, "{:.1f}")}</td>'
             f'<td style="color:{dc};font-weight:700;">{f(d, "{:+.2f}")}</td>'
             f'<td>{rr["c_w"]:,.0f}</td><td>{rr["p_w"]:,.0f}</td>'
-            f'<td>{f(rr.get("wpct"), "{:.0%}")}</td><td style="color:{sc};">{stt}</td></tr>')
+            f'<td>{f(rr.get("wpct"), "{:.0%}")}</td>'
+            f'<td>{_avgc(rr.get("c_vs_avg"))} / {_avgc(rr.get("p_vs_avg"))}</td>'
+            f'<td style="color:{sc};">{stt}</td></tr>')
     table = ('<div style="overflow-x:auto;margin-top:8px;"><table style="width:100%;border-collapse:collapse;'
              'font-size:12px;font-family:monospace;text-align:right;background:#fff;" cellpadding="3">'
              f'<tr>{hdr}</tr>' + "".join(body) + '</table></div>')
@@ -4821,7 +4903,9 @@ def _fdmb_html(fb):
             'Bias = weighted MEDIAN of (F − spot) over clean strikes (both legs two-sided, spread ≤ 5% of mid; '
             '&gt; 3 MAD from the median F dropped as stale) · Direction: like-for-like change over strikes present in both snapshots '
             'with the same weights, compared with a noise floor built from the bid-ask spreads; confirmed after 3 consecutive '
-            'snapshots beyond the floor · Δ cells are grey when inside that strike\'s own quote noise.</div>')
+            'snapshots beyond the floor · Δ cells are grey when inside that strike\'s own quote noise · '
+            'LTP vs day avg = last price ÷ Dhan average_price − 1 (green/red beyond ±2%): calls above and puts below '
+            'their averages largely mirror spot rising since the open — treat as context, not a signal.</div>')
     return ('<div style="margin-top:12px;">'
             '<div style="font-size:12px;font-weight:700;color:#5C35CC;margin-bottom:6px;">'
             'SYNTHETIC-FORWARD BIAS LADDER · 25Δ RR SKEW (ATM ±5) · noise-filtered</div>'
