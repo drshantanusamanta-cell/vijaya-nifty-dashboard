@@ -1639,6 +1639,87 @@ def get_dual_max_pain(front_max_pain, front_expiry=None):
     return cur_mp, cur_lbl, nxt_mp, nxt_lbl
 
 
+# ─── v32 ADDITION: Max Pain time series (CURRENT green vs NEXT expiry blue) ───
+# One point per real data fetch (deduplicated on the payload timestamp, so many
+# visitors still give one point), kept in max_pain_timeseries.json and reset at
+# the start of each day. Read-only use of values get_dual_max_pain() already
+# returns — no extra Dhan calls, nothing else reads this file.
+_MP_TS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "max_pain_timeseries.json")
+_MP_TS_KEEP = 400
+
+
+@st.cache_resource(show_spinner=False)
+def _mp_ts_lock():
+    return threading.Lock()
+
+
+_MP_TS_LOCK = _mp_ts_lock()   # shared across reruns/visitors
+
+
+def _mp_ts_record(fetch_key, cur_mp, nxt_mp, cur_lbl="", nxt_lbl=""):
+    """Append (time, current MP, next MP) once per fetch; returns today's points. Never raises."""
+    import re as _re_mp
+    today = now_ist().date().isoformat()
+    try:
+        with _MP_TS_LOCK:
+            try:
+                with open(_MP_TS_FILE, "r") as _f:
+                    _d = json.load(_f)
+                if _d.get("date") != today:
+                    _d = {}
+            except Exception:
+                _d = {}
+            pts = _d.get("pts") or []
+            _k = str(fetch_key or "")
+            if _k and cur_mp and not any(p.get("k") == _k for p in pts[-5:]):
+                _tm = _re_mp.search(r"(\d{2}:\d{2}:\d{2})", _k)
+                pts.append({"k": _k, "t": _tm.group(1) if _tm else now_ist().strftime("%H:%M:%S"),
+                            "cur": int(cur_mp), "nxt": int(nxt_mp) if nxt_mp else None,
+                            "cl": str(cur_lbl or ""), "nl": str(nxt_lbl or "")})
+                pts = pts[-_MP_TS_KEEP:]
+                _atomic_json_write(_MP_TS_FILE, {"date": today, "pts": pts})
+            return pts
+    except Exception as _e:
+        try:
+            print(f"[max-pain ts] {_e}", flush=True)
+        except Exception:
+            pass
+        return []
+
+
+def _mp_ts_figure(pts):
+    """Step-line chart: CURRENT expiry max pain (green) and NEXT expiry max pain (blue)."""
+    fig = go.Figure()
+    if pts:
+        _t = [p["t"] for p in pts]
+        _cl = pts[-1].get("cl") or ""
+        _nl = pts[-1].get("nl") or ""
+        fig.add_trace(go.Scatter(
+            x=_t, y=[p.get("cur") for p in pts], name=f"Current expiry {_cl}".strip(),
+            mode="lines+markers", line=dict(color="#059669", width=2.4, shape="hv"),
+            marker=dict(size=4, color="#059669"),
+            hovertemplate="%{x}<br>Current Max Pain: %{y:,.0f}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=_t, y=[p.get("nxt") for p in pts], name=f"Next expiry {_nl}".strip(),
+            mode="lines+markers", line=dict(color="#2563EB", width=2.4, shape="hv"),
+            marker=dict(size=4, color="#2563EB"), connectgaps=False,
+            hovertemplate="%{x}<br>Next Max Pain: %{y:,.0f}<extra></extra>"))
+    else:
+        fig.add_annotation(text="Collecting Max Pain ticks…", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False, font=dict(size=13, color="#6B7280"))
+    fig.update_layout(
+        title=dict(text="Max Pain over time — Current expiry (green) vs Next expiry (blue) · today",
+                   x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+        height=240, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=55, r=20, t=48, b=36), font=dict(color="#1A1A2E", size=11),
+        legend=dict(orientation="h", y=1.14, x=0, font=dict(size=10)), hovermode="x unified",
+        xaxis=dict(title=dict(text="Time (IST)", font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text="Max Pain strike", font=dict(size=10, color="#6B7280")),
+                   tickfont=dict(size=9), tickformat=",.0f", gridcolor="#F3F4F6"),
+    )
+    return fig
+
+
 def compute_metrics(df, spot, expiry=None, history=None):
     if df.empty:
         return {}
@@ -8527,6 +8608,14 @@ with _slot_summary:
             st.plotly_chart(f1, width='stretch', config={"displayModeBar": False}, key="fdm_s4_f1")
         with _fdm_c2:
             st.plotly_chart(f2, width='stretch', config={"displayModeBar": False}, key="fdm_s4_f2")
+
+    # v32: Max Pain time series (CURRENT green / NEXT blue)
+    try:
+        st.plotly_chart(_mp_ts_figure(_mp_ts_record(payload.get("ts_ist"), _mp_cur_s4, _mp_nxt_s4,
+                                                    _mp_lbl_s4, _mp_nxtlbl_s4)),
+                        width='stretch', config={"displayModeBar": False}, key="fdm_mp_ts")
+    except Exception as _mpts_e:
+        st.caption(f"Max Pain time series unavailable ({_mpts_e})")
 
     # ── v25: GEX × Gamma Flip Regime Matrix — INDEPENDENT ADD-ON ─────────────
     # Reads only values already on hand (spot, m, the GEX walls shown in the
