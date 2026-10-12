@@ -900,9 +900,9 @@ def render_gamma_regime_matrix_html(r, part="all"):
                 f'<div style="font-size:14px;color:#111;margin-top:4px;">Waiting for data — {_why}.</div></div>')
     c = r["cell"]; col, bg = GRM_TONES[c["tone"]]
     lab = 'font-size:10px;font-weight:700;letter-spacing:.06em;color:#6B7280;text-transform:uppercase;'
-    stat = lambda k, v: (f'<div style="display:flex;flex-direction:column;margin-right:22px;">'
+    stat = lambda k, v: (f'<div style="display:flex;flex-direction:column;margin-right:14px;">'
                          f'<span style="{lab}">{k}</span>'
-                         f'<span style="font-size:15px;font-weight:800;color:#111;font-family:monospace;">{v}</span></div>')
+                         f'<span style="font-size:12px;font-weight:800;color:#111;font-family:monospace;">{v}</span></div>')
     stats = "".join([
         stat("Spot − Flip", f"{r['dist_pts']:+,.0f} pts"),
         stat("Distance", f"{r['dist_pct']:+.2f}% (band ±{r['band_pct']:.2f}%)"),
@@ -911,28 +911,28 @@ def render_gamma_regime_matrix_html(r, part="all"):
         stat("To put wall", f"{r['spot'] - r['put_wall']:+,.0f} pts" if r["put_wall"] else "N/A"),
     ])
     meter = "".join(
-        f'<span style="display:inline-block;width:9px;height:14px;border-radius:2px;margin-left:3px;'
+        f'<span style="display:inline-block;width:6px;height:10px;border-radius:2px;margin-left:2px;'
         f'background:{col if i < r["score"] else "#E5E7EB"};"></span>' for i in range(10))
     chk = "".join(
-        f'<span style="display:inline-block;margin:4px 8px 0 0;padding:3px 8px;border-radius:999px;font-size:12px;'
+        f'<span style="display:inline-block;margin:3px 6px 0 0;padding:1px 6px;border-radius:999px;font-size:10.5px;'
         f'background:{"#D1FAE5" if ok else "#FEE2E2"};color:{"#047857" if ok else "#DC2626"};">'
         f'{"✓" if ok else "✗"} {esc(name)} ({esc(val)})</span>' for name, ok, val in r["checks"])
-    notes = "".join(f'<div style="font-size:12px;color:#6B7280;margin-top:3px;">• {esc(n)}</div>' for n in r["notes"])
-    rd = lambda k, v: (f'<div style="flex:1 1 220px;min-width:200px;"><div style="{lab}">{k}</div>'
-                       f'<div style="font-size:13px;color:#111;margin-top:2px;">{v}</div></div>')
+    notes = "".join(f'<div style="font-size:10.5px;color:#6B7280;margin-top:2px;">• {esc(n)}</div>' for n in r["notes"])
+    rd = lambda k, v: (f'<div style="flex:1 1 180px;min-width:160px;"><div style="{lab}">{k}</div>'
+                       f'<div style="font-size:11.5px;color:#111;margin-top:1px;line-height:1.35;">{v}</div></div>')
     verdict = (
-        f'<div style="background:{bg};border:2px solid {col};border-radius:10px;padding:12px 16px;margin-top:12px;">'
-        '<div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;">'
+        f'<div style="background:{bg};border:2px solid {col};border-radius:8px;padding:8px 12px;margin-top:8px;">'
+        '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">'
         f'<div><div style="{lab}">GEX × Gamma Flip Regime Matrix · live cell</div>'
-        f'<div style="font-size:24px;font-weight:900;color:{col};margin:2px 0;">{esc(c["name"])}'
-        f'<span style="font-size:11px;font-weight:700;margin-left:10px;padding:3px 8px;border-radius:999px;'
+        f'<div style="font-size:17px;font-weight:900;color:{col};margin:2px 0;">{esc(c["name"])}'
+        f'<span style="font-size:9.5px;font-weight:700;margin-left:8px;padding:2px 6px;border-radius:999px;'
         f'background:#FFFFFF;color:{col};vertical-align:middle;text-transform:uppercase;">{esc(c["tag"])}</span></div>'
-        f'<div style="font-size:14px;font-weight:700;color:{col};font-family:monospace;">{esc(c["dir"])}</div></div>'
+        f'<div style="font-size:12px;font-weight:700;color:{col};font-family:monospace;">{esc(c["dir"])}</div></div>'
         f'<div style="text-align:right;"><div style="{lab}">Confidence</div>'
-        f'<div style="font-size:30px;font-weight:900;color:#111;font-family:monospace;line-height:1.1;">{r["score"]}'
-        f'<span style="font-size:14px;color:#6B7280;">/10</span></div><div>{meter}</div></div></div>'
-        f'<div style="display:flex;flex-wrap:wrap;gap:6px 0;border-top:1px solid {col}33;margin-top:10px;padding-top:8px;">{stats}</div>'
-        '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;">'
+        f'<div style="font-size:21px;font-weight:900;color:#111;font-family:monospace;line-height:1.1;">{r["score"]}'
+        f'<span style="font-size:11px;color:#6B7280;">/10</span></div><div>{meter}</div></div></div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:6px 0;border-top:1px solid {col}33;margin-top:6px;padding-top:5px;">{stats}</div>'
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;">'
         + rd("Expect", esc(c["expect"])) + rd("Posture", esc(c["posture"]))
         + rd("Target / trigger", esc(r["target"])) + rd("Invalidation", f'{esc(r["stop"])} · {esc(c["inv"])}')
         + f'</div><div style="margin-top:6px;">{chk}</div>{notes}</div>')
@@ -8519,6 +8519,14 @@ with _slot_summary:
           <div style="font-size:11px;color:#374151;margin-top:2px;">{tip}</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # v31: first 2 Section-4 charts mirrored here (still shown in Section 4 too)
+    if not df_band.empty:
+        _fdm_c1, _fdm_c2 = st.columns(2)
+        with _fdm_c1:
+            st.plotly_chart(f1, width='stretch', config={"displayModeBar": False}, key="fdm_s4_f1")
+        with _fdm_c2:
+            st.plotly_chart(f2, width='stretch', config={"displayModeBar": False}, key="fdm_s4_f2")
 
     # ── v25: GEX × Gamma Flip Regime Matrix — INDEPENDENT ADD-ON ─────────────
     # Reads only values already on hand (spot, m, the GEX walls shown in the
