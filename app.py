@@ -1720,6 +1720,77 @@ def _mp_ts_figure(pts):
     return fig
 
 
+# ─── v33 ADDITION: GEX Put Wall / Call Wall time series ─────────────────────
+# Plots the SAME Put Wall / Call Wall values already shown in the Final Decision
+# Matrix tiles (GEX + Vega Live Interpretation snapshot). One point per real data
+# fetch (dedup on the payload timestamp), kept in gex_walls_timeseries.json and
+# reset each day. Read-only: no extra Dhan calls, nothing else reads this file.
+_WALL_TS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gex_walls_timeseries.json")
+_WALL_TS_KEEP = 400
+
+
+def _wall_ts_record(fetch_key, put_wall, call_wall):
+    """Append (time, Put Wall, Call Wall) once per fetch; returns today's points. Never raises."""
+    import re as _re_w
+    today = now_ist().date().isoformat()
+    try:
+        with _MP_TS_LOCK:
+            try:
+                with open(_WALL_TS_FILE, "r") as _f:
+                    _d = json.load(_f)
+                if _d.get("date") != today:
+                    _d = {}
+            except Exception:
+                _d = {}
+            pts = _d.get("pts") or []
+            _k = str(fetch_key or "")
+            if _k and (put_wall or call_wall) and not any(p.get("k") == _k for p in pts[-5:]):
+                _tm = _re_w.search(r"(\d{2}:\d{2}:\d{2})", _k)
+                pts.append({"k": _k, "t": _tm.group(1) if _tm else now_ist().strftime("%H:%M:%S"),
+                            "pw": int(put_wall) if put_wall else None,
+                            "cw": int(call_wall) if call_wall else None})
+                pts = pts[-_WALL_TS_KEEP:]
+                _atomic_json_write(_WALL_TS_FILE, {"date": today, "pts": pts})
+            return pts
+    except Exception as _e:
+        try:
+            print(f"[gex-walls ts] {_e}", flush=True)
+        except Exception:
+            pass
+        return []
+
+
+def _wall_ts_figure(pts):
+    """Step-line chart: GEX Put Wall (green, support) and Call Wall (red, resistance)."""
+    fig = go.Figure()
+    if pts:
+        _t = [p["t"] for p in pts]
+        fig.add_trace(go.Scatter(
+            x=_t, y=[p.get("cw") for p in pts], name="Call Wall (resistance)",
+            mode="lines+markers", line=dict(color="#DC2626", width=2.4, shape="hv"),
+            marker=dict(size=4, color="#DC2626"), connectgaps=False,
+            hovertemplate="%{x}<br>Call Wall: %{y:,.0f}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=_t, y=[p.get("pw") for p in pts], name="Put Wall (support)",
+            mode="lines+markers", line=dict(color="#059669", width=2.4, shape="hv"),
+            marker=dict(size=4, color="#059669"), connectgaps=False,
+            hovertemplate="%{x}<br>Put Wall: %{y:,.0f}<extra></extra>"))
+    else:
+        fig.add_annotation(text="Collecting GEX wall ticks…", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False, font=dict(size=13, color="#6B7280"))
+    fig.update_layout(
+        title=dict(text="GEX walls over time — Call Wall / resistance (red) vs Put Wall / support (green) · today",
+                   x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+        height=240, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=55, r=20, t=48, b=36), font=dict(color="#1A1A2E", size=11),
+        legend=dict(orientation="h", y=1.14, x=0, font=dict(size=10)), hovermode="x unified",
+        xaxis=dict(title=dict(text="Time (IST)", font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text="Wall strike", font=dict(size=10, color="#6B7280")),
+                   tickfont=dict(size=9), tickformat=",.0f", gridcolor="#F3F4F6"),
+    )
+    return fig
+
+
 def compute_metrics(df, spot, expiry=None, history=None):
     if df.empty:
         return {}
@@ -8616,6 +8687,13 @@ with _slot_summary:
                         width='stretch', config={"displayModeBar": False}, key="fdm_mp_ts")
     except Exception as _mpts_e:
         st.caption(f"Max Pain time series unavailable ({_mpts_e})")
+
+    # v33: GEX Put Wall / Call Wall time series (same values as the tiles above)
+    try:
+        st.plotly_chart(_wall_ts_figure(_wall_ts_record(payload.get("ts_ist"), _sum_pw, _sum_cw)),
+                        width='stretch', config={"displayModeBar": False}, key="fdm_gex_walls_ts")
+    except Exception as _wts_e:
+        st.caption(f"GEX walls time series unavailable ({_wts_e})")
 
     # ── v25: GEX × Gamma Flip Regime Matrix — INDEPENDENT ADD-ON ─────────────
     # Reads only values already on hand (spot, m, the GEX walls shown in the
