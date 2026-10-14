@@ -992,30 +992,44 @@ try:
 except ImportError:                                # pragma: no cover
     Retry = None
 
-_dhan_session = None
-_dhan_session_lock = threading.Lock()
+# v36 FIX (API over-calling): these caches were plain module globals, which Streamlit
+# re-creates EMPTY on every rerun — so every visitor refresh re-downloaded the scrip
+# master CSV and re-hit /marketfeed/ltp (VIX). They now live in st.cache_resource,
+# shared across reruns and visitors (the Dash edition loads its module once, so it
+# never had this problem).
+@st.cache_resource(show_spinner=False)
+def _v36_dhan_store():
+    return {
+        "sess": {"s": None}, "sess_lock": threading.Lock(),
+        "master": {"df": None, "fail_ts": 0.0}, "master_lock": threading.Lock(),
+        "fut_id": {}, "fut_ltp": {"ltp": 0.0, "ts": 0.0},
+        "vix_id": {}, "vix_ltp": {"ltp": 0.0, "ts": 0.0, "fail_ts": 0.0},
+    }
+
+_V36 = _v36_dhan_store()
+_dhan_session_lock = _V36["sess_lock"]
 
 def _get_dhan_session():
     """H3 fix: return a Session with retry/backoff mounted. Thread-safe singleton."""
-    global _dhan_session
-    if _dhan_session is not None:
-        return _dhan_session
+    _holder = _V36["sess"]                      # v36: persists across reruns
+    if _holder["s"] is not None:
+        return _holder["s"]
     with _dhan_session_lock:
-        if _dhan_session is None:
+        if _holder["s"] is None:
             s = _requests.Session()
             if Retry is not None:
                 retry = Retry(
                     total=3,
                     backoff_factor=0.5,            # 0.5, 1, 2 seconds
-                    status_forcelist=(429, 500, 502, 503, 504),
+                    status_forcelist=(500, 502, 503, 504),   # v36: no auto-retry on 429 (it multiplied calls while rate-limited)
                     allowed_methods=("GET", "POST"),
                     respect_retry_after_header=True,
                 )
                 adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
                 s.mount("https://", adapter)
                 s.mount("http://",  adapter)
-            _dhan_session = s
-    return _dhan_session
+            _holder["s"] = s
+    return _holder["s"]
 
 
 class DhanAPIError(Exception):
@@ -1403,24 +1417,27 @@ import re
 # and any future NIFTY<suffix> index-future family NSE introduces.
 _NIFTY_FUT_PATTERN = r"^NIFTY(?:-[A-Z]{3}\d{4}-FUT|\d{2}[A-Z]{3}FUT)$"
 
-_fut_master_df   = None
-_fut_id_cache    = {}
-_fut_master_lock = threading.Lock()
+_fut_id_cache    = _V36["fut_id"]       # v36: persistent (was {} — reset every rerun)
+_fut_master_lock = _V36["master_lock"]
+_V36_MASTER_RETRY = 300                  # v36: after a failed CSV download, wait 5 min
 
 def _load_dhan_instrument_master():
-    global _fut_master_df
+    _m = _V36["master"]                  # v36: persistent, downloaded once per process
     with _fut_master_lock:
-        if _fut_master_df is not None:
-            return _fut_master_df
+        if _m["df"] is not None:
+            return _m["df"]
+        if time.time() - _m["fail_ts"] < _V36_MASTER_RETRY:
+            return None
         try:
             import io
             # H1+H3 fix: use the shared session (with retry/backoff) via _dhan_get_csv.
             csv_text = _dhan_get_csv("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=25)
             df = pd.read_csv(io.StringIO(csv_text), low_memory=False)
             df.columns = [c.strip().upper() for c in df.columns]
-            _fut_master_df = df
-            return _fut_master_df
+            _m["df"] = df
+            return _m["df"]
         except (DhanAPIError, Exception) as e:
+            _m["fail_ts"] = time.time()
             try:
                 print(f"[_load_dhan_instrument_master] error: {e}", flush=True)
             except Exception:
@@ -1480,7 +1497,7 @@ def _resolve_futures_id(near_expiry_str=None):
     except Exception:
         return None, None
 
-_fut_ltp_cache = {"ltp": 0.0, "ts": 0.0}
+_fut_ltp_cache = _V36["fut_ltp"]        # v36: persistent
 _FUT_CACHE_SEC = 58
 
 def fetch_futures_ltp(near_expiry_str=None, spot=None):
@@ -3634,7 +3651,7 @@ def compute_term_structure_signal(front_atm_iv: float, back_atm_iv, front_expiry
 
 
 # ── Module C: India VIX ───────────────────────────────────────────────────────
-_vix_id_cache = {}
+_vix_id_cache = _V36["vix_id"]          # v36: persistent
 
 def _resolve_india_vix_id():
     """Look up India VIX security ID from the Dhan instruments master CSV."""
@@ -3664,7 +3681,7 @@ def _resolve_india_vix_id():
         return None
 
 
-_vix_ltp_cache_v7 = {"ltp": 0.0, "ts": 0.0}
+_vix_ltp_cache_v7 = _V36["vix_ltp"]     # v36: persistent
 _VIX_CACHE_SEC = 58
 
 def fetch_india_vix_ltp():
@@ -3677,6 +3694,9 @@ def fetch_india_vix_ltp():
     now = time.time()
     if now - _vix_ltp_cache_v7["ts"] < _VIX_CACHE_SEC and _vix_ltp_cache_v7["ltp"] > 0:
         return _vix_ltp_cache_v7["ltp"]
+    if now - _vix_ltp_cache_v7.get("fail_ts", 0.0) < _VIX_CACHE_SEC:   # v36: failure cooldown
+        return _vix_ltp_cache_v7.get("ltp", 0.0)
+    _vix_ltp_cache_v7["fail_ts"] = now          # cleared below on success
     vix_id = _resolve_india_vix_id()
     if not vix_id:
         return 0.0
@@ -3693,6 +3713,7 @@ def fetch_india_vix_ltp():
             if ltp > 0:
                 _vix_ltp_cache_v7["ltp"] = ltp
                 _vix_ltp_cache_v7["ts"]  = now
+                _vix_ltp_cache_v7["fail_ts"] = 0.0
                 return ltp
     except (DhanAPIError, Exception) as e:
         try:
@@ -4537,6 +4558,10 @@ def get_server_data(expiry_override=None, _from_bg=False):
                 _srv_cache.get("source", "N/A"),
                 _srv_cache.get("last_fetch_ts", 0.0),
             )
+        # v36 FIX: no payload yet and the last attempt failed < 20 s ago → don't retry
+        # (previously the 40-s wait loop could fire ~80 full fetches per visitor).
+        if _srv_cache["payload"] is None and (now - _SH.get("fail_ts", 0.0)) < 20:
+            return (None, "API ERROR", 0.0)
         # Cache stale — check if another thread is already fetching
         # v27 fix: a fetch older than 120 s is treated as dead (its thread was stopped)
         if _SH["inflight"]["v"] and (now - _SH["inflight"].get("ts", 0.0)) < 120:   # shared single-flight flag
@@ -4574,6 +4599,8 @@ def get_server_data(expiry_override=None, _from_bg=False):
             # but bump last_fetch_ts by a short cooldown to prevent retry storms.
             elif _srv_cache["payload"] is not None:
                 _srv_cache["last_fetch_ts"] = time.time() - max(0, interval - 30)  # 30s cooldown
+            else:
+                _SH["fail_ts"] = time.time()          # v36: cold-start failure cooldown
 
     # v27: record the shared history tick right after a successful fetch.
     # Background fetches outside market hours are not recorded (as before, after-hours
