@@ -1905,6 +1905,45 @@ def _oi15_figure(df_band, spot, base, cur):
     return fig
 
 
+# ─── v35: session Δ-weighted OI change — call/put split traces ──────────────
+# Same pattern as the 15-min chart (_oi15_figure) but over the WHOLE SESSION
+# (call_oi_chg / put_oi_chg vs previous close). Builds traces only; the caller
+# applies the existing Section-4 styling. The net ◆ equals the old single bar
+# (CallOIChg×|Δc| − PutOIChg×|Δp|), so the momentum values are unchanged.
+def _oi_session_split_figure(df_band):
+    fig = go.Figure()
+    xs, cv, pv, nv, cc, pc, cp, pp, ch, ph = [], [], [], [], [], [], [], [], [], []
+    for r in df_band.sort_values("strike").to_dict("records"):
+        d_c = float(r.get("call_oi_chg") or 0); d_p = float(r.get("put_oi_chg") or 0)
+        a_c = abs(float(r.get("call_delta") or 0)); a_p = abs(float(r.get("put_delta") or 0))
+        c_w = d_c * a_c; p_w = d_p * a_p
+        xs.append(int(r["strike"])); cv.append(c_w); pv.append(-p_w)
+        nv.append((c_w - p_w) if (c_w or p_w) else None)
+        cc.append("#DC2626" if c_w >= 0 else "#FCA5A5"); cp.append("" if c_w >= 0 else "/")
+        pc.append("#059669" if p_w >= 0 else "#86EFAC"); pp.append("" if p_w >= 0 else "/")
+        ch.append(f"{'Call BUILD-UP' if d_c >= 0 else 'Call UNWINDING'}<br>ΔOI {d_c:+,.0f} · |Δ| {a_c:.2f}")
+        ph.append(f"{'Put BUILD-UP' if d_p >= 0 else 'Put UNWINDING'}<br>ΔOI {d_p:+,.0f} · |Δ| {a_p:.2f}")
+    fig.add_trace(go.Bar(x=xs, y=cv, name="Call side",
+                         marker=dict(color=cc, pattern=dict(shape=cp, fgcolor="#DC2626")),
+                         customdata=ch, hovertemplate="%{x}<br>%{customdata}<br>Δ×ΔOI %{y:+,.0f}<extra></extra>"))
+    fig.add_trace(go.Bar(x=xs, y=pv, name="Put side",
+                         marker=dict(color=pc, pattern=dict(shape=pp, fgcolor="#059669")),
+                         customdata=ph, hovertemplate="%{x}<br>%{customdata}<br>plotted %{y:+,.0f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=xs, y=nv, name="Net (call − put)", mode="markers",
+                             marker=dict(symbol="diamond", size=7, color="#111827",
+                                         line=dict(width=1, color="#fff")),
+                             hovertemplate="%{x}<br>Net Δ×ΔOI %{y:+,.0f}<extra></extra>"))
+    fig.add_hline(y=0, line_width=1, line_color="#9CA3AF")
+    return fig
+
+
+def _oi_session_split_finish(fig):
+    """Applied AFTER the existing Section-4 styling: grouped bars, no legend (key is in the title)."""
+    fig.update_layout(barmode="group", bargap=0.18, showlegend=False)
+    fig.update_yaxes(tickformat=",.0f")
+    return fig
+
+
 def compute_metrics(df, spot, expiry=None, history=None):
     if df.empty:
         return {}
@@ -8198,8 +8237,10 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             _s4_style(f1, "★ Δ-Weighted Net OI · Red=Call side · Green=Put side", "Δ×OI (net)")
             st.plotly_chart(f1, width='stretch', config={"displayModeBar":False})
         with _s4_r1c2:
-            f2 = go.Figure(go.Bar(x=x, y=mv, marker_color=mc))
-            _s4_style(f2, "★ Δ-Weighted OI Change Momentum · Red=Call side · Green=Put side", "Δ×ΔOI (net)")
+            # v35: call/put split pattern chart (net ◆ == old mv bar; mv itself unchanged)
+            f2 = _oi_session_split_figure(df_band)
+            _s4_style(f2, "★ Δ-Weighted OI Change Momentum · session<br><sup>Red=Call ↑ · Green=Put ↓ · solid=build-up · hatched=unwinding · ◆=net · above 0 bearish / below 0 bullish</sup>", "Δ×ΔOI (net)")
+            _oi_session_split_finish(f2)
             st.plotly_chart(f2, width='stretch', config={"displayModeBar":False})
 
         # v34: rolling 15-min Δ-weighted OI change (call/put split) — full width
