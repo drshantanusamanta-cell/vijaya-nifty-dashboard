@@ -1065,7 +1065,10 @@ def _dhan_post(url, payload, timeout=15):
             msg = body.get("errorMessage") or body.get("message") or body
         except Exception:
             msg = resp.text[:200] if resp.text else resp.reason
+        if resp.status_code == 401 or "808" in str(msg):          # v37: token rejected
+            _V36["auth_fail_ts"] = time.time()
         raise DhanAPIError(f"HTTP {resp.status_code}: {msg}")
+    _V36["auth_fail_ts"] = 0.0                                     # v37: token accepted
 
     try:
         data = resp.json()
@@ -5476,6 +5479,11 @@ def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs, data_sour
         detail   = ("Dhan API call failed (timeout, rate-limit, or auth issue) · "
                     "Values shown are <strong>simulated</strong>, not real market data · "
                     "Will auto-retry on next refresh")
+        if time.time() - _V36.get("auth_fail_ts", 0.0) < 600:      # v37: say exactly what's wrong
+            headline = "DHAN TOKEN REJECTED — showing fallback demo data"
+            detail   = ("Dhan says the <strong>Client ID or Access Token is invalid / expired</strong> (HTTP 401 · code 808). "
+                        "Paste a fresh <code>DHAN_ACCESS_TOKEN</code> into this app's Secrets and reboot · "
+                        "Values shown are <strong>simulated</strong>")
         label_bg, label_fg = "#DC2626", "#ffffff"
         label_text = "● API ERROR"
 
@@ -6833,7 +6841,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 xaxis=dict(title="Strike", tickfont=dict(size=9)),
                 font=dict(color="#1A1A2E", size=11),
             )
-            st.plotly_chart(_gc1_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(_gc1_fig, width='stretch', config={"displayModeBar": False})
 
         with _gc_col2:
             # ─────────────────────────────────────────────────────────────────────
@@ -6900,7 +6908,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                 xaxis=dict(title="Strike", tickfont=dict(size=9)),
                 font=dict(color="#1A1A2E", size=11),
             )
-            st.plotly_chart(_gv_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(_gv_fig, width='stretch', config={"displayModeBar": False})
 
         # ─────────────────────────────────────────────────────────────────────────
         # ATM BAND VEGA EXPOSURE DIFF vs SPOT — dual-axis time-series
@@ -7071,7 +7079,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                     hovermode="x unified",
                     font=dict(color="#1A1A2E", size=11),
                 )
-                st.plotly_chart(_vr_fig, use_container_width=True,
+                st.plotly_chart(_vr_fig, width='stretch',
                                 config={"displayModeBar": False})
 
             # ── Chart B: OI-Weighted Vega Ratio  (ΣOI×call_vega / ΣOI×put_vega) ────
@@ -7139,7 +7147,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                     hovermode="x unified",
                     font=dict(color="#1A1A2E", size=11),
                 )
-                st.plotly_chart(_vo_fig, use_container_width=True,
+                st.plotly_chart(_vo_fig, width='stretch',
                                 config={"displayModeBar": False})
         else:
             st.info("⏳ ATM Band Vega Ratio charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
@@ -7253,7 +7261,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                     hovermode="x unified",
                     font=dict(color="#1A1A2E", size=11),
                 )
-                st.plotly_chart(_ev_fig, use_container_width=True,
+                st.plotly_chart(_ev_fig, width='stretch',
                                 config={"displayModeBar": False})
 
             # ── Chart B: OI-Weighted CE/PE EV Ratio (Call EV×OI / Put EV×OI) ────
@@ -7321,7 +7329,7 @@ with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display
                     hovermode="x unified",
                     font=dict(color="#1A1A2E", size=11),
                 )
-                st.plotly_chart(_evo_fig, use_container_width=True,
+                st.plotly_chart(_evo_fig, width='stretch',
                                 config={"displayModeBar": False})
         else:
             st.info("⏳ Sentiment Z-Score charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
