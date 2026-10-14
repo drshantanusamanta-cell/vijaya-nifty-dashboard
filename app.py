@@ -1004,9 +1004,14 @@ def _v36_dhan_store():
         "master": {"df": None, "fail_ts": 0.0}, "master_lock": threading.Lock(),
         "fut_id": {}, "fut_ltp": {"ltp": 0.0, "ts": 0.0},
         "vix_id": {}, "vix_ltp": {"ltp": 0.0, "ts": 0.0, "fail_ts": 0.0},
+        # v38: one gate for ALL /marketfeed calls (Dhan quote APIs ≈ 1 request / second)
+        "mf_lock": threading.Lock(), "mf": {"last": 0.0, "block_until": 0.0},
+        "fut_resolve": {},
     }
 
 _V36 = _v36_dhan_store()
+_V38_MF_GAP     = 1.2     # s — minimum gap between any two /marketfeed calls (this app)
+_V38_MF_BACKOFF = 120     # s — pause all /marketfeed calls after a 429 / code 805
 _dhan_session_lock = _V36["sess_lock"]
 
 def _get_dhan_session():
@@ -1052,10 +1057,27 @@ def _dhan_post(url, payload, timeout=15):
         "Content-Type": "application/json",
     }
     sess = _get_dhan_session()
+    _is_mf = "/marketfeed/" in url                                # v38: quote-API gate
+    if _is_mf:
+        _V36["mf_lock"].acquire()
     try:
-        resp = sess.post(url, headers=headers, json=payload, timeout=timeout)
-    except _requests.RequestException as e:
-        raise DhanAPIError(f"network error: {e}")
+        if _is_mf:
+            _mf = _V36["mf"]
+            if time.time() < _mf["block_until"]:
+                raise DhanAPIError("HTTP 429: marketfeed paused after a rate-limit reply (v38 back-off)")
+            _wait = _V38_MF_GAP - (time.time() - _mf["last"])
+            if _wait > 0:
+                time.sleep(_wait)
+            _mf["last"] = time.time()
+        try:
+            resp = sess.post(url, headers=headers, json=payload, timeout=timeout)
+        except _requests.RequestException as e:
+            raise DhanAPIError(f"network error: {e}")
+        if _is_mf and (resp.status_code == 429 or '"805"' in (resp.text or "")[:300]):
+            _V36["mf"]["block_until"] = time.time() + _V38_MF_BACKOFF
+    finally:
+        if _is_mf:
+            _V36["mf_lock"].release()
 
     # H1 fix: check HTTP status code (was missing — JSONDecodeError was silently swallowed)
     if resp.status_code >= 400:
@@ -1448,6 +1470,18 @@ def _load_dhan_instrument_master():
             return None
 
 def _resolve_futures_id(near_expiry_str=None):
+    # v38: memoised per (day, expiry arg) — the CSV scan + log line ran on every call
+    _rk = (date.today().isoformat(), str(near_expiry_str))
+    _rc = _V36["fut_resolve"]
+    if _rk in _rc and _rc[_rk][0]:
+        return _rc[_rk]
+    _res = _v38_resolve_futures_id_uncached(near_expiry_str)
+    if _res and _res[0]:
+        _rc.clear(); _rc[_rk] = _res
+    return _res
+
+
+def _v38_resolve_futures_id_uncached(near_expiry_str=None):
     today = date.today()
     master = _load_dhan_instrument_master()
     if master is None:
@@ -1545,6 +1579,7 @@ def fetch_futures_ltp(near_expiry_str=None, spot=None):
                     except Exception:
                         pass
                     _fut_id_cache.pop("NIFTY", None)
+                    _V36["fut_resolve"].clear()                  # v38
                     _fut_ltp_cache["ltp"] = 0.0
                     _fut_ltp_cache["ts"]  = 0.0
                     return 0.0
@@ -3719,6 +3754,8 @@ def fetch_india_vix_ltp():
                 _vix_ltp_cache_v7["fail_ts"] = 0.0
                 return ltp
     except (DhanAPIError, Exception) as e:
+        if "429" in str(e) or "805" in str(e):                  # v38: back off 5 min on rate-limit
+            _vix_ltp_cache_v7["fail_ts"] = now + 240
         try:
             print(f"[fetch_india_vix_ltp] error: {e}", flush=True)
         except Exception:
