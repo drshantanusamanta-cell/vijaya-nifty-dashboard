@@ -1791,6 +1791,120 @@ def _wall_ts_figure(pts):
     return fig
 
 
+# ─── v34 ADDITION: Δ-weighted OI change — rolling last 15 minutes ───────────
+# Same weighting as the "Δ-Weighted OI Change Momentum" chart (ΔOI × |Δ|), but the
+# OI change is measured against the snapshot ~15 min ago instead of the previous
+# close. Call and put sides are shown SEPARATELY so two-sided build-up/unwinding
+# is visible. One snapshot per real data fetch (dedup on payload timestamp), kept
+# in oi15_snapshots.json, reset each day / on expiry change. No extra Dhan calls;
+# nothing else reads this file.
+_OI15_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi15_snapshots.json")
+_OI15_WINDOW_S = 15 * 60
+_OI15_KEEP_S = 40 * 60
+
+
+def _oi15_secs(fetch_key):
+    """Seconds since midnight IST from the payload timestamp (falls back to now)."""
+    import re as _re_o
+    _m = _re_o.search(r"(\d{2}):(\d{2}):(\d{2})", str(fetch_key or ""))
+    if _m:
+        return int(_m.group(1)) * 3600 + int(_m.group(2)) * 60 + int(_m.group(3))
+    _n = now_ist()
+    return _n.hour * 3600 + _n.minute * 60 + _n.second
+
+
+def _oi15_record(fetch_key, df_band, expiry=None):
+    """Store this fetch's per-strike call/put OI; return (baseline_snap, current_snap). Never raises."""
+    today = now_ist().date().isoformat()
+    try:
+        cur_oi = {str(int(r["strike"])): [float(r.get("call_oi") or 0), float(r.get("put_oi") or 0)]
+                  for r in df_band.to_dict("records")}
+        _k = str(fetch_key or "")
+        cur = {"k": _k, "s": _oi15_secs(_k), "oi": cur_oi}
+        with _MP_TS_LOCK:
+            try:
+                with open(_OI15_FILE, "r") as _f:
+                    _d = json.load(_f)
+                if _d.get("date") != today or str(_d.get("exp")) != str(expiry):
+                    _d = {}
+            except Exception:
+                _d = {}
+            snaps = _d.get("snaps") or []
+            if _k and cur_oi and not any(s.get("k") == _k for s in snaps[-5:]):
+                snaps.append(cur)
+                snaps = [s for s in snaps if cur["s"] - s.get("s", 0) <= _OI15_KEEP_S]
+                _atomic_json_write(_OI15_FILE, {"date": today, "exp": str(expiry), "snaps": snaps})
+        older = [s for s in snaps if s.get("k") != _k and s.get("s", 0) < cur["s"]]
+        if not older:
+            return None, cur
+        full = [s for s in older if cur["s"] - s["s"] >= _OI15_WINDOW_S]
+        base = max(full, key=lambda s: s["s"]) if full else min(older, key=lambda s: s["s"])
+        return base, cur
+    except Exception as _e:
+        try:
+            print(f"[oi15] {_e}", flush=True)
+        except Exception:
+            pass
+        return None, None
+
+
+def _oi15_figure(df_band, spot, base, cur):
+    """Grouped bars per strike: call component up (+) / put component down (−).
+    Solid = build-up, light hatched = unwinding. ◆ = net (call − put), same sign
+    convention as the Δ-Weighted OI Change Momentum chart (+ bearish / − bullish)."""
+    fig = go.Figure()
+    _hh = lambda s: f"{s // 3600:02d}:{(s % 3600) // 60:02d}"
+    if not base or not cur:
+        fig.add_annotation(text="Collecting OI snapshots… (needs at least 2 data fetches)",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+                           font=dict(size=13, color="#6B7280"))
+        _title = "★ Δ-Weighted OI Change · last 15 min — collecting"
+    else:
+        xs, cv, pv, nv, cc, pc, cp, pp, ch, ph = [], [], [], [], [], [], [], [], [], []
+        for r in df_band.sort_values("strike").to_dict("records"):
+            k = str(int(r["strike"]))
+            if k not in base["oi"] or k not in cur["oi"]:
+                continue
+            d_c = cur["oi"][k][0] - base["oi"][k][0]
+            d_p = cur["oi"][k][1] - base["oi"][k][1]
+            a_c = abs(float(r.get("call_delta") or 0)); a_p = abs(float(r.get("put_delta") or 0))
+            c_w = d_c * a_c; p_w = d_p * a_p
+            xs.append(int(k)); cv.append(c_w); pv.append(-p_w); nv.append((c_w - p_w) if (c_w or p_w) else None)
+            cc.append("#DC2626" if c_w >= 0 else "#FCA5A5"); cp.append("" if c_w >= 0 else "/")
+            pc.append("#059669" if p_w >= 0 else "#86EFAC"); pp.append("" if p_w >= 0 else "/")
+            ch.append(f"{'Call BUILD-UP' if d_c >= 0 else 'Call UNWINDING'}<br>ΔOI {d_c:+,.0f} · |Δ| {a_c:.2f}")
+            ph.append(f"{'Put BUILD-UP' if d_p >= 0 else 'Put UNWINDING'}<br>ΔOI {d_p:+,.0f} · |Δ| {a_p:.2f}")
+        fig.add_trace(go.Bar(x=xs, y=cv, name="Call side",
+                             marker=dict(color=cc, pattern=dict(shape=cp, fgcolor="#DC2626")),
+                             customdata=ch, hovertemplate="%{x}<br>%{customdata}<br>Δ×ΔOI %{y:+,.0f}<extra></extra>"))
+        fig.add_trace(go.Bar(x=xs, y=pv, name="Put side",
+                             marker=dict(color=pc, pattern=dict(shape=pp, fgcolor="#059669")),
+                             customdata=ph, hovertemplate="%{x}<br>%{customdata}<br>plotted %{y:+,.0f}<extra></extra>"))
+        fig.add_trace(go.Scatter(x=xs, y=nv, name="Net (call − put)", mode="markers",
+                                 marker=dict(symbol="diamond", size=8, color="#111827",
+                                             line=dict(width=1, color="#fff")),
+                                 hovertemplate="%{x}<br>Net Δ×ΔOI %{y:+,.0f}<extra></extra>"))
+        _mins = max(1, round((cur["s"] - base["s"]) / 60))
+        _title = (f"★ Δ-Weighted OI Change · last {_mins} min ({_hh(base['s'])} → {_hh(cur['s'])})"
+                  "<br><sup>Above 0 = bearish pressure · Below 0 = bullish · solid = build-up · hatched = unwinding</sup>")
+    if spot:
+        fig.add_vline(x=spot, line_width=2, line_dash="dash", line_color="#0891B2",
+                      annotation_text=f"Spot {spot:,.0f}", annotation_position="top",
+                      annotation_font=dict(size=9, color="#0891B2"))
+    fig.add_hline(y=0, line_width=1, line_color="#9CA3AF")
+    fig.update_layout(
+        title=dict(text=_title, x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+        height=320, barmode="group", bargap=0.18, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=55, r=18, t=46, b=70), font=dict(color="#1A1A2E", size=11),
+        hoverlabel=dict(bgcolor="#fff", font_color="#1A1A2E", font_size=11),
+        legend=dict(orientation="h", y=-0.25, x=0, font=dict(size=9)),
+        xaxis=dict(title=dict(text="Strike", font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text="Δ×ΔOI (15 min)", font=dict(size=10, color="#6B7280")),
+                   tickfont=dict(size=9), tickformat=",.0f"),
+    )
+    return fig
+
+
 def compute_metrics(df, spot, expiry=None, history=None):
     if df.empty:
         return {}
@@ -8088,6 +8202,14 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             _s4_style(f2, "★ Δ-Weighted OI Change Momentum · Red=Call side · Green=Put side", "Δ×ΔOI (net)")
             st.plotly_chart(f2, width='stretch', config={"displayModeBar":False})
 
+        # v34: rolling 15-min Δ-weighted OI change (call/put split) — full width
+        try:
+            _oi15_b, _oi15_c = _oi15_record(payload.get("ts_ist"), df_band, payload.get("expiry"))
+            _oi15_fig = _oi15_figure(df_band, spot, _oi15_b, _oi15_c)
+            st.plotly_chart(_oi15_fig, width='stretch', config={"displayModeBar":False}, key="s4_oi15")
+        except Exception as _oi15_e:
+            st.caption(f"15-min Δ-weighted OI change unavailable ({_oi15_e})")
+
         # Row 2 — Net GEX per Strike (with Gamma Flip) | IV Smile
         _s4_r2c1, _s4_r2c2 = st.columns(2)
         with _s4_r2c1:
@@ -8680,6 +8802,33 @@ with _slot_summary:
         with _fdm_c2:
             st.plotly_chart(f2, width='stretch', config={"displayModeBar": False}, key="fdm_s4_f2")
 
+    # v34: GEX × Gamma Flip Regime Matrix | last-15-min Δ-weighted OI change — same row
+    _fdm_r2c1, _fdm_r2c2 = st.columns(2)
+    with _fdm_r2c1:
+        # ── v25: GEX × Gamma Flip Regime Matrix — INDEPENDENT ADD-ON ─────────────
+        # Reads only values already on hand (spot, m, the GEX walls shown in the
+        # tiles above, persisted history, India VIX, VWAP). Writes nothing and no
+        # other panel reads it. Any failure is contained to this block.
+        try:
+            _grm_vix  = globals().get("_vix_data") or {}
+            _grm_vwap = globals().get("_vwap_or_data") or {}
+            _grm = compute_gamma_regime_matrix(
+                spot=spot, gex=m.get("gex", 0), gamma_flip=m.get("gamma_flip"),
+                call_wall=(_sum_cw if _sum_cw is not None else m.get("resistance")),
+                put_wall=(_sum_pw if _sum_pw is not None else m.get("support")),
+                history=history, momentum=m.get("momentum"),
+                vix_change=(_grm_vix.get("vix_change") if _grm_vix.get("available") else None),
+                above_vwap=_grm_vwap.get("above_vwap"), expiry=expiry, now=now_ist())
+            st.markdown(render_gamma_regime_matrix_html(_grm, part="live"), unsafe_allow_html=True)   # v27: current state only
+            _v27_grm_for_bottom = _grm                                                               # v27: grid at bottom
+        except Exception as _grm_err:
+            st.info(f"GEX × Gamma Flip Regime Matrix — collecting data ({_grm_err}).")
+
+    with _fdm_r2c2:
+        _oi15_fdm = globals().get("_oi15_fig")
+        if _oi15_fdm is not None:
+            st.plotly_chart(_oi15_fdm, width='stretch', config={"displayModeBar": False}, key="fdm_oi15")
+
     # v32: Max Pain time series (CURRENT green / NEXT blue)
     try:
         st.plotly_chart(_mp_ts_figure(_mp_ts_record(payload.get("ts_ist"), _mp_cur_s4, _mp_nxt_s4,
@@ -8694,25 +8843,6 @@ with _slot_summary:
                         width='stretch', config={"displayModeBar": False}, key="fdm_gex_walls_ts")
     except Exception as _wts_e:
         st.caption(f"GEX walls time series unavailable ({_wts_e})")
-
-    # ── v25: GEX × Gamma Flip Regime Matrix — INDEPENDENT ADD-ON ─────────────
-    # Reads only values already on hand (spot, m, the GEX walls shown in the
-    # tiles above, persisted history, India VIX, VWAP). Writes nothing and no
-    # other panel reads it. Any failure is contained to this block.
-    try:
-        _grm_vix  = globals().get("_vix_data") or {}
-        _grm_vwap = globals().get("_vwap_or_data") or {}
-        _grm = compute_gamma_regime_matrix(
-            spot=spot, gex=m.get("gex", 0), gamma_flip=m.get("gamma_flip"),
-            call_wall=(_sum_cw if _sum_cw is not None else m.get("resistance")),
-            put_wall=(_sum_pw if _sum_pw is not None else m.get("support")),
-            history=history, momentum=m.get("momentum"),
-            vix_change=(_grm_vix.get("vix_change") if _grm_vix.get("available") else None),
-            above_vwap=_grm_vwap.get("above_vwap"), expiry=expiry, now=now_ist())
-        st.markdown(render_gamma_regime_matrix_html(_grm, part="live"), unsafe_allow_html=True)   # v27: current state only
-        _v27_grm_for_bottom = _grm                                                               # v27: grid at bottom
-    except Exception as _grm_err:
-        st.info(f"GEX × Gamma Flip Regime Matrix — collecting data ({_grm_err}).")
 
     # ── v27: Synthetic-forward bias ladder + 25Δ RR skew (inside the Final Decision Matrix) ──
     try:
