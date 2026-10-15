@@ -1012,6 +1012,7 @@ def _v36_dhan_store():
 _V36 = _v36_dhan_store()
 _V38_MF_GAP     = 1.2     # s — minimum gap between any two /marketfeed calls (this app)
 _V38_MF_BACKOFF = 120     # s — pause all /marketfeed calls after a 429 / code 805
+_V39_AUTH_PAUSE = 600     # s — no calls with a token Dhan has just rejected
 _dhan_session_lock = _V36["sess_lock"]
 
 def _get_dhan_session():
@@ -1056,6 +1057,12 @@ def _dhan_post(url, payload, timeout=15):
         "client-id":    str(DHAN_CLIENT_ID),
         "Content-Type": "application/json",
     }
+    # v39: token-rejected gate — once Dhan rejects THIS token, make no further calls
+    # with it for 10 min (an expired token was being retried by every fetcher, every
+    # minute). A new token in Secrets is a different string, so it is used at once.
+    if (_V36.get("auth_fail_tok") == DHAN_ACCESS_TOKEN
+            and time.time() - _V36.get("auth_fail_ts", 0.0) < _V39_AUTH_PAUSE):
+        raise DhanAPIError("HTTP 401: token rejected by Dhan — calls paused (v39); update DHAN_ACCESS_TOKEN")
     sess = _get_dhan_session()
     _is_mf = "/marketfeed/" in url                                # v38: quote-API gate
     if _is_mf:
@@ -1087,8 +1094,10 @@ def _dhan_post(url, payload, timeout=15):
             msg = body.get("errorMessage") or body.get("message") or body
         except Exception:
             msg = resp.text[:200] if resp.text else resp.reason
-        if resp.status_code == 401 or "808" in str(msg):          # v37: token rejected
+        if (resp.status_code == 401 or "808" in str(msg)
+                or "invalid token" in str(msg).lower()):          # v37/v39: token rejected
             _V36["auth_fail_ts"] = time.time()
+            _V36["auth_fail_tok"] = DHAN_ACCESS_TOKEN
         raise DhanAPIError(f"HTTP {resp.status_code}: {msg}")
     _V36["auth_fail_ts"] = 0.0                                     # v37: token accepted
 
