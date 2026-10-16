@@ -2000,10 +2000,10 @@ def _oi_session_split_finish(fig):
 
 
 # ─── v39 ADDITION: Rolling-15-min Δ-weighted OI change → MOMENTUM STRENGTH ──
-# Raw strength = 100 × Σ net(Δ×ΔOI) / Σ (|call Δ×ΔOI| + |put Δ×ΔOI|) over the SAME
+# Raw strength = −100 × Σ net(Δ×ΔOI) / Σ (|call Δ×ΔOI| + |put Δ×ΔOI|) over the SAME
 # strikes / SAME 15-min baseline used by the "Δ-Weighted OI Change · last 15 min"
 # chart (net = call − put, identical sign convention). Range −100 … +100.
-#   NEGATIVE = UPWARD momentum strength (green) · POSITIVE = DOWNWARD (red).
+#   v39.1: POSITIVE = UPWARD momentum strength (green) · NEGATIVE = DOWNWARD (red).
 # Option 1 — ACTIVITY FLOOR: a quiet window can print an extreme ratio from tiny
 #   flow, so the plotted strength = raw × min(1, gross ÷ (0.5 × median gross of
 #   today's ticks)). Full strength only when the window carries at least half the
@@ -2036,7 +2036,7 @@ def _oi15_strength(df_band, base, cur):
             net += c_w - p_w
             gross += abs(c_w) + abs(p_w)
         win = max(1, round((cur["s"] - base["s"]) / 60))
-        return (round(100.0 * net / gross, 1) if gross > 0 else 0.0), win, float(gross)
+        return (round(-100.0 * net / gross, 1) if gross > 0 else 0.0), win, float(gross)   # v39.1: upward = +
     except Exception as _e:
         try:
             print(f"[oi15-strength] {_e}", flush=True)
@@ -2054,7 +2054,7 @@ def _oi_session_strength(df_band):
             p_w = float(r.get("put_oi_chg") or 0) * abs(float(r.get("put_delta") or 0))
             net += c_w - p_w
             gross += abs(c_w) + abs(p_w)
-        return round(100.0 * net / gross, 1) if gross > 0 else 0.0
+        return round(-100.0 * net / gross, 1) if gross > 0 else 0.0   # v39.1: upward = +
     except Exception:
         return None
 
@@ -2069,7 +2069,7 @@ def _oi15s_record(fetch_key, raw, gross, sess, spot, win_min=None):
             try:
                 with open(_OI15S_FILE, "r") as _f:
                     _d = json.load(_f)
-                if _d.get("date") != today:
+                if _d.get("date") != today or _d.get("v") != 2:   # v39.1: sign convention v2
                     _d = {}
             except Exception:
                 _d = {}
@@ -2090,7 +2090,7 @@ def _oi15s_record(fetch_key, raw, gross, sess, spot, win_min=None):
                             "ss": (float(sess) if sess is not None else None),
                             "spot": float(spot), "w": win_min})
                 pts = pts[-_OI15S_KEEP:]
-                _atomic_json_write(_OI15S_FILE, {"date": today, "pts": pts})
+                _atomic_json_write(_OI15S_FILE, {"date": today, "v": 2, "pts": pts})
             return pts
     except Exception as _e:
         try:
@@ -2102,7 +2102,7 @@ def _oi15s_record(fetch_key, raw, gross, sess, spot, win_min=None):
 
 def _oi15s_figure(pts):
     """Full-width dual-axis time series: activity-floored 15-min momentum strength (left;
-    green below 0 = upward, red above 0 = downward, thin zero line), session strength
+    green above 0 = upward, red below 0 = downward, thin zero line), session strength
     (faint dotted context line, left) and NIFTY spot (right). Current value in a corner."""
     fig = go.Figure()
     if not pts:
@@ -2127,13 +2127,13 @@ def _oi15s_figure(pts):
             if (y0 < 0 < y) or (y0 > 0 > y):
                 px.append(x0 + (x - x0) * (y0 / (y0 - y))); py.append(0.0)
         px.append(x); py.append(y)
-    up_y = [v if v <= 0 else None for v in py]      # negative = upward momentum (green)
-    dn_y = [v if v >= 0 else None for v in py]      # positive = downward momentum (red)
-    fig.add_trace(go.Scatter(x=px, y=up_y, name="15-min upward strength (< 0)", mode="lines",
+    up_y = [v if v >= 0 else None for v in py]      # v39.1: positive = upward momentum (green)
+    dn_y = [v if v <= 0 else None for v in py]      # v39.1: negative = downward momentum (red)
+    fig.add_trace(go.Scatter(x=px, y=up_y, name="15-min upward strength (> 0)", mode="lines",
                              line=dict(color="#059669", width=2.4), fill="tozeroy",
                              fillcolor="rgba(5,150,105,0.18)", connectgaps=False,
                              hovertemplate="15-min %{y:+.1f} · UPWARD<extra></extra>"))
-    fig.add_trace(go.Scatter(x=px, y=dn_y, name="15-min downward strength (> 0)", mode="lines",
+    fig.add_trace(go.Scatter(x=px, y=dn_y, name="15-min downward strength (< 0)", mode="lines",
                              line=dict(color="#DC2626", width=2.4), fill="tozeroy",
                              fillcolor="rgba(220,38,38,0.18)", connectgaps=False,
                              hovertemplate="15-min %{y:+.1f} · DOWNWARD<extra></extra>"))
@@ -2153,8 +2153,8 @@ def _oi15s_figure(pts):
     # current value in the top-right corner
     _last = pts[-1]
     _cv = ys[-1]
-    _cc = "#059669" if _cv < 0 else ("#DC2626" if _cv > 0 else "#6B7280")
-    _cw = "▲ UPWARD" if _cv < 0 else ("▼ DOWNWARD" if _cv > 0 else "NEUTRAL")
+    _cc = "#059669" if _cv > 0 else ("#DC2626" if _cv < 0 else "#6B7280")
+    _cw = "▲ UPWARD" if _cv > 0 else ("▼ DOWNWARD" if _cv < 0 else "NEUTRAL")
     _f = _last.get("f")
     if _f is None:
         _fl = "activity floor calibrating"
@@ -2167,8 +2167,8 @@ def _oi15s_figure(pts):
     if _last.get("ss") is not None and abs(_cv) >= 15 and abs(_last["ss"]) >= 15 \
             and (_cv > 0) != (_last["ss"] > 0):
         _div = "<br><span style='font-size:11px;color:#B45309'><b>⚠ 15-min diverging from session</b></span>"
-    fig.add_annotation(xref="paper", yref="paper", x=0.995, y=0.97, xanchor="right", yanchor="top",
-                       showarrow=False, align="right", bgcolor="rgba(255,255,255,0.93)",
+    fig.add_annotation(xref="paper", yref="paper", x=0.005, y=0.03, xanchor="left", yanchor="bottom",
+                       showarrow=False, align="left", bgcolor="rgba(255,255,255,0.93)",   # v39.1: lower-left
                        bordercolor=_cc, borderwidth=2, borderpad=6,
                        text=(f"<b style='font-size:24px;color:{_cc}'>{_cv:+.1f}</b><br>"
                              f"<span style='font-size:12px;color:{_cc}'><b>{_cw}</b> momentum</span><br>"
@@ -2177,7 +2177,7 @@ def _oi15s_figure(pts):
     fig.update_layout(
         title=dict(text="★ 15-min Δ-Weighted OI Momentum STRENGTH vs NIFTY · today"
                         "<br><sup>Strength = 100 × net(call − put Δ×ΔOI) ÷ gross, damped in quiet windows · "
-                        "−100 = max upward (green) · +100 = max downward (red) · dotted = session strength · "
+                        "+100 = max upward (green) · −100 = max downward (red) · dotted = session strength · "
                         "right axis = NIFTY</sup>",
                    x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
         height=330, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
