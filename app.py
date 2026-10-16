@@ -1012,7 +1012,6 @@ def _v36_dhan_store():
 _V36 = _v36_dhan_store()
 _V38_MF_GAP     = 1.2     # s — minimum gap between any two /marketfeed calls (this app)
 _V38_MF_BACKOFF = 120     # s — pause all /marketfeed calls after a 429 / code 805
-_V39_AUTH_PAUSE = 600     # s — no calls with a token Dhan has just rejected
 _dhan_session_lock = _V36["sess_lock"]
 
 def _get_dhan_session():
@@ -1057,12 +1056,6 @@ def _dhan_post(url, payload, timeout=15):
         "client-id":    str(DHAN_CLIENT_ID),
         "Content-Type": "application/json",
     }
-    # v39: token-rejected gate — once Dhan rejects THIS token, make no further calls
-    # with it for 10 min (an expired token was being retried by every fetcher, every
-    # minute). A new token in Secrets is a different string, so it is used at once.
-    if (_V36.get("auth_fail_tok") == DHAN_ACCESS_TOKEN
-            and time.time() - _V36.get("auth_fail_ts", 0.0) < _V39_AUTH_PAUSE):
-        raise DhanAPIError("HTTP 401: token rejected by Dhan — calls paused (v39); update DHAN_ACCESS_TOKEN")
     sess = _get_dhan_session()
     _is_mf = "/marketfeed/" in url                                # v38: quote-API gate
     if _is_mf:
@@ -1094,10 +1087,8 @@ def _dhan_post(url, payload, timeout=15):
             msg = body.get("errorMessage") or body.get("message") or body
         except Exception:
             msg = resp.text[:200] if resp.text else resp.reason
-        if (resp.status_code == 401 or "808" in str(msg)
-                or "invalid token" in str(msg).lower()):          # v37/v39: token rejected
+        if resp.status_code == 401 or "808" in str(msg):          # v37: token rejected
             _V36["auth_fail_ts"] = time.time()
-            _V36["auth_fail_tok"] = DHAN_ACCESS_TOKEN
         raise DhanAPIError(f"HTTP {resp.status_code}: {msg}")
     _V36["auth_fail_ts"] = 0.0                                     # v37: token accepted
 
@@ -2005,6 +1996,202 @@ def _oi_session_split_finish(fig):
     """Applied AFTER the existing Section-4 styling: grouped bars, no legend (key is in the title)."""
     fig.update_layout(barmode="group", bargap=0.18, showlegend=False)
     fig.update_yaxes(tickformat=",.0f")
+    return fig
+
+
+# ─── v39 ADDITION: Rolling-15-min Δ-weighted OI change → MOMENTUM STRENGTH ──
+# Raw strength = 100 × Σ net(Δ×ΔOI) / Σ (|call Δ×ΔOI| + |put Δ×ΔOI|) over the SAME
+# strikes / SAME 15-min baseline used by the "Δ-Weighted OI Change · last 15 min"
+# chart (net = call − put, identical sign convention). Range −100 … +100.
+#   NEGATIVE = UPWARD momentum strength (green) · POSITIVE = DOWNWARD (red).
+# Option 1 — ACTIVITY FLOOR: a quiet window can print an extreme ratio from tiny
+#   flow, so the plotted strength = raw × min(1, gross ÷ (0.5 × median gross of
+#   today's ticks)). Full strength only when the window carries at least half the
+#   day's typical flow. Inactive until OI15S_CALIB_N ticks exist (calibrating).
+# Option 2 — SESSION CONTEXT: same formula on the whole-session OI change (vs
+#   previous close), drawn as a faint dotted line. 15-min vs session divergence =
+#   early sign the day's trend is tiring.
+# One point per real data fetch (dedup on payload timestamp), kept in
+# oi15_strength_timeseries.json with NIFTY spot, reset each day.
+# Read-only use of snapshots _oi15_record() already stores — no extra Dhan calls.
+_OI15S_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi15_strength_timeseries.json")
+_OI15S_KEEP = 500
+OI15S_FLOOR_FRAC = 0.5    # full strength needs ≥ 50% of today's median gross 15-min flow
+OI15S_CALIB_N    = 5      # ticks needed before the activity floor switches on
+
+
+def _oi15_strength(df_band, base, cur):
+    """(raw strength −100..+100, window minutes, gross Δ×ΔOI) from the 15-min snapshots,
+    or (None, None, None)."""
+    try:
+        if not base or not cur:
+            return None, None, None
+        net = gross = 0.0
+        for r in df_band.to_dict("records"):
+            k = str(int(r["strike"]))
+            if k not in base["oi"] or k not in cur["oi"]:
+                continue
+            c_w = (cur["oi"][k][0] - base["oi"][k][0]) * abs(float(r.get("call_delta") or 0))
+            p_w = (cur["oi"][k][1] - base["oi"][k][1]) * abs(float(r.get("put_delta") or 0))
+            net += c_w - p_w
+            gross += abs(c_w) + abs(p_w)
+        win = max(1, round((cur["s"] - base["s"]) / 60))
+        return (round(100.0 * net / gross, 1) if gross > 0 else 0.0), win, float(gross)
+    except Exception as _e:
+        try:
+            print(f"[oi15-strength] {_e}", flush=True)
+        except Exception:
+            pass
+        return None, None, None
+
+
+def _oi_session_strength(df_band):
+    """Option 2: same strength formula on the whole-session OI change (vs previous close)."""
+    try:
+        net = gross = 0.0
+        for r in df_band.to_dict("records"):
+            c_w = float(r.get("call_oi_chg") or 0) * abs(float(r.get("call_delta") or 0))
+            p_w = float(r.get("put_oi_chg") or 0) * abs(float(r.get("put_delta") or 0))
+            net += c_w - p_w
+            gross += abs(c_w) + abs(p_w)
+        return round(100.0 * net / gross, 1) if gross > 0 else 0.0
+    except Exception:
+        return None
+
+
+def _oi15s_record(fetch_key, raw, gross, sess, spot, win_min=None):
+    """Append one tick per fetch (raw, damped strength, gross, session strength, spot);
+    returns today's points. Never raises."""
+    import re as _re_s
+    today = now_ist().date().isoformat()
+    try:
+        with _MP_TS_LOCK:
+            try:
+                with open(_OI15S_FILE, "r") as _f:
+                    _d = json.load(_f)
+                if _d.get("date") != today:
+                    _d = {}
+            except Exception:
+                _d = {}
+            pts = _d.get("pts") or []
+            _k = str(fetch_key or "")
+            if _k and raw is not None and spot and not any(p.get("k") == _k for p in pts[-5:]):
+                # Option 1: activity floor vs today's typical gross 15-min flow
+                _gs = [float(p["g"]) for p in pts if p.get("g")] + ([float(gross)] if gross else [])
+                if len(_gs) >= OI15S_CALIB_N:
+                    _ref = OI15S_FLOOR_FRAC * float(np.median(_gs))
+                    fac = min(1.0, float(gross or 0) / _ref) if _ref > 0 else 1.0
+                else:
+                    fac = None                                  # calibrating — no damping yet
+                _tm = _re_s.search(r"(\d{2}:\d{2}:\d{2})", _k)
+                pts.append({"k": _k, "t": _tm.group(1) if _tm else now_ist().strftime("%H:%M:%S"),
+                            "r": float(raw), "s": round(float(raw) * (fac if fac is not None else 1.0), 1),
+                            "f": (round(fac, 2) if fac is not None else None), "g": float(gross or 0),
+                            "ss": (float(sess) if sess is not None else None),
+                            "spot": float(spot), "w": win_min})
+                pts = pts[-_OI15S_KEEP:]
+                _atomic_json_write(_OI15S_FILE, {"date": today, "pts": pts})
+            return pts
+    except Exception as _e:
+        try:
+            print(f"[oi15-strength ts] {_e}", flush=True)
+        except Exception:
+            pass
+        return []
+
+
+def _oi15s_figure(pts):
+    """Full-width dual-axis time series: activity-floored 15-min momentum strength (left;
+    green below 0 = upward, red above 0 = downward, thin zero line), session strength
+    (faint dotted context line, left) and NIFTY spot (right). Current value in a corner."""
+    fig = go.Figure()
+    if not pts:
+        fig.add_annotation(text="Collecting 15-min momentum strength ticks…", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False, font=dict(size=13, color="#6B7280"))
+        fig.update_layout(height=330, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                          margin=dict(l=60, r=60, t=50, b=40))
+        return fig
+    _day = now_ist().date()
+    xs, ys, sp, ss = [], [], [], []
+    for p in pts:
+        try:
+            xs.append(datetime.combine(_day, datetime.strptime(p["t"], "%H:%M:%S").time()))
+            ys.append(float(p["s"])); sp.append(p.get("spot")); ss.append(p.get("ss"))
+        except Exception:
+            continue
+    # insert interpolated zero-crossings so the colour switches exactly at 0
+    px, py = [], []
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        if i > 0:
+            y0, x0 = ys[i - 1], xs[i - 1]
+            if (y0 < 0 < y) or (y0 > 0 > y):
+                px.append(x0 + (x - x0) * (y0 / (y0 - y))); py.append(0.0)
+        px.append(x); py.append(y)
+    up_y = [v if v <= 0 else None for v in py]      # negative = upward momentum (green)
+    dn_y = [v if v >= 0 else None for v in py]      # positive = downward momentum (red)
+    fig.add_trace(go.Scatter(x=px, y=up_y, name="15-min upward strength (< 0)", mode="lines",
+                             line=dict(color="#059669", width=2.4), fill="tozeroy",
+                             fillcolor="rgba(5,150,105,0.18)", connectgaps=False,
+                             hovertemplate="15-min %{y:+.1f} · UPWARD<extra></extra>"))
+    fig.add_trace(go.Scatter(x=px, y=dn_y, name="15-min downward strength (> 0)", mode="lines",
+                             line=dict(color="#DC2626", width=2.4), fill="tozeroy",
+                             fillcolor="rgba(220,38,38,0.18)", connectgaps=False,
+                             hovertemplate="15-min %{y:+.1f} · DOWNWARD<extra></extra>"))
+    if any(v is not None for v in ss):                 # Option 2: session context
+        fig.add_trace(go.Scatter(x=xs, y=ss, name="Session strength (context)", mode="lines",
+                                 line=dict(color="#6B7280", width=1.6, dash="dot"), opacity=0.75,
+                                 connectgaps=True,
+                                 hovertemplate="Session %{y:+.1f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=xs, y=sp, name="NIFTY spot", mode="lines", yaxis="y2",
+                             line=dict(color="#1E3A8A", width=1.8),
+                             hovertemplate="NIFTY %{y:,.2f}<extra></extra>"))
+    fig.add_hline(y=0, line_width=1, line_color="#6B7280")       # thin zero line
+    # auto-scaling: strength axis symmetric about 0 (covers both strength lines), spot padded
+    _m = max([abs(v) for v in ys] + [abs(v) for v in ss if v is not None] + [5.0]) * 1.15
+    _sv = [v for v in sp if v]
+    _pad = max((max(_sv) - min(_sv)) * 0.10, 5.0) if _sv else 5.0
+    # current value in the top-right corner
+    _last = pts[-1]
+    _cv = ys[-1]
+    _cc = "#059669" if _cv < 0 else ("#DC2626" if _cv > 0 else "#6B7280")
+    _cw = "▲ UPWARD" if _cv < 0 else ("▼ DOWNWARD" if _cv > 0 else "NEUTRAL")
+    _f = _last.get("f")
+    if _f is None:
+        _fl = "activity floor calibrating"
+    elif _f < 1.0:
+        _fl = f"quiet window · damped ×{_f:.2f} (raw {_last.get('r', _cv):+.1f})"
+    else:
+        _fl = "full activity"
+    _sl = (f"session {_last['ss']:+.1f}" if _last.get("ss") is not None else "session —")
+    _div = ""
+    if _last.get("ss") is not None and abs(_cv) >= 15 and abs(_last["ss"]) >= 15 \
+            and (_cv > 0) != (_last["ss"] > 0):
+        _div = "<br><span style='font-size:11px;color:#B45309'><b>⚠ 15-min diverging from session</b></span>"
+    fig.add_annotation(xref="paper", yref="paper", x=0.995, y=0.97, xanchor="right", yanchor="top",
+                       showarrow=False, align="right", bgcolor="rgba(255,255,255,0.93)",
+                       bordercolor=_cc, borderwidth=2, borderpad=6,
+                       text=(f"<b style='font-size:24px;color:{_cc}'>{_cv:+.1f}</b><br>"
+                             f"<span style='font-size:12px;color:{_cc}'><b>{_cw}</b> momentum</span><br>"
+                             f"<span style='font-size:10px;color:#6B7280'>{_fl} · {_sl}"
+                             + (f" · last {_last['w']} min" if _last.get("w") else "") + "</span>" + _div))
+    fig.update_layout(
+        title=dict(text="★ 15-min Δ-Weighted OI Momentum STRENGTH vs NIFTY · today"
+                        "<br><sup>Strength = 100 × net(call − put Δ×ΔOI) ÷ gross, damped in quiet windows · "
+                        "−100 = max upward (green) · +100 = max downward (red) · dotted = session strength · "
+                        "right axis = NIFTY</sup>",
+                   x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+        height=330, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=60, r=65, t=58, b=40), font=dict(color="#1A1A2E", size=11),
+        legend=dict(orientation="h", y=-0.18, x=0, font=dict(size=10)), hovermode="x unified",
+        xaxis=dict(title=dict(text="Time (IST)", font=dict(size=10, color="#6B7280")),
+                   tickformat="%H:%M", tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text="Momentum strength", font=dict(size=10, color="#6B7280")),
+                   range=[-_m, _m], tickfont=dict(size=9), zeroline=False, gridcolor="#F3F4F6"),
+        yaxis2=dict(title=dict(text="NIFTY spot", font=dict(size=10, color="#1E3A8A")),
+                    overlaying="y", side="right", showgrid=False, tickformat=",.0f",
+                    tickfont=dict(size=9, color="#1E3A8A"),
+                    range=([min(_sv) - _pad, max(_sv) + _pad] if _sv else None)),
+    )
     return fig
 
 
@@ -8950,6 +9137,16 @@ with _slot_summary:
         _oi15_fdm = globals().get("_oi15_fig")
         if _oi15_fdm is not None:
             st.plotly_chart(_oi15_fdm, width='stretch', config={"displayModeBar": False}, key="fdm_oi15")
+
+    # v39: 15-min Δ-weighted OI momentum STRENGTH vs NIFTY — full width, above Max Pain
+    try:
+        _oi15s_val, _oi15s_win, _oi15s_g = _oi15_strength(df_band, globals().get("_oi15_b"), globals().get("_oi15_c"))
+        _oi15s_ss = _oi_session_strength(df_band)
+        st.plotly_chart(_oi15s_figure(_oi15s_record(payload.get("ts_ist"), _oi15s_val, _oi15s_g,
+                                                    _oi15s_ss, spot, _oi15s_win)),
+                        width='stretch', config={"displayModeBar": False}, key="fdm_oi15_strength")
+    except Exception as _oi15s_e:
+        st.caption(f"15-min momentum strength unavailable ({_oi15s_e})")
 
     # v32: Max Pain time series (CURRENT green / NEXT blue)
     try:
