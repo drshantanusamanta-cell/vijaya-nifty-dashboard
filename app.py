@@ -41,6 +41,10 @@
 ║  v41 — 18-Oct-2026: IV engine OI cross-check — wing IV×OI quadrant║
 ║        (vega-wtd ΔOI) + flip tags from Δ-wtd ΔOI, same window;   ║
 ║        not in the score · OI refresh cadence reported            ║
+║  v42 — 19-Oct-2026: Dhan token fix — token read live (Secrets or  ║
+║        owner sidebar, no reboot) · 5-min pause on 401 instead of ║
+║        hammering Dhan · demo fallback never enters live state    ║
+║        (history, IV engine, FDM) · stalled-feed banner           ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -161,8 +165,44 @@ def _get_secret(key, default=""):
     except Exception:
         return os.environ.get(key, default)
 
-DHAN_CLIENT_ID    = _get_secret("DHAN_CLIENT_ID")
-DHAN_ACCESS_TOKEN = _get_secret("DHAN_ACCESS_TOKEN")
+# v42: the token is read on EVERY Dhan call (not frozen at start-up), so a new
+# token works without a reboot — also inside the background fetcher thread.
+# Priority: token saved from the owner sidebar (dhan_token.json), unless the
+# Secrets token has been changed since that save — then Secrets wins again.
+_V42_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dhan_token.json")
+
+def _v42_fp(tok):
+    import hashlib
+    return hashlib.sha256(str(tok or "").encode()).hexdigest()[:16] if tok else ""
+
+def _dhan_creds():
+    """v42: returns (client_id, access_token, source_label)."""
+    cid = str(_get_secret("DHAN_CLIENT_ID") or "").strip()
+    tok = str(_get_secret("DHAN_ACCESS_TOKEN") or "").strip()
+    src = "Secrets"
+    try:
+        with open(_V42_TOKEN_FILE, "r") as _tf:
+            _o = json.load(_tf)
+        if _o.get("access_token") and _o.get("secrets_fp", "") == _v42_fp(tok):
+            tok = str(_o["access_token"]).strip()
+            cid = str(_o.get("client_id") or cid).strip()
+            src = "owner sidebar"
+    except Exception:
+        pass
+    return cid, tok, src
+
+def _v42_save_token(tok, cid=""):
+    """v42: owner sidebar → dhan_token.json (owner-only file, atomic)."""
+    rec = {"access_token": tok.strip(), "client_id": cid.strip(),
+           "secrets_fp": _v42_fp(str(_get_secret("DHAN_ACCESS_TOKEN") or "").strip()),
+           "saved_ts": time.time()}
+    tmp = _V42_TOKEN_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as _tf:
+        json.dump(rec, _tf)
+    os.replace(tmp, _V42_TOKEN_FILE)
+
+DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, _V42_CRED_SRC = _dhan_creds()   # start-up value only
 USE_DHAN          = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
 USE_DEMO_MODE     = not USE_DHAN
 
@@ -396,6 +436,46 @@ def _render_owner_sidebar(expiry_list):
             if st.button("⟳ Refresh Now", width='stretch',
                          type="primary", key="owner_refresh_btn"):
                 manual_refresh_clicked = True
+
+            # v42: replace an expired Dhan token without a reboot
+            st.divider()
+            st.markdown("**🔑 Dhan access token**")
+            _v42_cid, _v42_tok, _v42_src = _dhan_creds()
+            if time.time() - _V36.get("auth_fail_ts", 0.0) < 600:
+                st.error(f"Rejected by Dhan (token from {_v42_src}). Paste a new one.")
+            elif _v42_tok:
+                st.caption(f"In use: token from **{_v42_src}**.")
+            with st.form("v42_token_form", clear_on_submit=True):
+                _v42_new_tok = st.text_input("New access token", type="password",
+                                             placeholder="paste token from web.dhan.co")
+                _v42_new_cid = st.text_input("Client ID (blank = keep current)",
+                                             placeholder=_v42_cid or "")
+                _v42_go = st.form_submit_button("Save & reconnect", width='stretch')
+            if _v42_go:
+                _t = (_v42_new_tok or "").strip()
+                if len(_t) < 20 or any(c.isspace() for c in _t):
+                    st.error("That doesn't look like a Dhan token — paste the full token.")
+                else:
+                    try:
+                        _v42_save_token(_t, (_v42_new_cid or "").strip())
+                        _V36.get("auth", {}).update({"fp": "", "until": 0.0})
+                        _V36["auth_fail_ts"] = 0.0
+                        _SH["fail_ts"] = 0.0
+                        _force_server_refresh()
+                        st.success("Saved — fetching with the new token…")
+                        st.rerun()
+                    except Exception as _e:
+                        st.error(f"Could not save token: {_e}")
+            if _v42_src == "owner sidebar":
+                if st.button("Use the Secrets token instead", key="v42_tok_clear", width='stretch'):
+                    try:
+                        os.remove(_V42_TOKEN_FILE)
+                    except Exception:
+                        pass
+                    _V36.get("auth", {}).update({"fp": "", "until": 0.0})
+                    _V36["auth_fail_ts"] = 0.0
+                    _force_server_refresh()
+                    st.rerun()
 
             st.divider()
             if st.button(" Lock", key="owner_lock_btn", width='stretch'):
@@ -1058,9 +1138,17 @@ def _dhan_post(url, payload, timeout=15):
     if not USE_DHAN:
         raise DhanAPIError("Dhan credentials not configured")
     sec = DHAN_SECURITY["NIFTY"]
+    _cid, _tok, _ = _dhan_creds()                                  # v42: live token
+    if not (_cid and _tok):
+        raise DhanAPIError("Dhan credentials not configured")
+    _fp  = _v42_fp(_cid + "|" + _tok)
+    _ath = _V36.setdefault("auth", {"fp": "", "until": 0.0})
+    if _ath["fp"] == _fp and time.time() < _ath["until"]:
+        # v42: this exact token was rejected < 5 min ago — don't call Dhan again
+        raise DhanAPIError("HTTP 401: token rejected — Dhan calls paused (v42) until a new token is saved")
     headers = {
-        "access-token": DHAN_ACCESS_TOKEN,
-        "client-id":    str(DHAN_CLIENT_ID),
+        "access-token": _tok,
+        "client-id":    _cid,
         "Content-Type": "application/json",
     }
     sess = _get_dhan_session()
@@ -1096,6 +1184,12 @@ def _dhan_post(url, payload, timeout=15):
             msg = resp.text[:200] if resp.text else resp.reason
         if resp.status_code == 401 or "808" in str(msg):          # v37: token rejected
             _V36["auth_fail_ts"] = time.time()
+            _first = (_ath["fp"] != _fp) or (time.time() >= _ath["until"])
+            _ath["fp"], _ath["until"] = _fp, time.time() + 300      # v42: pause 5 min
+            if _first:
+                print("[v42] Dhan rejected the access token (401/808) — all Dhan calls "
+                      "paused 5 min. Paste a new token in the owner sidebar or Secrets.",
+                      flush=True)
         raise DhanAPIError(f"HTTP {resp.status_code}: {msg}")
     _V36["auth_fail_ts"] = 0.0                                     # v37: token accepted
 
@@ -4735,6 +4829,12 @@ def _raw_fetch_and_compute(expiry_override=None, history=None):
     df, spot, expiry, source = get_option_chain(expiry_override)
     if df.empty:
         return None, source
+    # v42: with credentials configured, a demo-fallback chain must NOT be computed:
+    # it used to replace the last live payload and was written into history, the
+    # IV Skew engine, FDM state, OI-15 files — and its fake spot (~24,500) made the
+    # futures sanity guard reject a correct futures price.  Keep the last live data.
+    if USE_DHAN and "API ERROR" in str(source):
+        return None, source
 
     m = compute_metrics(df, spot, expiry, history=history)
     if not m:
@@ -4840,6 +4940,7 @@ def get_server_data(expiry_override=None, _from_bg=False):
                 _srv_cache["payload"] = payload
                 _srv_cache["source"]  = source
                 _srv_cache["last_fetch_ts"] = time.time()
+                _SH["live_ts"] = time.time()                  # v42: last good live fetch
             # If payload is None (fetch failed), keep the previous stale payload
             # but bump last_fetch_ts by a short cooldown to prevent retry storms.
             elif _srv_cache["payload"] is not None:
@@ -6389,8 +6490,36 @@ def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs, data_sour
 
     # CI #10 fix: detect API-error fallback (live mode that failed over to demo)
     _is_api_error = bool(data_source and "API ERROR" in data_source)
+    _v42_auth_bad = bool(use_dhan) and (time.time() - _V36.get("auth_fail_ts", 0.0) < 600)
+    _v42_live_ts  = _SH.get("live_ts", 0.0)
+    _v42_stalled  = (bool(use_dhan) and market_open and _v42_live_ts > 0
+                     and time.time() - _v42_live_ts > max(180, 3 * int(refresh_secs or 60)))
 
-    if _is_api_error:
+    if _v42_auth_bad and not _is_api_error:
+        # v42 — RED: token rejected, but the last REAL snapshot is still on screen
+        bg, border = "#FEF2F2", "#DC2626"
+        dot = ""
+        _lt = (datetime.fromtimestamp(_v42_live_ts, IST).strftime("%H:%M:%S")
+               if _v42_live_ts else "—")
+        headline = f"DHAN TOKEN REJECTED — data frozen at {_lt} IST"
+        detail   = ("Values are the last <strong>real</strong> snapshot and are <strong>not updating</strong> · "
+                    "Owner: ⚙️ sidebar → <strong>🔑 Dhan access token</strong> → paste a fresh token "
+                    "(no reboot needed) — or update Secrets")
+        label_bg, label_fg = "#DC2626", "#ffffff"
+        label_text = "● TOKEN"
+
+    elif _v42_stalled and not _is_api_error:
+        # v42 — AMBER: market open but no successful fetch for a while
+        bg, border = "#FFFBEB", "#D97706"
+        dot = ""
+        _lt = datetime.fromtimestamp(_v42_live_ts, IST).strftime("%H:%M:%S")
+        headline = f"LIVE FEED STALLED — last good data {_lt} IST"
+        detail   = ("Dhan calls are failing (network / rate-limit) · showing the last real snapshot · "
+                    "will auto-retry")
+        label_bg, label_fg = "#D97706", "#ffffff"
+        label_text = "● STALLED"
+
+    elif _is_api_error:
         # ── RED — live mode but API call failed; serving stale demo data ──────
         bg, border = "#FEF2F2", "#DC2626"
         dot = ""
@@ -6401,8 +6530,8 @@ def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs, data_sour
         if time.time() - _V36.get("auth_fail_ts", 0.0) < 600:      # v37: say exactly what's wrong
             headline = "DHAN TOKEN REJECTED — showing fallback demo data"
             detail   = ("Dhan says the <strong>Client ID or Access Token is invalid / expired</strong> (HTTP 401 · code 808). "
-                        "Paste a fresh <code>DHAN_ACCESS_TOKEN</code> into this app's Secrets and reboot · "
-                        "Values shown are <strong>simulated</strong>")
+                        "Owner: ⚙️ sidebar → <strong>🔑 Dhan access token</strong> → paste a fresh token "
+                        "(no reboot needed) — or update Secrets")
         label_bg, label_fg = "#DC2626", "#ffffff"
         label_text = "● API ERROR"
 
@@ -6539,7 +6668,12 @@ if payload is not None:
     payload = _v27_copy.deepcopy(payload)
 
 if payload is None:
-    st.error("❌ Could not fetch option chain data. Please check your API credentials or try again.")
+    if USE_DHAN and time.time() - _V36.get("auth_fail_ts", 0.0) < 600:      # v42
+        st.error("❌ Dhan rejected the access token (expired or wrong) — no live data yet today. "
+                 "Owner: open the ⚙️ sidebar → 🔑 Dhan access token → paste today's token. "
+                 "No demo numbers are shown, so nothing fake is recorded.")
+    else:
+        st.error("❌ Could not fetch option chain data. Please check your API credentials or try again.")
     st.stop()
 
 m        = payload["metrics"]
