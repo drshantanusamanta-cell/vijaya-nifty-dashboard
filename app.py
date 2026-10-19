@@ -1,0 +1,9860 @@
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║  Shantanu's Options Analysis Dashboard  Streamlit Edition          ║
+║  Data: Dhan API (primary) | Demo Mode (fallback)                    ║
+║  NIFTY 50 + NIFTY Futures ONLY                                      ║
+║  Bias Score: -100 to +100 | Regime | Strategy Engine               ║
+║  v6 — Hardened Edition: CI #2-10 + H1-H26 audit fixes applied      ║
+║  v8 — Cosmetic re-layout: S3→S4→S2→Gamma&Vega→S10 on top;          ║
+║       Section-4 charts in 4 rows × 2; responsive + clearer labels  ║
+║  v9 — Owner refresh dropdown: new 30-sec Turbo interval added      ║
+║  v10 — Enhanced NDM Buyer/Seller Matrix (per-strike EVR × Δ-Wtd    ║
+║        OI Chg Momentum) · 15-min verdict log · View under Sec-4    ║
+║  v24 — 13-Aug-2026: NIFTY futures contract-resolution fix           ║
+║        (NIFTYFPI symbol collision) + spot sanity guard +            ║
+║        dual-expiry Max Pain: CURRENT / NEXT, W/M tagged             ║
+║  v25 — 15-Sep-2026: GEX × Gamma Flip Regime Matrix (3×3 live cell, ║
+║        confidence + levels) added inside Shantanu's Final Decision ║
+║        Matrix — independent add-on, no existing logic changed      ║
+║  v27 — 07-Oct-2026: ONE shared history for all visitors — process-  ║
+║        wide fetch cache + locks, server-side tick recording, 30s   ║
+║        background fetcher, daily skew anchor, permanent archive    ║
+║        + GEX×Flip: live state at top, 9-state grid moved to bottom ║
+║        + FDM: synthetic-forward bias ladder (OI-weighted) + 25Δ RR ║
+║          noise-filtered: like-for-like Δ, quote noise floor, MAD   ║
+║          trim, weighted median, 3-snapshot confirmation, mid IVs  ║
+║        · October 2026 Sentiment panel REMOVED from this edition    ║
+║  v28 — 10-Oct-2026: FDM alert log (time + NIFTY spot) when bias   ║
+║        AND 25Δ RR are confirmed in the same direction, below the  ║
+║        ladder · October 2026 Sentiment panel stays removed        ║
+║  v29 — 10-Oct-2026: Dhan API v2.5 — next-expiry chain refreshed   ║
+║        every 60 s via ONE shared de-duplicated fetch (auto 5-min  ║
+║        fall-back on rate-limit) · average_price → ladder column   ║
+║  v30 — 10-Oct-2026: REMOVED Shantanu's View (Buyer/Seller Matrix) ║
+║        and Combined Flow × Premium Read — no other section used   ║
+║        them (their helper functions remain, now unused)           ║
+║  All data and calculations are LIVE during market hours             ║
+║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
+import os, json, time, warnings, threading
+# ── v4: combined_bias_engine merged inline (no external dependency) ──
+from datetime import date, timedelta, datetime
+import pytz
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import brentq
+from scipy.stats import norm
+import plotly.graph_objs as go
+import plotly.io as _pio
+
+# Force explicit colours for all charts — fixes white labels on iOS Safari / iPad
+_pio.templates["_mobile_fix"] = go.layout.Template(
+    layout=go.Layout(
+        font=dict(color="#1A1A2E"),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#F9FAFB",
+        xaxis=dict(tickfont=dict(color="#1A1A2E"), title_font=dict(color="#1A1A2E"),
+                   linecolor="#E5E7EB", gridcolor="#F3F4F6"),
+        yaxis=dict(tickfont=dict(color="#1A1A2E"), title_font=dict(color="#1A1A2E"),
+                   linecolor="#E5E7EB", gridcolor="#F3F4F6"),
+        legend=dict(font=dict(color="#1A1A2E")),
+        hoverlabel=dict(bgcolor="#ffffff", font_color="#1A1A2E"),
+        title=dict(font=dict(color="#1A1A2E")),
+    )
+)
+_pio.templates.default = "plotly+_mobile_fix"
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+import copy as _v27_copy
+
+# v27: Streamlit re-executes this whole script on every rerun, so plain module-level
+# globals (caches, locks) are re-created EMPTY each time and are never shared between
+# visitors. st.cache_resource returns the SAME object for every rerun and every visitor
+# of this server process — all shared caches and locks now live here.
+@st.cache_resource(show_spinner=False)
+def _v27_shared_state():
+    return {
+        "srv_lock":     threading.Lock(),
+        "srv_cache":    {"payload": None, "source": None, "last_fetch_ts": 0.0},
+        "inflight":     {"v": False, "ts": 0.0},
+        "persist_lock": threading.Lock(),
+        "hist_lock":    threading.Lock(),
+        "bias_lock":    threading.Lock(),
+        "smile_lock":   threading.Lock(),
+        "skew_lock":    threading.Lock(),
+        "vix_lock":     threading.Lock(),
+        "vix_history":  [],
+        "endm_lock":    threading.Lock(),
+        "fdmb_lock":    threading.Lock(),
+    }
+
+_SH = _v27_shared_state()
+_V27_HIST_LOCK = _SH["hist_lock"]
+
+warnings.filterwarnings("ignore")
+
+# ─── Timezone ─────────────────────────────────────────────────────────────────
+IST = pytz.timezone("Asia/Kolkata")
+
+def now_ist():
+    return datetime.now(IST)
+
+def ist_str(fmt="%d-%m-%Y  %H:%M:%S IST"):
+    return now_ist().strftime(fmt)
+
+def is_market_hours():
+    n = now_ist()
+    return n.weekday() < 5 and (9, 15) <= (n.hour, n.minute) <= (15, 30)
+
+# ─── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Shantanu's Options Dashboard — NIFTY · v13",   # H21 fix: was mojibake (\x97 where em-dash should be)
+    page_icon="📊",   # H21 fix: was empty — browser showed default favicon
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# CI #5 fix: register auto-refresh IMMEDIATELY after set_page_config, BEFORE any
+# st.stop() can fire downstream. The previous location (very end of script) meant
+# that if Dhan returned an error → `st.stop()` halted execution →
+# `st_autorefresh` never registered → the page would not auto-recover from a
+# transient API failure; the user had to manually reload the browser.
+# Registering early guarantees the page re-runs every 60s regardless of any
+# downstream st.stop() or exception.
+#
+# H18 FOLLOW-UP (not applied in this pass): migrating from `streamlit_autorefresh`
+# to native `st.fragment(run_every=60.0)` (Streamlit ≥1.33) would cut per-rerun
+# work by ~80% — only the data-fetch + history-append logic would re-execute,
+# not the entire 7000-line script. This is a larger refactor (requires wrapping
+# the fetch logic in a fragment function and reading results from
+# st.session_state in the main body) and should be done as a separate PR.
+# For now, st_autorefresh at the top is the safe fix that preserves all existing
+# behavior while solving the st.stop() recovery problem.
+#
+# v9: the page rerun cadence follows the owner data-refresh setting when it is
+# FASTER than 60s (the new "30 sec Turbo" option) — otherwise freshly fetched
+# data would sit unseen until the next 60s rerun. All other choices keep 60s.
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "nifty_settings.json"), "r") as _arf:
+        _ar_secs = int(json.load(_arf).get("refresh_interval", 60))
+except Exception:
+    _ar_secs = 60
+st_autorefresh(interval=(30_000 if _ar_secs < 60 else 60_000), key="nifty_autorefresh")
+
+
+# ─── Credentials ──────────────────────────────────────────────────────────────
+def _get_secret(key, default=""):
+    try:
+        return st.secrets.get(key, default) or os.environ.get(key, default)
+    except Exception:
+        return os.environ.get(key, default)
+
+DHAN_CLIENT_ID    = _get_secret("DHAN_CLIENT_ID")
+DHAN_ACCESS_TOKEN = _get_secret("DHAN_ACCESS_TOKEN")
+USE_DHAN          = bool(DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN)
+USE_DEMO_MODE     = not USE_DHAN
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+APP_TITLE        = "Shantanu's Options Analysis  NIFTY 50 · v13"
+RISK_FREE_RATE   = 0.065
+STRUCTURAL_BAND  = 10
+SIGNAL_BAND      = 5
+NIFTY_STEP       = 50
+NIFTY_LOT_SIZE   = 65   # Current NIFTY F&O lot size — multiplies GEX to match industry standard (OI×Γ×LotSize×S²×0.01)
+REFRESH_SECONDS  = 60   # default; overridden at runtime via owner settings
+
+# ─── Owner sidebar  PIN-protected advanced controls ──────────────────────────
+# Dashboard is publicly readable. Owner PIN unlocks expiry, refresh, manual reload.
+_REFRESH_OPTIONS = {
+    "🚀 30 sec  Turbo":             30,   # v9: fastest option — page rerun drops to 30s too
+    "⚡ 1 min   Live market":       60,
+    " 5 min   Active monitoring": 300,
+    " 15 min  Slow watch":        900,
+    " 30 min  Market closed":     1800,
+    " 1 hour  Weekend / idle":    3600,
+}
+
+def _render_owner_sidebar(expiry_list):
+    """
+    Renders the sidebar for all visitors.
+    - Locked state  → PIN entry form only.
+    - Unlocked state → expiry selector, refresh interval, manual refresh button.
+    Returns (sel_expiry, manual_refresh_clicked).
+
+    CI #3 fix: if OWNER_PIN secret is not configured, the unlock form is hidden
+    entirely (fail-closed) — there is NO default PIN. A misconfigured deploy
+    cannot expose owner controls to public visitors.
+    """
+    import hmac
+    correct_pin = _get_secret("OWNER_PIN", None)   # CI #3 fix: was "12345"
+
+    if "owner_unlocked" not in st.session_state:
+        st.session_state.owner_unlocked = False
+
+    # CI #3 fix: brute-force lockout — 5 failed attempts → 5-min cooldown
+    if "owner_pin_fail_count" not in st.session_state:
+        st.session_state.owner_pin_fail_count = 0
+    if "owner_pin_lock_until" not in st.session_state:
+        st.session_state.owner_pin_lock_until = 0.0
+
+    # Smart default for refresh (set once, survives reruns)
+    if "refresh_seconds" not in st.session_state:
+        _n = now_ist()
+        _mh = _n.weekday() < 5 and (9, 15) <= (_n.hour, _n.minute) <= (15, 30)
+        st.session_state.refresh_seconds = 60 if _mh else 1800
+
+    sel_expiry            = None
+    manual_refresh_clicked = False
+
+    with st.sidebar:
+        st.markdown("### ⚙️ Owner Controls")
+
+        # CI #3 fix: if PIN isn't configured, hide the entire owner section.
+        if correct_pin is None:
+            st.caption("🔒 Owner controls disabled (no OWNER_PIN configured).")
+            st.caption(" Dashboard is in **read-only** mode for all visitors.")
+            return sel_expiry, manual_refresh_clicked
+
+        if not st.session_state.owner_unlocked:
+            # CI #3 fix: brute-force lockout check
+            _now_ts = time.time()
+            if _now_ts < st.session_state.owner_pin_lock_until:
+                _mins_left = int((st.session_state.owner_pin_lock_until - _now_ts) / 60) + 1
+                st.warning(f"⏱️ Too many failed attempts. Try again in {_mins_left} min.")
+            else:
+                st.caption("Enter PIN to access advanced settings.")
+                pin = st.text_input("Owner PIN", type="password",
+                                    key="owner_pin_input", placeholder="Enter owner PIN")
+                if st.button("Unlock", width='stretch', type="primary", key="owner_unlock_btn"):
+                    # CI #3 fix: constant-time comparison (timing-attack resistance)
+                    if pin and hmac.compare_digest(pin, correct_pin):
+                        st.session_state.owner_unlocked = True
+                        st.session_state.owner_pin_fail_count = 0
+                        st.rerun()
+                    else:
+                        st.session_state.owner_pin_fail_count += 1
+                        if st.session_state.owner_pin_fail_count >= 5:
+                            st.session_state.owner_pin_lock_until = _now_ts + 300   # 5 min
+                            st.session_state.owner_pin_fail_count = 0
+                            st.error("❌ Too many failed attempts. Locked for 5 minutes.")
+                        else:
+                            st.error(f"❌ Incorrect PIN (attempt "
+                                     f"{st.session_state.owner_pin_fail_count}/5)")
+            st.divider()
+            st.caption(" Dashboard is in **read-only** mode for guests.")
+
+        else:
+            # ── Unlocked: show advanced controls ──────────────────────────────
+            st.success(" Owner mode")
+
+            # Expiry selector
+            _cur_settings = _load_owner_settings()
+            if expiry_list:
+                _saved_expiry = _cur_settings.get("selected_expiry") or expiry_list[0]
+                _exp_idx = expiry_list.index(_saved_expiry) if _saved_expiry in expiry_list else 0
+                sel_expiry = st.selectbox(" Expiry", expiry_list,
+                                          index=_exp_idx, key="owner_expiry")
+                # Persist if owner changed expiry
+                if sel_expiry != _cur_settings.get("selected_expiry"):
+                    _cur_settings["selected_expiry"] = sel_expiry
+                    _save_owner_settings(_cur_settings)
+                    _force_server_refresh()   # expire cache so new expiry is fetched next cycle
+            else:
+                sel_expiry = None
+                st.caption("Expiry: Auto (nearest)")
+
+            st.divider()
+
+            # Refresh interval  (data refresh, NOT page refresh)
+            _saved_interval = _cur_settings.get("refresh_interval", REFRESH_SECONDS)
+            st.session_state.refresh_seconds = _saved_interval
+            current_label = next(
+                (k for k, v in _REFRESH_OPTIONS.items()
+                 if v == _saved_interval),
+                list(_REFRESH_OPTIONS.keys())[0]
+            )
+            chosen = st.selectbox(
+                " Data refresh interval",
+                list(_REFRESH_OPTIONS.keys()),
+                index=list(_REFRESH_OPTIONS.keys()).index(current_label),
+                key="refresh_selector",
+            )
+            new_interval = _REFRESH_OPTIONS[chosen]
+            if new_interval != _saved_interval:
+                _cur_settings["refresh_interval"] = new_interval
+                _save_owner_settings(_cur_settings)
+                st.session_state.refresh_seconds = new_interval
+            mins = new_interval // 60
+            _ref_lbl  = f"{mins} min" if new_interval >= 60 else f"{new_interval} sec"
+            _page_lbl = "30s (follows Turbo)" if new_interval < 60 else "60s"
+            st.info(f"Data refresh: **{new_interval}s** ({_ref_lbl})\nPage refresh: **{_page_lbl}**")
+
+            st.divider()
+
+            # Vega band width selector
+            # Controls how many strikes either side of ATM are included in the
+            # OI-weighted band vega sum (ATM Vega Diff chart + Net Vega per Strike),
+            # AND the strike-wise averaging band for the CE/PE EV Ratio charts —
+            # one control now governs the strike width for all 4 Z-Score charts
+            # (Raw & OI-Wtd Vega Ratio, Raw & OI-Wtd CE/PE EV Ratio).
+            # H6 fix: reduced to the 2 requested options (±3 / ±5). Also — this
+            # is baked into compute_metrics at FETCH time (not read fresh at
+            # render time like the Z-Score TF/lookback settings below), so the
+            # selector silently had no visible effect until the next scheduled
+            # refresh cycle (up to `refresh_interval` seconds later). That's
+            # the actual reason it looked "broken" — fixed by force-expiring
+            # the server cache immediately on change, same as the expiry selector.
+            _VEGA_BAND_OPTIONS = {"±3 strikes (150 pts)": 3,
+                                  "±5 strikes (250 pts) — default": 5}
+            _saved_vb = _cur_settings.get("vega_band_strikes", 5)
+            _vb_label = next((k for k, v in _VEGA_BAND_OPTIONS.items() if v == _saved_vb),
+                             "±5 strikes (250 pts) — default")
+            _chosen_vb = st.selectbox(
+                "📐 ATM Vega band width",
+                list(_VEGA_BAND_OPTIONS.keys()),
+                index=list(_VEGA_BAND_OPTIONS.keys()).index(_vb_label),
+                key="vega_band_selector",
+                help="Number of strikes either side of ATM. Governs all 4 Z-Score "
+                     "charts: the OI-weighted band vega sum (Raw & OI-Wtd Vega "
+                     "Ratio charts) and the strike-wise averaging band (Raw & "
+                     "OI-Wtd Sentiment charts). Takes effect on the next "
+                     "data fetch (forced immediately on change).",
+            )
+            _new_vb = _VEGA_BAND_OPTIONS[_chosen_vb]
+            if _new_vb != _saved_vb:
+                _cur_settings["vega_band_strikes"] = _new_vb
+                _save_owner_settings(_cur_settings)
+                _force_server_refresh()   # H6 fix: recompute immediately with the new band width
+            st.caption(f"Band: ATM ± {_new_vb} × 50 = ±{_new_vb * NIFTY_STEP} pts")
+
+            st.divider()
+
+            # Z-Score chart plotting settings — govern all 4 Z-score charts:
+            # Raw Vega Ratio, OI-Wtd Vega Ratio, Raw CE/PE EV Ratio, OI-Wtd CE/PE
+            # EV Ratio. Display-only: does NOT touch how ticks are collected or
+            # stored in history. Two independently configurable settings:
+            #   A. TF / time bucket — bar width ticks are resampled into
+            #   B. Look-back period — how many bars the rolling Z-score spans
+            _ZS_TF_OPTIONS = {
+                "5 min":  5,
+                "15 min (default)": 15,
+                "30 min": 30,
+                "60 min": 60,
+            }
+            _saved_zs_tf = _cur_settings.get("zscore_tf_minutes", 15)
+            _zs_tf_label = next((k for k, v in _ZS_TF_OPTIONS.items() if v == _saved_zs_tf),
+                                "15 min (default)")
+            _chosen_zs_tf = st.selectbox(
+                "📊 Z-Score chart TF (time bucket)",
+                list(_ZS_TF_OPTIONS.keys()),
+                index=list(_ZS_TF_OPTIONS.keys()).index(_zs_tf_label),
+                key="zscore_tf_selector",
+                help="Applies to all 4 Z-Score charts (Raw & OI-Wtd Vega Ratio, "
+                     "Raw & OI-Wtd Sentiment). Ticks are resampled into bars "
+                     "of this width (last value per bar); the in-progress bar "
+                     "updates every refresh and locks once its window closes. "
+                     "Does not affect data collection.",
+            )
+            _new_zs_tf = _ZS_TF_OPTIONS[_chosen_zs_tf]
+            if _new_zs_tf != _saved_zs_tf:
+                _cur_settings["zscore_tf_minutes"] = _new_zs_tf
+                _save_owner_settings(_cur_settings)
+
+            _ZS_LOOKBACK_OPTIONS = {f"{n} bars": n for n in range(5, 11)}
+            _saved_zs_lb = _cur_settings.get("zscore_lookback_buckets", 6)
+            _zs_lb_label = next((k for k, v in _ZS_LOOKBACK_OPTIONS.items() if v == _saved_zs_lb),
+                                "6 bars")
+            _chosen_zs_lb = st.selectbox(
+                "📊 Z-Score look-back period",
+                list(_ZS_LOOKBACK_OPTIONS.keys()),
+                index=list(_ZS_LOOKBACK_OPTIONS.keys()).index(_zs_lb_label),
+                key="zscore_lookback_selector",
+                help="Number of TF bars the rolling Z-score window spans (5-10), "
+                     "e.g. 6 bars × 15-min TF = 90-min lookback. Applies to all "
+                     "4 Z-Score charts alongside the TF setting above.",
+            )
+            _new_zs_lb = _ZS_LOOKBACK_OPTIONS[_chosen_zs_lb]
+            if _new_zs_lb != _saved_zs_lb:
+                _cur_settings["zscore_lookback_buckets"] = _new_zs_lb
+                _save_owner_settings(_cur_settings)
+
+            st.divider()
+
+            # Manual refresh  — OWNER ONLY
+            if st.button("⟳ Refresh Now", width='stretch',
+                         type="primary", key="owner_refresh_btn"):
+                manual_refresh_clicked = True
+
+            st.divider()
+            if st.button(" Lock", key="owner_lock_btn", width='stretch'):
+                st.session_state.owner_unlocked = False
+                # CI #3 fix: clear the PIN input so the next visitor can't re-unlock
+                # by clicking Unlock without re-entering the PIN.
+                if "owner_pin_input" in st.session_state:
+                    del st.session_state["owner_pin_input"]
+                st.rerun()
+
+    return sel_expiry, manual_refresh_clicked
+
+# Resolve effective data-refresh  reads owner-controlled value from server settings.
+# NOTE: page auto-refresh is always 60 s for ALL visitors regardless of this value.
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_settings.json"), "r") as _sf:
+        _effective_refresh = json.load(_sf).get("refresh_interval", REFRESH_SECONDS)
+except Exception:
+    _effective_refresh = REFRESH_SECONDS
+
+SYMBOL           = "NIFTY"   # NIFTY 50 only
+
+DHAN_SECURITY    = {"NIFTY": {"id": 13, "seg": "IDX_I"}}
+
+# Bias weights  identical to Dash app
+BIAS_WEIGHTS = {
+    "net_delta":               16,
+    "momentum":                22,
+    "ev_ratio":                10,
+    "atm_pressure":            10,
+    "skew_slope":               8,
+    "vanna":                    4,
+    "regime_range":            22,
+    "regime_trend":            25,
+    "regime_transition":       10,
+    "near_oi_concentration":   12,
+    "near_oichg_concentration":12,
+    "wall_proximity":           8,
+    "wall_shift":               8,
+    "max_pain_drift":           6,
+    "range_compression":        6,
+    "expansion_building":       6,
+    "persistence":             10,
+    "skew_slope_threshold":  0.15,
+    "ev_ratio_bull":         1.20,   # v17: bullish only above 1.2 (sideways 0.7-1.2)
+    "ev_ratio_bear":         0.70,   # v17: bearish only below 0.7
+    "momentum_gex_threshold":500,
+    "near_oi_min":           0.55,
+    "near_oichg_min":        0.50,
+    "wall_proximity_pts":      75,
+    "bias_bull_threshold":     15,
+    "bias_bear_threshold":    -15,
+    "confidence_min_strategy": 35,
+}
+
+METRIC_EXPLAIN = {
+    "Bias Score":      "Hedge-flow bias score (-100..+100) from the legacy compute_nifty_bias engine — uses SIGNED delta x OI (net_delta), so it reads dealer hedge-flow pressure, not writer positioning. Use the S3/4 / Combined Decision panels for the authoritative directional call.",
+    "Confidence":      "Signal quality score based on regime, persistence, concentration, and wall behavior.",
+    "Regime":          "Range/pin, trend/expansion, or transition inferred from gamma, IV, walls, and persistence.",
+    "Sentiment (Raw Avg)":    "Per-strike Call/Put time-value ratio averaged across the ATM band (same series as the Raw Sentiment Z-Score chart); higher means call premium stronger, lower means put premium stronger.",
+    "Sentiment (OI-Wtd Avg)": "Per-strike (Call EV x Call OI)/(Put EV x Put OI) averaged across the ATM band (same series as the OI-Wtd Sentiment Z-Score chart).",
+    "Net Delta":       "Directional lean from near-spot open interest weighted by delta.",
+    "Momentum":        "Fresh intraday open-interest change weighted by delta near spot.",
+    "GEX":             "Gamma exposure from the structural band; positive tends to pin, negative tends to expand moves.",
+    "PCR":             "Put-call ratio from the structural band.",
+    "G/T Ratio":       "Gamma-to-theta ratio; higher values often align with unstable or directional conditions.",
+    "ATM Pressure":    "Near-ATM put OI change minus call OI change.",
+    "Skew Slope":      "Difference between downside put-IV slope and upside call-IV slope.",
+    "Near OI %":       "Share of structural-band OI concentrated near ATM.",
+    "Near OI Chg %":   "Share of fresh OI activity concentrated near ATM.",
+    "Wall Width":      "Distance between the strongest put wall and strongest call wall.",
+    "Max Pain":        "Strike where option writers lose the least money.",
+    "Support":         "Strongest put OI wall in the structural band.",
+    "Resistance":      "Strongest call OI wall in the structural band.",
+    "IV Rank":         "ATM IV rank within smile range (0=low, 100=high).",
+    "Gamma Flip":      "Strike where cumulative GEX turns zero. Spot below flip = trend amplification zone.",
+}
+
+# ─── Colours ──────────────────────────────────────────────────────────────────
+GREEN  = "#059669"
+RED    = "#DC2626"
+AMBER  = "#D97706"
+SKY    = "#38BDF8"   # v17: sky blue — neutral/sideways EVR zone (was orange/amber)
+BLUE   = "#2563EB"
+CYAN   = "#0891B2"
+PINK   = "#9333EA"
+MUTED  = "#6B7280"
+ACCENT = "#5C35CC"
+TEXT   = "#1A1A2E"
+GOLD   = "#B45309"
+
+# ─── Black-Scholes helpers  EXACT same as Dash app ──────────────────────────
+def _bs_price(S, K, T, r, sigma, opt):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if opt == "CE":
+        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+
+def _bs_greeks(S, K, T, r, sigma, opt):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    nd1 = norm.pdf(d1)
+    delta = norm.cdf(d1) if opt == "CE" else -norm.cdf(-d1)
+    gamma = nd1 / (S * sigma * np.sqrt(T))
+    if opt == "CE":
+        theta = (-(S * nd1 * sigma) / (2 * np.sqrt(T)) -
+                 r * K * np.exp(-r * T) * norm.cdf(d2)) / 365
+    else:
+        theta = (-(S * nd1 * sigma) / (2 * np.sqrt(T)) +
+                 r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365
+    vega = S * nd1 * np.sqrt(T) / 100
+    return delta, gamma, theta, vega
+
+
+def _solve_iv(mkt_price, S, K, T, r, opt):
+    if T <= 0 or mkt_price <= 0 or S <= 0 or K <= 0:
+        return np.nan
+    try:
+        return brentq(
+            lambda v: (_bs_price(S, K, T, r, v, opt) - mkt_price),
+            1e-4, 5.0, xtol=1e-5, maxiter=100
+        )
+    except Exception:
+        return np.nan
+
+
+def safe_num(x, d=0.0):
+    """H5 fix: also reject ±inf (was only None / NaN before).
+
+    ±inf in metrics propagates to json.dump which (with default allow_nan=True)
+    writes the literal `Infinity` / `NaN` token — invalid per RFC 8259 and
+    unparseable by non-Python tools. Combined with allow_nan=False in
+    _atomic_json_write (CI #6), this guarantees persisted history stays clean.
+    """
+    try:
+        if x is None:
+            return d
+        v = float(x)
+        if np.isnan(v) or np.isinf(v):
+            return d
+        return v
+    except (TypeError, ValueError):
+        return d
+
+
+# ─── GEX + IV Rank + Gamma Regime  IDENTICAL to Dash app ────────────────────
+def compute_true_gex(df, spot):
+    """Standard (unweighted) GEX per strike.
+
+    Formula matches industry standard (Perfiliev / SpotGamma / StockMojo):
+      GEX = OI × Gamma × LotSize × Spot² × 0.01
+    Calls add to GEX (dealers long gamma → pinning).
+    Puts subtract from GEX (dealers short gamma → amplifying).
+    Gaussian weighting removed — no tool uses it; it made the headline
+    metric incomparable to any published Indian options tool.
+    """
+    if df is None or df.empty:
+        return 0.0, pd.Series(dtype=float), None
+    strikes  = df["strike"].values
+    call_arr = df["call_oi"].values * df["call_gamma"].values * NIFTY_LOT_SIZE * (spot ** 2) * 0.01
+    put_arr  = df["put_oi"].values  * df["put_gamma"].values  * NIFTY_LOT_SIZE * (spot ** 2) * 0.01
+    net_arr  = call_arr - put_arr
+    total_gex  = float(net_arr.sum())
+    gex_series = pd.Series(net_arr, index=strikes)
+    cumulative = gex_series.sort_index().cumsum()
+    flip_cands = cumulative[cumulative <= 0].index
+    gamma_flip = float(flip_cands[-1]) if len(flip_cands) > 0 else None
+    return total_gex, gex_series, gamma_flip
+
+
+def compute_gamma_flip_true(df, spot, T, r=RISK_FREE_RATE, band_pct=0.20, n_pts=60):
+    """Zero-gamma / flip level — price-domain method (Perfiliev / SpotGamma).
+
+    The flip returned by compute_true_gex() above is a STRIKE-domain cumulative-
+    GEX crossing computed at today's spot; it is not the same quantity as the
+    "gamma flip" / "zero gamma" reported by SpotGamma and most vendors. That
+    flip is a PRICE-domain quantity: recompute every option's gamma via
+    Black-Scholes at a grid of hypothetical spot levels (today's IV smile held
+    fixed per strike), sum GEX at each level, and find where the total changes
+    sign. Parameters (±20% band, 60 points, first sign crossing scanning up
+    from the bottom of the range) match the reference implementation cited in
+    compute_true_gex's own docstring.
+
+    Returns None if no sign crossing is found within the scanned band (caller
+    should fall back to the strike-domain flip in that case).
+    """
+    if df is None or df.empty or spot <= 0 or T <= 0:
+        return None
+    lo = max(spot * (1 - band_pct), float(df["strike"].min()))
+    hi = min(spot * (1 + band_pct), float(df["strike"].max()))
+    if hi <= lo:
+        return None
+    levels = np.linspace(lo, hi, n_pts)
+
+    strikes = df["strike"].values
+    iv_c = df["call_iv"].values / 100.0
+    iv_p = df["put_iv"].values / 100.0
+    call_oi = df["call_oi"].values
+    put_oi = df["put_oi"].values
+
+    total_gamma = np.empty(n_pts)
+    for i, S in enumerate(levels):
+        cg = np.array([_bs_greeks(S, K, T, r, s, "CE")[1] for K, s in zip(strikes, iv_c)])
+        pg = np.array([_bs_greeks(S, K, T, r, s, "PE")[1] for K, s in zip(strikes, iv_p)])
+        call_gex = (call_oi * cg * NIFTY_LOT_SIZE * (S ** 2) * 0.01).sum()
+        put_gex  = (put_oi  * pg * NIFTY_LOT_SIZE * (S ** 2) * 0.01).sum()
+        total_gamma[i] = call_gex - put_gex
+
+    cross = np.where(np.diff(np.sign(total_gamma)))[0]
+    if len(cross) == 0:
+        return None
+    i = cross[0]
+    x0, y0 = levels[i], total_gamma[i]
+    x1, y1 = levels[i + 1], total_gamma[i + 1]
+    if y1 == y0:
+        return float(x0)
+    return float(x1 - (x1 - x0) * y1 / (y1 - y0))
+
+
+def compute_iv_rank(df, atm):
+    """Cross-sectional IV rank within the current smile.
+
+    Returns (smile_position_pct, iv_pct). This is a SMILE-POSITION metric, NOT a
+    temporal IV rank — for a normal NIFTY smile where ATM sits near the IV
+    minimum, this value is close to 0 most of the time. Use compute_temporal_iv_rank()
+    for any vol-regime / strategy decision that depends on whether IV is
+    historically high or low.
+    """
+    if df is None or df.empty:
+        return 0.0, 0.0
+    avg_iv = ((df["call_iv"].replace(0, np.nan) + df["put_iv"].replace(0, np.nan)) / 2).dropna()
+    if avg_iv.empty:
+        return 0.0, 0.0
+    row = df[df["strike"] == atm]
+    if row.empty:
+        row = df.iloc[[(df["strike"] - atm).abs().idxmin()]]
+    # CI #2 fix part A: robust non-zero average for ATM IV (was biased by zeros).
+    _c = safe_num(row["call_iv"].iloc[0])
+    _p = safe_num(row["put_iv"].iloc[0])
+    if _c > 0 or _p > 0:
+        atm_iv = (_c + _p) / max(1, (_c > 0) + (_p > 0))
+    else:
+        atm_iv = 0.0
+    iv_min, iv_max = float(avg_iv.min()), float(avg_iv.max())
+    if iv_max <= iv_min:
+        return 0.0, 0.0
+    iv_rank = round((atm_iv - iv_min) / (iv_max - iv_min) * 100, 1)
+    iv_pct  = round(float((avg_iv <= atm_iv).mean()) * 100, 1)
+    return iv_rank, iv_pct
+
+
+# ── CI #2 fix: True temporal IV rank from persisted history ─────────────────
+# `nifty_history.json` records `atm_iv` per tick (see build_history_entry, L3239).
+# We compute a trailing-N-day rank: rank = (now - min) / (max - min) * 100.
+# Falls back to the cross-sectional smile_position (with a flag) if history is
+# too short or contains no IV variation.
+TEMPORAL_IVR_LOOKBACK_DAYS = 20    # ~1 trading month
+TEMPORAL_IVR_MIN_SAMPLES   = 10   # need at least this many distinct days
+
+def compute_temporal_iv_rank(current_atm_iv, history=None):
+    """
+    Returns (temporal_iv_rank, is_temporal).
+      temporal_iv_rank: 0-100 rank of current_atm_iv vs trailing ~20d window.
+      is_temporal:      True if computed from real history,
+                        False if fell back to None (caller should use cross-sectional).
+    """
+    if current_atm_iv is None or current_atm_iv <= 0:
+        return None, False
+    if not history or len(history) < 2:
+        return None, False
+
+    # Build a series of (date, atm_iv) from history, deduplicating by date
+    # (one IV value per calendar day, taking the last sample of that day).
+    by_date = {}
+    for h in history:
+        iv = safe_num(h.get("atm_iv", 0))
+        if iv <= 0:
+            continue
+        ts = h.get("ts", "")
+        # ts format: "YYYY-MM-DDTHH:MM:SS"
+        d = ts.split("T")[0] if "T" in ts else ts[:10]
+        if d:
+            by_date[d] = iv   # later entries overwrite earlier — keeps last sample of day
+
+    if len(by_date) < TEMPORAL_IVR_MIN_SAMPLES:
+        return None, False
+
+    # Take the trailing N days (sorted by date)
+    sorted_dates = sorted(by_date.keys())
+    window_dates = sorted_dates[-TEMPORAL_IVR_LOOKBACK_DAYS:]
+    window_ivs   = [by_date[d] for d in window_dates]
+
+    iv_min = min(window_ivs)
+    iv_max = max(window_ivs)
+    if iv_max - iv_min < 0.5:    # <0.5 vol-point spread — insufficient variation
+        return None, False
+
+    rank = round((current_atm_iv - iv_min) / (iv_max - iv_min) * 100, 1)
+    rank = max(0.0, min(100.0, rank))
+    return rank, True
+
+
+def classify_gamma_regime(gex, wall_width, momentum, atm_iv, iv_rank, spot, gamma_flip):
+    # H13 fix: convert absolute-point thresholds to % of spot. As NIFTY drifts
+    # (22k → 25k), 300 pts went from 1.36% to 1.20% of spot — the regime
+    # classifier became arbitrarily stricter simply because the index rose.
+    # Now: 300 pts ≈ 1.3% band; 400 pts ≈ 1.7% band; 500 momentum units stays
+    # absolute (it's an OI-delta unit, not a price unit).
+    spot_pct = lambda abs_pts: (abs_pts / max(spot, 1)) * 100.0   # converts pts → % of spot
+    flip_dist = abs(spot - gamma_flip) if gamma_flip is not None else 9999
+    _strike_step = max(wall_width / 20, 50) if wall_width > 0 else 50
+    near_flip = flip_dist < max(2.0 * _strike_step, 100) if gamma_flip is not None else False
+    if iv_rank >= 70:   vol_regime = "HIGH_VOL"
+    elif iv_rank <= 30: vol_regime = "LOW_VOL"
+    else:               vol_regime = "MID_VOL"
+    wall_width_pct = spot_pct(wall_width)
+    if   gex > 0 and wall_width_pct <= 1.3 and vol_regime == "LOW_VOL":
+        return "PINNED / RANGE",       vol_regime, near_flip
+    elif gex > 0 and wall_width_pct <= 1.7:
+        return "RANGE / PIN",          vol_regime, near_flip
+    elif gex < 0 and abs(momentum) > 500 and vol_regime in ("MID_VOL", "HIGH_VOL"):
+        return "TREND / EXPANSION",    vol_regime, near_flip
+    elif near_flip:
+        return "FLIP ZONE / UNSTABLE", vol_regime, near_flip
+    else:
+        return "TRANSITION",           vol_regime, near_flip
+
+
+# ─── v25 ADDITION: GEX × Gamma Flip Regime Matrix (independent add-on) ──────────
+# Classifies the live snapshot into one of 9 cells:
+#   rows    = Net GEX vs its typical size  (positive / near zero / negative)
+#   columns = spot vs Gamma Flip           (above / near / below)
+# Pure read-only: consumes values already computed elsewhere (spot, m["gex"],
+# m["gamma_flip"], GEX walls, history, VIX, VWAP). Nothing upstream is modified
+# and no existing verdict, score or state file reads its output.
+#   • "Typical |GEX|" = median |Net GEX| over the persisted history ticks.
+#     Until GRM_MIN_HIST ticks exist the row is decided by GEX sign alone.
+#   • Momentum sign follows the dashboard's existing convention
+#     (compute_nifty_bias / GRF): momentum > 0 = bullish flow.
+GRM_BAND_PCT  = 0.30   # near-flip band, % of spot (0.30% ≈ 75 pts at 25,000)
+GRM_ZERO_MULT = 0.25   # |Net GEX| < 0.25 × typical |GEX|  →  "near zero" row
+GRM_MIN_HIST  = 20     # ticks required before the typical-|GEX| scale is used
+
+GRM_CELLS = {
+    "pos_above": dict(name="Pinned range", tag="Dampened", tone="pin", dir="Neutral, mild up-drift", dirn=0.0, base=6,
+        expect="Dealers sell rallies and buy dips. Realised move usually smaller than implied; breakouts fade.",
+        posture="Fade the edges: sell near the call wall, buy near the put wall. Iron condors or strangles beyond the walls are favoured. Skip opening-range breakout buys.",
+        inv="15-min close below the flip"),
+    "pos_near": dict(name="Fragile floor", tag="Dampening thinning", tone="warn", dir="Neutral · decision zone", dirn=0.0, base=4,
+        expect="Flip acts as support while GEX stays positive. A hold sends price back into the range; a break turns dealers into amplifiers.",
+        posture="Wait for the reaction. Long on a hold with a stop just under the flip; flip short on a decisive break. Cut short-premium size.",
+        inv="Acceptance beyond the near-flip band"),
+    "pos_below": dict(name="Stale signal", tag="Conflict", tone="warn", dir="Lean bearish", dirn=-1.0, base=3,
+        expect="Net GEX is positive but spot is already under the flip. Usually far-OTM call gamma inflating the total, or a fast move after the snapshot. Gamma at spot is likely negative.",
+        posture="Recompute first. Until then treat it as negative gamma: don't buy dips blindly, sell bounces into the flip.",
+        inv="Reclaim and hold above the flip"),
+    "zero_above": dict(name="Loose drift", tag="Weak dealer influence", tone="up", dir="Mild bullish", dirn=0.5, base=4,
+        expect="Hedging flows are too small to steer price; order flow and fresh OI decide. Trends can start but follow-through is thin.",
+        posture="Trade price action and OI momentum. Smaller size, wider stops. Buy dips toward the flip if puts are being written.",
+        inv="Break below the flip"),
+    "zero_near": dict(name="Vol coil", tag="Maximum uncertainty", tone="warn", dir="No bias", dirn=0.0, base=3,
+        expect="Sitting at zero gamma, nothing damps a move. Range compresses, then expands sharply either way.",
+        posture="Stand aside, or own gamma (long straddle/strangle) if IV isn't rich. Trade the opening-range break, not a forecast.",
+        inv="A clean trend away from the flip means reclassify"),
+    "zero_below": dict(name="Loose slide", tag="Weak amplification", tone="down", dir="Mild bearish", dirn=-0.5, base=4,
+        expect="Dealer selling on dips starts to matter as GEX tips negative. Supports break more easily than they hold.",
+        posture="Sell rallies toward the flip. Prefer bear put spreads over naked puts; don't catch falling knives.",
+        inv="Reclaim of the flip"),
+    "neg_above": dict(name="Squeeze", tag="Conflict", tone="up", dir="Bullish momentum", dirn=1.0, base=5,
+        expect="Spot has pushed above the flip while Net GEX is still negative. Short-gamma hedgers chase the rally; moves can overshoot to the call wall.",
+        posture="Momentum long or bull call spreads toward the call wall, trailing stops. Don't short strength until GEX turns positive or the call wall rejects.",
+        inv="Slip back below the flip"),
+    "neg_near": dict(name="Knife edge", tag="Short gamma at the pivot", tone="warn", dir="Two-sided breakout", dirn=0.0, base=4,
+        expect="The most explosive cell. A reclaim triggers a squeeze, a loss triggers liquidation. Whipsaws around the level are common.",
+        posture="Set both triggers in advance: long above flip + band, short below flip − band. Enter on candle close with volume; small size, fast stops.",
+        inv="Chop inside the band for 45 min: stand aside"),
+    "neg_below": dict(name="Trend amplifier", tag="Short gamma", tone="down", dir="Bearish continuation", dirn=-1.0, base=6,
+        expect="Hedgers sell into falls and buy into rises, adding fuel. Widest intraday ranges; India VIX usually firm. Relief rallies are sharp but tend to fail under the flip.",
+        posture="Sell rallies; buy puts or bear put spreads toward the put wall. No naked premium selling. Never fade a breakdown here.",
+        inv="15-min close back above the flip"),
+}
+GRM_ROWS = [("pos", "Net GEX positive", f"> +{GRM_ZERO_MULT:.2f}× typical"),
+            ("zero", "Net GEX near zero", f"within ±{GRM_ZERO_MULT:.2f}×"),
+            ("neg", "Net GEX negative", f"< −{GRM_ZERO_MULT:.2f}× typical")]
+GRM_COLS = [("above", "Spot above flip", "beyond +band"),
+            ("near", "Spot near flip", "inside ±band"),
+            ("below", "Spot below flip", "beyond −band")]
+GRM_TONES = {  # (text/border colour, background) — dashboard palette
+    "pin":  ("#2563EB", "#DBEAFE"),
+    "up":   ("#047857", "#D1FAE5"),
+    "down": ("#DC2626", "#FEE2E2"),
+    "warn": ("#B45309", "#FEF3C7"),
+}
+
+
+def compute_gamma_regime_matrix(spot, gex, gamma_flip, call_wall=None, put_wall=None,
+                                history=None, momentum=None, vix_change=None,
+                                above_vwap=None, expiry=None, now=None,
+                                band_pct=GRM_BAND_PCT, zero_mult=GRM_ZERO_MULT):
+    """Return a dict describing the active GEX × Gamma-Flip cell, or
+    {"available": False, "reason": ...} when spot / flip / GEX are missing."""
+    spot = safe_num(spot, 0.0)
+    gex = safe_num(gex, 0.0)
+    flip = safe_num(gamma_flip, 0.0) if gamma_flip is not None else 0.0
+    if spot <= 0 or flip <= 0:
+        return {"available": False, "reason": "Gamma Flip or spot unavailable for this tick"}
+
+    # Typical |Net GEX| from persisted history (multi-day, ≤500 ticks)
+    _abs_hist = [abs(safe_num(h.get("gex"), 0.0)) for h in (history or [])
+                 if h.get("gex") not in (None, 0, 0.0)]
+    _days = len({str(h.get("ts", ""))[:10] for h in (history or []) if h.get("gex") not in (None, 0, 0.0)})
+    calibrated = len(_abs_hist) >= GRM_MIN_HIST
+    typical = float(np.median(_abs_hist)) if calibrated else max(abs(gex), 1.0)
+    ratio = gex / typical if typical > 0 else 0.0
+
+    dist_pts = spot - flip
+    dist_pct = dist_pts / spot * 100.0
+    col = "near" if abs(dist_pct) <= band_pct else ("above" if dist_pct > 0 else "below")
+    if calibrated:
+        row = "pos" if ratio > zero_mult else ("neg" if ratio < -zero_mult else "zero")
+    else:
+        row = "pos" if gex > 0 else ("neg" if gex < 0 else "zero")
+    key = f"{row}_{col}"
+    cell = GRM_CELLS[key]
+    dirn = cell["dirn"]
+
+    # Confluence — only checks that apply to this cell are counted
+    checks = []
+    if dirn != 0 and momentum is not None:
+        _ok = (safe_num(momentum) > 0) if dirn > 0 else (safe_num(momentum) < 0)
+        checks.append(("Δ-weighted OI momentum", _ok, f"{safe_num(momentum):+,.0f}"))
+    if row != "zero" and vix_change is not None:
+        _vc = safe_num(vix_change)
+        _ok = (_vc > 0) if row == "neg" else (_vc < 0)
+        checks.append(("India VIX direction", _ok, f"{_vc:+.2f}"))
+    if dirn != 0 and above_vwap is not None:
+        _ok = bool(above_vwap) if dirn > 0 else (not bool(above_vwap))
+        checks.append(("Price vs VWAP", _ok, "above" if above_vwap else "below"))
+
+    score = float(cell["base"]) + sum(1 for c in checks if c[1])
+    notes = []
+    if abs(dist_pct) > 0.75:
+        score += 0.5
+    if calibrated and row != "zero" and abs(ratio) > 1.5:
+        score += 0.5
+    _now = now or datetime.now(pytz.timezone("Asia/Kolkata"))
+    _hm = (_now.hour, _now.minute)
+    if (10, 45) <= _hm < (13, 45):
+        score -= 1; notes.append("Mid-session: GEX hedging flows are weakest")
+    _is_expiry = False
+    if expiry:
+        for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+            try:
+                _is_expiry = datetime.strptime(str(expiry), _fmt).date() == _now.date()
+                break
+            except ValueError:
+                continue
+    if _is_expiry:
+        if row == "pos" and col != "below":
+            score += 1; notes.append("Expiry day: positive-gamma pinning strongest into the close")
+        elif col == "near" and row == "neg":
+            score -= 1; notes.append("Expiry day at the flip: whipsaw risk is extreme")
+    if not calibrated:
+        score -= 1
+        notes.append(f"Typical |GEX| still calibrating ({len(_abs_hist)}/{GRM_MIN_HIST} ticks): row uses GEX sign only")
+    score = int(max(1, min(10, round(score))))
+
+    band_pts = spot * band_pct / 100.0
+    cw = int(call_wall) if call_wall else None
+    pw = int(put_wall) if put_wall else None
+    _f = lambda v: f"{v:,.0f}" if v is not None else "N/A"
+    if key == "pos_above":
+        target, stop = f"Fade {_f(cw)} · buy {_f(pw)}", f"Below {_f(flip)}"
+    elif col == "below" and row in ("pos", "zero", "neg"):
+        target, stop = f"{_f(pw)} (put wall)", f"Above {_f(flip)}"
+    elif col == "above":
+        target, stop = f"{_f(cw)} (call wall)", f"Below {_f(flip)}"
+    else:
+        target = f"Long > {_f(flip + band_pts)} · Short < {_f(flip - band_pts)}"
+        stop = f"Back inside {_f(flip - band_pts)}–{_f(flip + band_pts)}"
+
+    return {
+        "available": True, "key": key, "row": row, "col": col, "cell": cell,
+        "spot": spot, "flip": flip, "gex": gex, "typical": typical, "ratio": ratio,
+        "calibrated": calibrated, "hist_ticks": len(_abs_hist), "hist_days": _days,
+        "dist_pts": dist_pts, "dist_pct": dist_pct, "band_pct": band_pct, "band_pts": band_pts,
+        "call_wall": cw, "put_wall": pw, "target": target, "stop": stop,
+        "checks": checks, "notes": notes, "score": score, "is_expiry": _is_expiry,
+    }
+# ─── end v25 GEX × Gamma Flip Regime Matrix core ─────────────────────────────────
+
+
+def render_gamma_regime_matrix_html(r, part="all"):
+    """v25: Streamlit renderer for compute_gamma_regime_matrix() — returns one
+    single-line HTML string (no indentation, so Markdown never treats it as code)."""
+    import html as _h
+    esc = lambda s: _h.escape(str(s))
+    if not r or not r.get("available"):
+        _why = esc((r or {}).get("reason", "no data"))
+        return ('<div style="background:#F9FAFB;border:2px solid #6B7280;border-radius:10px;'
+                'padding:12px 16px;margin-top:12px;"><div style="font-size:11px;font-weight:700;'
+                'color:#6B7280;text-transform:uppercase;">GEX × Gamma Flip Regime Matrix</div>'
+                f'<div style="font-size:14px;color:#111;margin-top:4px;">Waiting for data — {_why}.</div></div>')
+    c = r["cell"]; col, bg = GRM_TONES[c["tone"]]
+    lab = 'font-size:10px;font-weight:700;letter-spacing:.06em;color:#6B7280;text-transform:uppercase;'
+    stat = lambda k, v: (f'<div style="display:flex;flex-direction:column;margin-right:14px;">'
+                         f'<span style="{lab}">{k}</span>'
+                         f'<span style="font-size:12px;font-weight:800;color:#111;font-family:monospace;">{v}</span></div>')
+    stats = "".join([
+        stat("Spot − Flip", f"{r['dist_pts']:+,.0f} pts"),
+        stat("Distance", f"{r['dist_pct']:+.2f}% (band ±{r['band_pct']:.2f}%)"),
+        stat("GEX ÷ typical", f"{r['ratio']:+.2f}×" if r["calibrated"] else "calibrating"),
+        stat("To call wall", f"{r['call_wall'] - r['spot']:+,.0f} pts" if r["call_wall"] else "N/A"),
+        stat("To put wall", f"{r['spot'] - r['put_wall']:+,.0f} pts" if r["put_wall"] else "N/A"),
+    ])
+    meter = "".join(
+        f'<span style="display:inline-block;width:6px;height:10px;border-radius:2px;margin-left:2px;'
+        f'background:{col if i < r["score"] else "#E5E7EB"};"></span>' for i in range(10))
+    chk = "".join(
+        f'<span style="display:inline-block;margin:3px 6px 0 0;padding:1px 6px;border-radius:999px;font-size:10.5px;'
+        f'background:{"#D1FAE5" if ok else "#FEE2E2"};color:{"#047857" if ok else "#DC2626"};">'
+        f'{"✓" if ok else "✗"} {esc(name)} ({esc(val)})</span>' for name, ok, val in r["checks"])
+    notes = "".join(f'<div style="font-size:10.5px;color:#6B7280;margin-top:2px;">• {esc(n)}</div>' for n in r["notes"])
+    rd = lambda k, v: (f'<div style="flex:1 1 180px;min-width:160px;"><div style="{lab}">{k}</div>'
+                       f'<div style="font-size:11.5px;color:#111;margin-top:1px;line-height:1.35;">{v}</div></div>')
+    verdict = (
+        f'<div style="background:{bg};border:2px solid {col};border-radius:8px;padding:8px 12px;margin-top:8px;">'
+        '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">'
+        f'<div><div style="{lab}">GEX × Gamma Flip Regime Matrix · live cell</div>'
+        f'<div style="font-size:17px;font-weight:900;color:{col};margin:2px 0;">{esc(c["name"])}'
+        f'<span style="font-size:9.5px;font-weight:700;margin-left:8px;padding:2px 6px;border-radius:999px;'
+        f'background:#FFFFFF;color:{col};vertical-align:middle;text-transform:uppercase;">{esc(c["tag"])}</span></div>'
+        f'<div style="font-size:12px;font-weight:700;color:{col};font-family:monospace;">{esc(c["dir"])}</div></div>'
+        f'<div style="text-align:right;"><div style="{lab}">Confidence</div>'
+        f'<div style="font-size:21px;font-weight:900;color:#111;font-family:monospace;line-height:1.1;">{r["score"]}'
+        f'<span style="font-size:11px;color:#6B7280;">/10</span></div><div>{meter}</div></div></div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:6px 0;border-top:1px solid {col}33;margin-top:6px;padding-top:5px;">{stats}</div>'
+        '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;">'
+        + rd("Expect", esc(c["expect"])) + rd("Posture", esc(c["posture"]))
+        + rd("Target / trigger", esc(r["target"])) + rd("Invalidation", f'{esc(r["stop"])} · {esc(c["inv"])}')
+        + f'</div><div style="margin-top:6px;">{chk}</div>{notes}</div>')
+
+    th = 'font-size:11px;font-weight:700;letter-spacing:.05em;color:#374151;text-transform:uppercase;padding:4px;'
+    grid = ['<div style="overflow-x:auto;margin-top:10px;"><div style="display:grid;'
+            'grid-template-columns:110px repeat(3,minmax(230px,1fr));gap:8px;min-width:820px;">',
+            f'<div style="{th}color:#9CA3AF;">Net GEX ↓ · Spot vs flip →</div>']
+    grid += [f'<div style="{th}">{t}<div style="font-size:11px;font-weight:400;color:#9CA3AF;text-transform:none;">{s}</div></div>'
+             for _, t, s in GRM_COLS]
+    for rk, rt, rs in GRM_ROWS:
+        grid.append(f'<div style="{th}display:flex;flex-direction:column;justify-content:center;border-right:2px solid #E5E7EB;">'
+                    f'{rt}<div style="font-size:11px;font-weight:400;color:#9CA3AF;text-transform:none;">{rs}</div></div>')
+        for ck, _, _ in GRM_COLS:
+            k = f"{rk}_{ck}"; x = GRM_CELLS[k]; tc, tb = GRM_TONES[x["tone"]]
+            active = k == r["key"]
+            box = (f"border:3px solid {tc};box-shadow:0 0 0 3px {tb};background:{tb};" if active
+                   else "border:1px solid #E5E7EB;background:#FFFFFF;opacity:.82;")
+            grid.append(
+                f'<div style="{box}border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:5px;">'
+                '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">'
+                f'<span style="font-size:16px;font-weight:800;color:#111;">{esc(x["name"])}{" ◉" if active else ""}</span>'
+                f'<span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;background:{tb};color:{tc};'
+                f'text-transform:uppercase;white-space:nowrap;">{esc(x["tag"])}</span></div>'
+                f'<div style="font-size:12px;font-weight:700;color:{tc};font-family:monospace;">{esc(x["dir"])}</div>'
+                f'<div style="font-size:12px;color:#374151;"><span style="{lab}">Expect</span><br>{esc(x["expect"])}</div>'
+                f'<div style="font-size:12px;color:#374151;"><span style="{lab}">Posture</span><br>{esc(x["posture"])}</div>'
+                f'<div style="font-size:12px;color:#111;border-top:1px dashed #D1D5DB;padding-top:5px;margin-top:auto;">'
+                f'<span style="{lab}">Invalidation</span><br>{esc(x["inv"])}</div></div>')
+    grid.append('</div></div>')
+    foot = ('<div style="font-size:11px;color:#6B7280;margin-top:6px;font-style:italic;">'
+            f'Typical |GEX| = median of {r["hist_ticks"]} history ticks across {r["hist_days"]} day(s). '
+            'Independent read — does not alter the Bias Summary or any other verdict. '
+            'GEX is a model of dealer hedging; on NIFTY many writers do not delta-hedge.</div>')
+    # v27: part='live' → current state only (top); part='grid' → 9-state grid (bottom)
+    if part == "live":
+        return verdict + ('<div style="font-size:11px;color:#6B7280;margin-top:4px;font-style:italic;">'
+                          'Full 9-state reference grid (live cell ◉ highlighted) is at the bottom of the dashboard.</div>')
+    if part == "grid":
+        return (f'<div style="font-size:12px;color:#374151;">Live cell now: <b style="color:{col};">'
+                f'{esc(c["name"])}</b> · {esc(c["tag"])} · confidence {r["score"]}/10</div>'
+                + "".join(grid) + foot)
+    return verdict + "".join(grid) + foot
+
+
+# ─── Data fetchers ────────────────────────────────────────────────────────────
+# H1+H2+H3 fix: shared Dhan HTTP helper. Centralizes:
+#   - status-code checking via raise_for_status (H1)
+#   - status=="success" body validation (H2)
+#   - retry+backoff via urllib3 Retry (H3) — 3 retries, exponential backoff,
+#     honors 429 / 5xx. Mounted on a module-level Session so connection pooling
+#     works across fetchers.
+import requests as _requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except ImportError:                                # pragma: no cover
+    Retry = None
+
+# v36 FIX (API over-calling): these caches were plain module globals, which Streamlit
+# re-creates EMPTY on every rerun — so every visitor refresh re-downloaded the scrip
+# master CSV and re-hit /marketfeed/ltp (VIX). They now live in st.cache_resource,
+# shared across reruns and visitors (the Dash edition loads its module once, so it
+# never had this problem).
+@st.cache_resource(show_spinner=False)
+def _v36_dhan_store():
+    return {
+        "sess": {"s": None}, "sess_lock": threading.Lock(),
+        "master": {"df": None, "fail_ts": 0.0}, "master_lock": threading.Lock(),
+        "fut_id": {}, "fut_ltp": {"ltp": 0.0, "ts": 0.0},
+        "vix_id": {}, "vix_ltp": {"ltp": 0.0, "ts": 0.0, "fail_ts": 0.0},
+        # v38: one gate for ALL /marketfeed calls (Dhan quote APIs ≈ 1 request / second)
+        "mf_lock": threading.Lock(), "mf": {"last": 0.0, "block_until": 0.0},
+        "fut_resolve": {},
+    }
+
+_V36 = _v36_dhan_store()
+_V38_MF_GAP     = 1.2     # s — minimum gap between any two /marketfeed calls (this app)
+_V38_MF_BACKOFF = 120     # s — pause all /marketfeed calls after a 429 / code 805
+_dhan_session_lock = _V36["sess_lock"]
+
+def _get_dhan_session():
+    """H3 fix: return a Session with retry/backoff mounted. Thread-safe singleton."""
+    _holder = _V36["sess"]                      # v36: persists across reruns
+    if _holder["s"] is not None:
+        return _holder["s"]
+    with _dhan_session_lock:
+        if _holder["s"] is None:
+            s = _requests.Session()
+            if Retry is not None:
+                retry = Retry(
+                    total=3,
+                    backoff_factor=0.5,            # 0.5, 1, 2 seconds
+                    status_forcelist=(500, 502, 503, 504),   # v36: no auto-retry on 429 (it multiplied calls while rate-limited)
+                    allowed_methods=("GET", "POST"),
+                    respect_retry_after_header=True,
+                )
+                adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+                s.mount("https://", adapter)
+                s.mount("http://",  adapter)
+            _holder["s"] = s
+    return _holder["s"]
+
+
+class DhanAPIError(Exception):
+    """Raised when Dhan returns a non-success response body or HTTP error."""
+    pass
+
+
+def _dhan_post(url, payload, timeout=15):
+    """H1+H2+H3 fix: POST to a Dhan endpoint with full validation + retry.
+
+    Returns the parsed JSON body on success.
+    Raises DhanAPIError on HTTP error, non-success body, or network failure.
+    """
+    if not USE_DHAN:
+        raise DhanAPIError("Dhan credentials not configured")
+    sec = DHAN_SECURITY["NIFTY"]
+    headers = {
+        "access-token": DHAN_ACCESS_TOKEN,
+        "client-id":    str(DHAN_CLIENT_ID),
+        "Content-Type": "application/json",
+    }
+    sess = _get_dhan_session()
+    _is_mf = "/marketfeed/" in url                                # v38: quote-API gate
+    if _is_mf:
+        _V36["mf_lock"].acquire()
+    try:
+        if _is_mf:
+            _mf = _V36["mf"]
+            if time.time() < _mf["block_until"]:
+                raise DhanAPIError("HTTP 429: marketfeed paused after a rate-limit reply (v38 back-off)")
+            _wait = _V38_MF_GAP - (time.time() - _mf["last"])
+            if _wait > 0:
+                time.sleep(_wait)
+            _mf["last"] = time.time()
+        try:
+            resp = sess.post(url, headers=headers, json=payload, timeout=timeout)
+        except _requests.RequestException as e:
+            raise DhanAPIError(f"network error: {e}")
+        if _is_mf and (resp.status_code == 429 or '"805"' in (resp.text or "")[:300]):
+            _V36["mf"]["block_until"] = time.time() + _V38_MF_BACKOFF
+    finally:
+        if _is_mf:
+            _V36["mf_lock"].release()
+
+    # H1 fix: check HTTP status code (was missing — JSONDecodeError was silently swallowed)
+    if resp.status_code >= 400:
+        # Try to extract error message from body, fall back to status text
+        try:
+            body = resp.json()
+            msg = body.get("errorMessage") or body.get("message") or body
+        except Exception:
+            msg = resp.text[:200] if resp.text else resp.reason
+        if resp.status_code == 401 or "808" in str(msg):          # v37: token rejected
+            _V36["auth_fail_ts"] = time.time()
+        raise DhanAPIError(f"HTTP {resp.status_code}: {msg}")
+    _V36["auth_fail_ts"] = 0.0                                     # v37: token accepted
+
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise DhanAPIError(f"invalid JSON response: {e}")
+
+    # H2 fix: validate status=="success" envelope (only for /v2 endpoints;
+    # the scrip-master CSV is fetched separately via _load_dhan_instrument_master)
+    if "status" in data and data.get("status") != "success":
+        err = data.get("errorMessage") or data.get("errorCode") or data.get("status")
+        raise DhanAPIError(f"Dhan status={data.get('status')}: {err}")
+
+    return data
+
+
+def _dhan_get_csv(url, timeout=25):
+    """H1+H3 fix: GET a CSV (used for the instrument master). Returns the text."""
+    sess = _get_dhan_session()
+    try:
+        resp = sess.get(url, timeout=timeout)
+        resp.raise_for_status()           # H1 fix
+        return resp.text
+    except _requests.RequestException as e:
+        raise DhanAPIError(f"network error fetching CSV: {e}")
+
+
+
+@st.cache_resource(show_spinner=False)
+def _v29_oc_store():
+    """Process-wide (shared across reruns and visitors)."""
+    return {"lock": threading.Lock(), "data": {}, "backoff_until": 0.0}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v29 — ONE shared, de-duplicated option-chain fetch per expiry (Dhan API v2.5)
+#   Dhan v2.5 (09-Feb-2026) allows several UNIQUE option-chain requests (different
+#   expiries) inside the same 3-second window; an IDENTICAL request still needs 3 s.
+#   • Every /v2/optionchain call goes through _v29_oc_raw(expiry, max_age):
+#       – max_age = 0   → front expiry: always a fresh call (de-duplicated only if the
+#                          same expiry was fetched < 3.2 s ago)
+#       – max_age = 60  → next expiry: shared by term-structure, roll-detection and the
+#                          inter-expiry roll signal (was 3 separate calls every 5 min)
+#   • Auto fall-back: if Dhan answers with a rate-limit error, next-expiry refresh drops
+#     back to 5 min for 15 min, and the last good next-expiry chain (≤ 10 min old) is
+#     served meanwhile. The FRONT expiry never receives stale data — errors still raise.
+# ═══════════════════════════════════════════════════════════════════════════════
+V29_BACK_TTL        = 60      # s — next-expiry refresh (was 300)
+V29_BACK_TTL_SLOW   = 300     # s — used for 15 min after a rate-limit error
+V29_BACKOFF_SECS    = 900
+V29_SAME_REQ_GAP    = 3.2     # s — never repeat an identical request faster than this
+V29_STALE_MAX       = 600     # s — oldest next-expiry chain served after an error
+
+
+def _v29_back_age():
+    st_ = _v29_oc_store()
+    return V29_BACK_TTL_SLOW if time.time() < st_["backoff_until"] else V29_BACK_TTL
+
+
+def _v29_is_rate_limit(e):
+    m = str(e).lower()
+    return ("429" in m) or ("rate" in m and "limit" in m) or ("too many" in m) or ("dh-904" in m)
+
+
+def _v29_oc_raw(expiry, max_age=0):
+    """Raw /v2/optionchain JSON for `expiry`, shared by every caller (see block comment)."""
+    st_ = _v29_oc_store()
+    sec = DHAN_SECURITY["NIFTY"]
+    with st_["lock"]:
+        hit = st_["data"].get(expiry)
+        age = (time.time() - hit[0]) if hit else None
+        if hit and (age < V29_SAME_REQ_GAP or (max_age > 0 and age < max_age)):
+            return hit[1]
+        try:
+            resp = _dhan_post(
+                "https://api.dhan.co/v2/optionchain",
+                {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"], "Expiry": expiry},
+                timeout=20,
+            )
+        except Exception as e:
+            if _v29_is_rate_limit(e):
+                st_["backoff_until"] = time.time() + V29_BACKOFF_SECS
+                print(f"[v29] option-chain rate limit hit ({expiry}) — next-expiry refresh slowed "
+                      f"to {V29_BACK_TTL_SLOW}s for {V29_BACKOFF_SECS // 60} min", flush=True)
+            if max_age > 0 and hit and age < V29_STALE_MAX:
+                return hit[1]                    # next expiry only: serve last good chain
+            raise
+        st_["data"][expiry] = (time.time(), resp)
+        for k in [k for k, v in st_["data"].items() if time.time() - v[0] > 3600]:
+            st_["data"].pop(k, None)             # forget expiries not asked for in an hour
+        return resp
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_dhan_expiry_list():
+    if not USE_DHAN:
+        return []
+    sec = DHAN_SECURITY["NIFTY"]
+    try:
+        data = _dhan_post(
+            "https://api.dhan.co/v2/optionchain/expirylist",
+            {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]},
+            timeout=15,
+        )
+        expiries = data.get("data", []) or []
+        today = date.today().isoformat()
+        return [e for e in expiries if e >= today]
+    except (DhanAPIError, Exception) as e:
+        # H1+M9 fix: log the exception (was silently swallowed)
+        try:
+            print(f"[fetch_dhan_expiry_list] error: {e}", flush=True)
+        except Exception:
+            pass
+        return []
+
+
+def fetch_dhan_option_chain(expiry=None, _max_age=0):
+    if not USE_DHAN:
+        return pd.DataFrame(), 0.0, ""
+
+    sec = DHAN_SECURITY["NIFTY"]
+
+    if expiry is None:
+        try:
+            exp_data = _dhan_post(
+                "https://api.dhan.co/v2/optionchain/expirylist",
+                {"UnderlyingScrip": sec["id"], "UnderlyingSeg": sec["seg"]},
+                timeout=15,
+            )
+            expiries = exp_data.get("data", []) or []
+            today = date.today().isoformat()
+            future = [e for e in expiries if e >= today]
+            expiry = future[0] if future else ""
+        except (DhanAPIError, Exception) as e:
+            try:
+                print(f"[fetch_dhan_option_chain] expiry list error: {e}", flush=True)
+            except Exception:
+                pass
+            return pd.DataFrame(), 0.0, ""
+
+    if not expiry:
+        return pd.DataFrame(), 0.0, ""
+
+    try:
+        resp = _v29_oc_raw(expiry, max_age=_max_age)    # v29: shared, de-duplicated fetch
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_dhan_option_chain] chain fetch error: {e}", flush=True)
+        except Exception:
+            pass
+        return pd.DataFrame(), 0.0, expiry
+
+    data = resp.get("data", {}) or {}
+    spot = float(data.get("last_price") or data.get("lastPrice") or
+                 data.get("last_traded_price") or data.get("ltp") or 0)
+
+    oc = data.get("oc", {}) or {}
+    rows = []
+    # H6 fix: use int(float(...)) for OI parsing. Previously int(ce.get("oi", 0) or 0)
+    # raised ValueError on schema drift (e.g., "12345.0" string), discarding the
+    # entire option chain for that cycle.
+    def _safe_int(v):
+        try:
+            return int(float(v or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    for strike_str, chain in oc.items():
+        K = safe_num(strike_str, 0)
+        ce = (chain or {}).get("ce", {}) or {}
+        pe = (chain or {}).get("pe", {}) or {}
+        cg = ce.get("greeks", {}) or {}
+        pg = pe.get("greeks", {}) or {}
+        rows.append({
+            "strike": K,
+            "call_ltp": safe_num(ce.get("last_price", 0)),
+            "call_oi": _safe_int(ce.get("oi", 0)),                       # H6 fix
+            "call_prev_oi": _safe_int(ce.get("previous_oi", 0)),         # H6 fix
+            "call_oi_chg": _safe_int(ce.get("oi", 0)) - _safe_int(ce.get("previous_oi", 0)),
+            "call_vol": _safe_int(ce.get("volume", 0)),                  # H6 fix
+            "call_bid": safe_num(ce.get("top_bid_price", 0)),
+            "call_ask": safe_num(ce.get("top_ask_price", 0)),
+            "call_iv": safe_num(ce.get("implied_volatility", 0)),
+            "call_delta": safe_num(cg.get("delta", 0)),
+            "call_gamma": safe_num(cg.get("gamma", 0)),
+            "call_theta": safe_num(cg.get("theta", 0)),
+            "call_vega": safe_num(cg.get("vega", 0)),
+            "call_avg": safe_num(ce.get("average_price", 0)),            # v29: day's average traded price
+            "put_ltp": safe_num(pe.get("last_price", 0)),
+            "put_oi": _safe_int(pe.get("oi", 0)),                        # H6 fix
+            "put_prev_oi": _safe_int(pe.get("previous_oi", 0)),          # H6 fix
+            "put_oi_chg": _safe_int(pe.get("oi", 0)) - _safe_int(pe.get("previous_oi", 0)),
+            "put_vol": _safe_int(pe.get("volume", 0)),                   # H6 fix
+            "put_bid": safe_num(pe.get("top_bid_price", 0)),
+            "put_ask": safe_num(pe.get("top_ask_price", 0)),
+            "put_iv": safe_num(pe.get("implied_volatility", 0)),
+            "put_delta": safe_num(pg.get("delta", 0)),
+            "put_gamma": safe_num(pg.get("gamma", 0)),
+            "put_theta": safe_num(pg.get("theta", 0)),
+            "put_vega": safe_num(pg.get("vega", 0)),
+            "put_avg": safe_num(pe.get("average_price", 0)),             # v29: day's average traded price
+        })
+
+    if spot == 0 and oc:
+        # H8 fix: use proper put-call parity S = C - P + K (median across
+        # strikes with both sides having positive LTP). The previous logic
+        # returned the strike K where |C-P| was smallest, which is just the
+        # ATM strike (rounded to NIFTY_STEP) — a 17-pt error at spot 24517.
+        try:
+            spot_estimates = []
+            for strike_str, chain in oc.items():
+                K = safe_num(strike_str, 0)
+                ce_ltp = safe_num((chain or {}).get("ce", {}).get("last_price", 0))
+                pe_ltp = safe_num((chain or {}).get("pe", {}).get("last_price", 0))
+                if ce_ltp > 0 and pe_ltp > 0 and K > 0:
+                    # put-call parity: C - P = S - K*exp(-rT) ≈ S - K for short T
+                    # → S ≈ C - P + K
+                    spot_estimates.append(ce_ltp - pe_ltp + K)
+            if spot_estimates:
+                # Use median to be robust against wide-spread / illiquid strikes
+                spot = float(np.median(spot_estimates))
+        except Exception:
+            pass
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(), 0.0, expiry
+    df = df.sort_values("strike").reset_index(drop=True)
+
+    # BS greek backfill when Dhan returns sparse greeks
+    try:
+        _T = max((datetime.strptime(expiry, "%Y-%m-%d").date() - date.today()).days, 0) / 365.0
+        _r = RISK_FREE_RATE
+        for i, row in df.iterrows():
+            _K = row["strike"]
+            if row["call_delta"] == 0 and row["call_iv"] > 0.5 and spot > 0 and _T > 0:
+                _d, _g, _th, _ve = _bs_greeks(spot, _K, _T, _r, row["call_iv"] / 100.0, "CE")
+                df.at[i, "call_delta"] = _d
+                df.at[i, "call_gamma"] = _g
+                df.at[i, "call_theta"] = _th
+                df.at[i, "call_vega"]  = _ve
+            if row["put_delta"] == 0 and row["put_iv"] > 0.5 and spot > 0 and _T > 0:
+                _d, _g, _th, _ve = _bs_greeks(spot, _K, _T, _r, row["put_iv"] / 100.0, "PE")
+                df.at[i, "put_delta"] = _d
+                df.at[i, "put_gamma"] = _g
+                df.at[i, "put_theta"] = _th
+                df.at[i, "put_vega"]  = _ve
+    except Exception:
+        pass
+
+    return df, spot, expiry
+
+
+# CI #8 fix: cached wrapper around fetch_dhan_option_chain for callers that
+# fetch the BACK expiry every 60s visitor refresh (e.g., the v4 #6 Inter-Expiry
+# Roll Signal at ~L4630). The bare function has no caching — every visitor
+# triggered a fresh Dhan POST, violating the ~1-req/3s rate limit and doubling
+# API spend. 5-min TTL is sufficient because roll-detection doesn't need
+# per-minute granularity.
+@st.cache_data(ttl=60, show_spinner=False)    # v29: was 300
+def fetch_dhan_option_chain_cached(expiry=None):
+    return fetch_dhan_option_chain(expiry, _max_age=_v29_back_age())
+
+
+def fetch_demo_option_chain():
+    np.random.seed(int(time.time()) // 60)
+    step = NIFTY_STEP
+    base_spot = 24500
+    spot = base_spot * (1 + np.random.normal(0, 0.003))
+    atm = round(spot / step) * step
+    strikes = np.arange(atm - 15 * step, atm + 16 * step, step)
+    T = 3 / 365.0
+    r = RISK_FREE_RATE
+    base_iv = 14.0 + np.random.normal(0, 1.5)
+    rows = []
+    for K in strikes:
+        mono = (K - spot) / max(spot, 1)
+        iv_c = max(0.05, (base_iv / 100) + 0.015 * mono**2 + abs(mono) * 0.04 + np.random.normal(0, 0.005))
+        iv_p = max(0.05, (base_iv / 100) + 0.025 * mono**2 - mono * 0.03 + np.random.normal(0, 0.005))
+        c_price = _bs_price(spot, K, T, r, iv_c, "CE")
+        p_price = _bs_price(spot, K, T, r, iv_p, "PE")
+        cd, cg, ct, cv = _bs_greeks(spot, K, T, r, iv_c, "CE")
+        pd2, pg, pt, pv = _bs_greeks(spot, K, T, r, iv_p, "PE")
+        put_oi_fac  = max(0.2, 2 - mono * 12) * np.random.lognormal(0, 0.4)
+        call_oi_fac = max(0.2, 2 + mono * 10) * np.random.lognormal(0, 0.4)
+        call_oi = int(max(500, call_oi_fac * 40000))
+        put_oi  = int(max(500, put_oi_fac  * 55000))
+        call_prev_oi = max(0, call_oi - int(np.random.normal(800, 4000)))
+        put_prev_oi  = max(0, put_oi  - int(np.random.normal(-300, 4500)))
+        rows.append({
+            "strike": float(K),
+            "call_ltp": round(max(0.05, c_price + np.random.normal(0, 0.3)), 2),
+            "call_oi": call_oi, "call_prev_oi": call_prev_oi,
+            "call_oi_chg": call_oi - call_prev_oi,
+            "call_vol": int(abs(np.random.normal(15000, 8000))),
+            "call_bid": round(max(0.05, c_price - 0.25), 2),
+            "call_ask": round(c_price + 0.25, 2),
+            "call_iv": round(iv_c * 100, 2),
+            "call_delta": round(cd, 4), "call_gamma": round(cg, 6),
+            "call_theta": round(ct, 4), "call_vega": round(cv, 4),
+            "put_ltp": round(max(0.05, p_price + np.random.normal(0, 0.3)), 2),
+            "put_oi": put_oi, "put_prev_oi": put_prev_oi,
+            "put_oi_chg": put_oi - put_prev_oi,
+            "put_vol": int(abs(np.random.normal(18000, 9000))),
+            "put_bid": round(max(0.05, p_price - 0.25), 2),
+            "put_ask": round(p_price + 0.25, 2),
+            "put_iv": round(iv_p * 100, 2),
+            "put_delta": round(pd2, 4), "put_gamma": round(pg, 6),
+            "put_theta": round(pt, 4), "put_vega": round(pv, 4),
+            "call_avg": round(max(0.05, c_price * (1 + np.random.normal(0, 0.03))), 2),   # v29 demo
+            "put_avg": round(max(0.05, p_price * (1 + np.random.normal(0, 0.03))), 2),
+        })
+    expiry = (date.today() + timedelta(days=3)).strftime("%Y-%m-%d")
+    return pd.DataFrame(rows), round(spot, 2), expiry
+
+
+def get_option_chain(expiry=None):
+    """CI #10 fix: distinguish "API error" from "no credentials / demo mode".
+
+    Previously: any transient Dhan failure (timeout, 429, 5xx) returned an empty
+    DataFrame, which silently triggered `fetch_demo_option_chain` and was labeled
+    "DEMO MODE (No API credentials)". Users saw fabricated spot/OI/IV values
+    presented as if their credentials were missing — a data-integrity / trust
+    issue.
+
+    Now: returns one of three source strings:
+      - " LIVE — Dhan API"           : successful live fetch
+      - " API ERROR — using stale demo data"  : live fetch failed, fell back to demo
+                                                (clearly labeled as NOT real data)
+      - " DEMO MODE (No API credentials)"     : USE_DHAN is False (genuine demo)
+    """
+    if USE_DHAN:
+        df, spot, exp = fetch_dhan_option_chain(expiry)
+        if not df.empty:
+            return df, spot, exp, " LIVE — Dhan API"
+        # Live fetch returned empty — this is an API ERROR, not "no credentials".
+        # Fall back to demo data (so the dashboard remains visually populated)
+        # but tag the source so the banner can surface a clear warning.
+        df, spot, exp = fetch_demo_option_chain()
+        return df, spot, exp, " API ERROR — using stale demo data"
+    # USE_DHAN is False — genuine demo mode (no credentials configured)
+    df, spot, exp = fetch_demo_option_chain()
+    return df, spot, exp, " DEMO MODE (No API credentials)"
+
+
+# ─── NIFTY Futures LTP ────────────────────────────────────────────────────────
+import re
+
+# v24 (2026-08-13): exact-match pattern for the plain NIFTY 50 index future.
+# Accepts "NIFTY-AUG2026-FUT" and "NIFTY26AUGFUT". Rejects NIFTYNXT50-*, NIFTYFPI-*
+# and any future NIFTY<suffix> index-future family NSE introduces.
+_NIFTY_FUT_PATTERN = r"^NIFTY(?:-[A-Z]{3}\d{4}-FUT|\d{2}[A-Z]{3}FUT)$"
+
+_fut_id_cache    = _V36["fut_id"]       # v36: persistent (was {} — reset every rerun)
+_fut_master_lock = _V36["master_lock"]
+_V36_MASTER_RETRY = 300                  # v36: after a failed CSV download, wait 5 min
+
+def _load_dhan_instrument_master():
+    _m = _V36["master"]                  # v36: persistent, downloaded once per process
+    with _fut_master_lock:
+        if _m["df"] is not None:
+            return _m["df"]
+        if time.time() - _m["fail_ts"] < _V36_MASTER_RETRY:
+            return None
+        try:
+            import io
+            # H1+H3 fix: use the shared session (with retry/backoff) via _dhan_get_csv.
+            csv_text = _dhan_get_csv("https://images.dhan.co/api-data/api-scrip-master.csv", timeout=25)
+            df = pd.read_csv(io.StringIO(csv_text), low_memory=False)
+            df.columns = [c.strip().upper() for c in df.columns]
+            _m["df"] = df
+            return _m["df"]
+        except (DhanAPIError, Exception) as e:
+            _m["fail_ts"] = time.time()
+            try:
+                print(f"[_load_dhan_instrument_master] error: {e}", flush=True)
+            except Exception:
+                pass
+            return None
+
+def _resolve_futures_id(near_expiry_str=None):
+    # v38: memoised per (day, expiry arg) — the CSV scan + log line ran on every call
+    _rk = (date.today().isoformat(), str(near_expiry_str))
+    _rc = _V36["fut_resolve"]
+    if _rk in _rc and _rc[_rk][0]:
+        return _rc[_rk]
+    _res = _v38_resolve_futures_id_uncached(near_expiry_str)
+    if _res and _res[0]:
+        _rc.clear(); _rc[_rk] = _res
+    return _res
+
+
+def _v38_resolve_futures_id_uncached(near_expiry_str=None):
+    today = date.today()
+    master = _load_dhan_instrument_master()
+    if master is None:
+        return None, None
+    try:
+        cols  = set(master.columns)
+        exch_col  = next((c for c in ["SEM_EXM_EXCH_ID"] if c in cols), None)
+        instr_col = next((c for c in ["SEM_INSTRUMENT_NAME"] if c in cols), None)
+        tsym_col  = next((c for c in ["SEM_TRADING_SYMBOL","SM_SYMBOL_NAME"] if c in cols), None)
+        expdt_col = next((c for c in ["SEM_EXPIRY_DATE","SM_EXPIRY_DATE"] if c in cols), None)
+        secid_col = next((c for c in ["SEM_SMST_SECURITY_ID","SEM_SECURITY_ID"] if c in cols), None)
+        if not all([tsym_col, expdt_col, secid_col]):
+            return None, None
+        df = master.copy()
+        if exch_col:
+            df = df[df[exch_col].astype(str).str.strip().str.upper() == "NSE"]
+        if instr_col:
+            df = df[df[instr_col].astype(str).str.strip().str.upper().isin(["FUTIDX"])]
+        tsym_s = df[tsym_col].astype(str).str.strip().str.upper()
+        # ── v24 FIX (2026-08-13) ────────────────────────────────────────────
+        # NSE listed NIFTYFPI (Nifty India FPI 150) FUTIDX contracts on
+        # 2026-08-12 with the same 25-Aug expiry as NIFTY. The old test
+        # startswith("NIFTY") also matched NIFTYFPI-* and NIFTYNXT50-*, and
+        # sort_values() defaults to UNSTABLE quicksort, so iloc[0] among rows
+        # tied on expiry was arbitrary. Match the FULL trading symbol instead.
+        mask = tsym_s.str.match(_NIFTY_FUT_PATTERN, na=False)
+        if not mask.any():
+            # Fallback if Dhan ever reformats: exact root before the first hyphen.
+            mask = (tsym_s.str.split("-").str[0] == "NIFTY") & tsym_s.str.endswith("FUT")
+        df = df[mask].copy()
+        if df.empty:
+            return None, None
+        df["_expdt"] = pd.to_datetime(df[expdt_col], dayfirst=True, errors="coerce").dt.date
+        df = df[df["_expdt"].notna()]
+        if df.empty:
+            return None, None
+        df = df[df["_expdt"] >= today]
+        if df.empty:
+            return None, None
+        # v24 FIX: stable mergesort + security-id tie-break => deterministic pick.
+        df = df.sort_values(["_expdt", secid_col], kind="mergesort")
+        chosen = df.iloc[0]
+        sec_id = str(int(float(chosen[secid_col])))
+        try:
+            print(f"[_resolve_futures_id] resolved -> {str(chosen[tsym_col]).strip()} "
+                  f"| id={sec_id} | expiry={chosen['_expdt']}", flush=True)
+        except Exception:
+            pass
+        return sec_id, chosen["_expdt"]
+    except Exception:
+        return None, None
+
+_fut_ltp_cache = _V36["fut_ltp"]        # v36: persistent
+_FUT_CACHE_SEC = 58
+
+def fetch_futures_ltp(near_expiry_str=None, spot=None):
+    # v24: `spot` is optional — omit it and the sanity guard below is skipped,
+    # so every pre-existing call site keeps working unchanged.
+    if not USE_DHAN:
+        return 0.0
+    now = time.time()
+    if now - _fut_ltp_cache["ts"] < _FUT_CACHE_SEC:
+        return _fut_ltp_cache["ltp"]
+    cached = _fut_id_cache.get("NIFTY")
+    if not cached:
+        sec_id, exp_dt = _resolve_futures_id(near_expiry_str)
+        if not sec_id:
+            return 0.0
+        _fut_id_cache["NIFTY"] = {"id": sec_id, "expiry": exp_dt}
+        cached = _fut_id_cache["NIFTY"]
+    try:
+        # H1+H2+H3 fix: route through shared _dhan_post helper (status check,
+        # status=="success" validation, retry+backoff).
+        rjson = _dhan_post(
+            "https://api.dhan.co/v2/marketfeed/ltp",
+            {"NSE_FNO": [int(cached["id"])]},
+            timeout=8,
+        )
+        seg = (rjson.get("data") or {}).get("NSE_FNO") or {}
+        for _, info in seg.items():
+            ltp = float(info.get("last_price") or info.get("ltp") or 0)
+            if ltp > 0:
+                # ── v24 FIX: spot sanity guard ──────────────────────────────
+                # NIFTY futures never trade >3% from spot. If they appear to, we
+                # resolved the wrong contract — drop the cached id so the next
+                # tick re-resolves, and return 0.0 so has_traded goes False and
+                # the Futures Confirmation panel hides instead of printing a
+                # fabricated basis into the Final Decision Matrix.
+                _s = safe_num(spot, 0) if spot is not None else 0
+                if _s > 0 and abs(ltp - _s) / _s > 0.03:
+                    try:
+                        print(f"[fetch_futures_ltp] REJECTED ltp={ltp} vs spot={_s} "
+                              f"(securityId={cached.get('id')}) — wrong contract "
+                              f"resolved, clearing id cache", flush=True)
+                    except Exception:
+                        pass
+                    _fut_id_cache.pop("NIFTY", None)
+                    _V36["fut_resolve"].clear()                  # v38
+                    _fut_ltp_cache["ltp"] = 0.0
+                    _fut_ltp_cache["ts"]  = 0.0
+                    return 0.0
+                _fut_ltp_cache["ltp"] = ltp
+                _fut_ltp_cache["ts"]  = now
+                return ltp
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_futures_ltp] error: {e}", flush=True)
+        except Exception:
+            pass
+    return _fut_ltp_cache.get("ltp", 0.0)
+
+
+# ─── Metrics engine  identical logic to Dash app ─────────────────────────────
+def select_atm_band(df, spot, band=SIGNAL_BAND):
+    if df.empty:
+        return pd.DataFrame(), 0.0
+    strikes = sorted(df["strike"].dropna().unique())
+    if not strikes:
+        return pd.DataFrame(), 0.0
+    atm = min(strikes, key=lambda x: abs(x - spot))
+    lo, hi = atm - band * NIFTY_STEP, atm + band * NIFTY_STEP
+    out = df[df["strike"].between(lo, hi)].copy()
+    return out.sort_values("strike").reset_index(drop=True), float(atm)
+
+
+def compute_max_pain(df):
+    if df.empty:
+        return 0.0
+    results = {}
+    strikes = list(df["strike"].values)
+    for K in strikes:
+        lower = df[df["strike"] < K]
+        upper = df[df["strike"] > K]
+        cl = (lower["call_oi"] * (K - lower["strike"])).sum()
+        pl = (upper["put_oi"] * (upper["strike"] - K)).sum()
+        results[K] = cl + pl
+    return float(min(results, key=results.get)) if results else 0.0
+
+
+# ─── v24 ADDITION: dual-expiry Max Pain (CURRENT + NEXT) ───────────────────
+# COST: zero additional Dhan API calls in the default path.
+#   • fetch_dhan_expiry_list()    — memoised ttl=300, already called every refresh.
+#   • fetch_back_expiry_oi_band() — memoised ttl=300, already called every refresh
+#     by the roll-detection engine, and it already returns exactly the three
+#     columns compute_max_pain() needs (strike / call_oi / put_oi).
+# Both calls below are therefore cache hits in steady state. Dhan's option-chain
+# limit is 1 unique request per 3s; this adds no new unique request.
+# ONE EXCEPTION: if the user picks a non-default expiry in the override selector,
+# "next" is the expiry after the selected one, which may not be the frame the
+# roll engine cached — that resolves to one extra (throttled, memoised) call.
+def _fmt_expiry_label(exp_str):
+    """'2026-08-25' -> '25-AUG'."""
+    try:
+        return datetime.strptime(str(exp_str)[:10], "%Y-%m-%d").strftime("%d-%b").upper()
+    except Exception:
+        return str(exp_str or "")[:10]
+
+
+def get_dual_max_pain(front_max_pain, front_expiry=None):
+    """
+    Returns (cur_mp:int, cur_label:str, next_mp:int|None, next_label:str).
+
+    next_mp is None whenever the next-expiry chain is unavailable. Callers MUST
+    render "N/A" in that case — never fall back to the current-expiry value, or
+    the two tiles silently agree and the comparison becomes meaningless.
+    """
+    cur_mp  = int(safe_num(front_max_pain, 0))
+    cur_lbl = _fmt_expiry_label(front_expiry)
+    nxt_mp, nxt_lbl = None, ""
+    try:
+        # v24 HARDENING: Dhan's expirylist happens to arrive ascending, but
+        # nothing in the API contract guarantees it and the rest of this file
+        # already indexes it positionally. Sort explicitly — the strings are ISO
+        # "YYYY-MM-DD", so lexicographic order IS chronological order. This is the
+        # same unverified-ordering assumption that broke the futures resolver.
+        exps = sorted({str(e)[:10] for e in (fetch_dhan_expiry_list() or []) if e})
+
+        # NIFTY carries weekly (every Tuesday) AND monthly (last Tuesday)
+        # expiries in one list. CURRENT/NEXT are simply the two nearest entries,
+        # whichever kind they happen to be — no weekly/monthly filtering.
+        if front_expiry and str(front_expiry)[:10] in exps:
+            _i  = exps.index(str(front_expiry)[:10])
+            nxt = exps[_i + 1] if _i + 1 < len(exps) else None
+        else:
+            nxt = exps[1] if len(exps) > 1 else None
+
+        # Tag each series W or M. An expiry is the monthly if no LATER expiry
+        # falls in the same calendar month — derived from the list itself, so it
+        # stays correct if SEBI moves the settlement weekday again.
+        def _kind(e):
+            if not e:
+                return ""
+            return "M" if not any(o > e and o[:7] == e[:7] for o in exps) else "W"
+
+        _ck = _kind(str(front_expiry)[:10] if front_expiry else None)
+        if _ck:
+            cur_lbl = f"{cur_lbl} {_ck}"
+
+        if nxt:
+            nxt_lbl = f"{_fmt_expiry_label(nxt)} {_kind(nxt)}".strip()
+            band = fetch_back_expiry_oi_band(nxt)          # cache hit in steady state
+            if band is not None and not band.empty:
+                _v = compute_max_pain(band)
+                nxt_mp = int(_v) if _v and _v > 0 else None
+    except Exception as e:
+        try:
+            print(f"[get_dual_max_pain] {e}", flush=True)
+        except Exception:
+            pass
+    return cur_mp, cur_lbl, nxt_mp, nxt_lbl
+
+
+# ─── v32 ADDITION: Max Pain time series (CURRENT green vs NEXT expiry blue) ───
+# One point per real data fetch (deduplicated on the payload timestamp, so many
+# visitors still give one point), kept in max_pain_timeseries.json and reset at
+# the start of each day. Read-only use of values get_dual_max_pain() already
+# returns — no extra Dhan calls, nothing else reads this file.
+_MP_TS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "max_pain_timeseries.json")
+_MP_TS_KEEP = 400
+
+
+@st.cache_resource(show_spinner=False)
+def _mp_ts_lock():
+    return threading.Lock()
+
+
+_MP_TS_LOCK = _mp_ts_lock()   # shared across reruns/visitors
+
+
+def _mp_ts_record(fetch_key, cur_mp, nxt_mp, cur_lbl="", nxt_lbl=""):
+    """Append (time, current MP, next MP) once per fetch; returns today's points. Never raises."""
+    import re as _re_mp
+    today = now_ist().date().isoformat()
+    try:
+        with _MP_TS_LOCK:
+            try:
+                with open(_MP_TS_FILE, "r") as _f:
+                    _d = json.load(_f)
+                if _d.get("date") != today:
+                    _d = {}
+            except Exception:
+                _d = {}
+            pts = _d.get("pts") or []
+            _k = str(fetch_key or "")
+            if _k and cur_mp and not any(p.get("k") == _k for p in pts[-5:]):
+                _tm = _re_mp.search(r"(\d{2}:\d{2}:\d{2})", _k)
+                pts.append({"k": _k, "t": _tm.group(1) if _tm else now_ist().strftime("%H:%M:%S"),
+                            "cur": int(cur_mp), "nxt": int(nxt_mp) if nxt_mp else None,
+                            "cl": str(cur_lbl or ""), "nl": str(nxt_lbl or "")})
+                pts = pts[-_MP_TS_KEEP:]
+                _atomic_json_write(_MP_TS_FILE, {"date": today, "pts": pts})
+            return pts
+    except Exception as _e:
+        try:
+            print(f"[max-pain ts] {_e}", flush=True)
+        except Exception:
+            pass
+        return []
+
+
+def _mp_ts_figure(pts):
+    """Step-line chart: CURRENT expiry max pain (green) and NEXT expiry max pain (blue)."""
+    fig = go.Figure()
+    if pts:
+        _t = [p["t"] for p in pts]
+        _cl = pts[-1].get("cl") or ""
+        _nl = pts[-1].get("nl") or ""
+        fig.add_trace(go.Scatter(
+            x=_t, y=[p.get("cur") for p in pts], name=f"Current expiry {_cl}".strip(),
+            mode="lines+markers", line=dict(color="#059669", width=2.4, shape="hv"),
+            marker=dict(size=4, color="#059669"),
+            hovertemplate="%{x}<br>Current Max Pain: %{y:,.0f}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=_t, y=[p.get("nxt") for p in pts], name=f"Next expiry {_nl}".strip(),
+            mode="lines+markers", line=dict(color="#2563EB", width=2.4, shape="hv"),
+            marker=dict(size=4, color="#2563EB"), connectgaps=False,
+            hovertemplate="%{x}<br>Next Max Pain: %{y:,.0f}<extra></extra>"))
+    else:
+        fig.add_annotation(text="Collecting Max Pain ticks…", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False, font=dict(size=13, color="#6B7280"))
+    fig.update_layout(
+        title=dict(text="Max Pain over time — Current expiry (green) vs Next expiry (blue) · today",
+                   x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+        height=240, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=55, r=20, t=48, b=36), font=dict(color="#1A1A2E", size=11),
+        legend=dict(orientation="h", y=1.14, x=0, font=dict(size=10)), hovermode="x unified",
+        xaxis=dict(title=dict(text="Time (IST)", font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text="Max Pain strike", font=dict(size=10, color="#6B7280")),
+                   tickfont=dict(size=9), tickformat=",.0f", gridcolor="#F3F4F6"),
+    )
+    return fig
+
+
+# ─── v33 ADDITION: GEX Put Wall / Call Wall time series ─────────────────────
+# Plots the SAME Put Wall / Call Wall values already shown in the Final Decision
+# Matrix tiles (GEX + Vega Live Interpretation snapshot). One point per real data
+# fetch (dedup on the payload timestamp), kept in gex_walls_timeseries.json and
+# reset each day. Read-only: no extra Dhan calls, nothing else reads this file.
+_WALL_TS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gex_walls_timeseries.json")
+_WALL_TS_KEEP = 400
+
+
+def _wall_ts_record(fetch_key, put_wall, call_wall):
+    """Append (time, Put Wall, Call Wall) once per fetch; returns today's points. Never raises."""
+    import re as _re_w
+    today = now_ist().date().isoformat()
+    try:
+        with _MP_TS_LOCK:
+            try:
+                with open(_WALL_TS_FILE, "r") as _f:
+                    _d = json.load(_f)
+                if _d.get("date") != today:
+                    _d = {}
+            except Exception:
+                _d = {}
+            pts = _d.get("pts") or []
+            _k = str(fetch_key or "")
+            if _k and (put_wall or call_wall) and not any(p.get("k") == _k for p in pts[-5:]):
+                _tm = _re_w.search(r"(\d{2}:\d{2}:\d{2})", _k)
+                pts.append({"k": _k, "t": _tm.group(1) if _tm else now_ist().strftime("%H:%M:%S"),
+                            "pw": int(put_wall) if put_wall else None,
+                            "cw": int(call_wall) if call_wall else None})
+                pts = pts[-_WALL_TS_KEEP:]
+                _atomic_json_write(_WALL_TS_FILE, {"date": today, "pts": pts})
+            return pts
+    except Exception as _e:
+        try:
+            print(f"[gex-walls ts] {_e}", flush=True)
+        except Exception:
+            pass
+        return []
+
+
+def _wall_ts_figure(pts):
+    """Step-line chart: GEX Put Wall (green, support) and Call Wall (red, resistance)."""
+    fig = go.Figure()
+    if pts:
+        _t = [p["t"] for p in pts]
+        fig.add_trace(go.Scatter(
+            x=_t, y=[p.get("cw") for p in pts], name="Call Wall (resistance)",
+            mode="lines+markers", line=dict(color="#DC2626", width=2.4, shape="hv"),
+            marker=dict(size=4, color="#DC2626"), connectgaps=False,
+            hovertemplate="%{x}<br>Call Wall: %{y:,.0f}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=_t, y=[p.get("pw") for p in pts], name="Put Wall (support)",
+            mode="lines+markers", line=dict(color="#059669", width=2.4, shape="hv"),
+            marker=dict(size=4, color="#059669"), connectgaps=False,
+            hovertemplate="%{x}<br>Put Wall: %{y:,.0f}<extra></extra>"))
+    else:
+        fig.add_annotation(text="Collecting GEX wall ticks…", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False, font=dict(size=13, color="#6B7280"))
+    fig.update_layout(
+        title=dict(text="GEX walls over time — Call Wall / resistance (red) vs Put Wall / support (green) · today",
+                   x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+        height=240, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=55, r=20, t=48, b=36), font=dict(color="#1A1A2E", size=11),
+        legend=dict(orientation="h", y=1.14, x=0, font=dict(size=10)), hovermode="x unified",
+        xaxis=dict(title=dict(text="Time (IST)", font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text="Wall strike", font=dict(size=10, color="#6B7280")),
+                   tickfont=dict(size=9), tickformat=",.0f", gridcolor="#F3F4F6"),
+    )
+    return fig
+
+
+# ─── v34 ADDITION: Δ-weighted OI change — rolling last 15 minutes ───────────
+# Same weighting as the "Δ-Weighted OI Change Momentum" chart (ΔOI × |Δ|), but the
+# OI change is measured against the snapshot ~15 min ago instead of the previous
+# close. Call and put sides are shown SEPARATELY so two-sided build-up/unwinding
+# is visible. One snapshot per real data fetch (dedup on payload timestamp), kept
+# in oi15_snapshots.json, reset each day / on expiry change. No extra Dhan calls;
+# nothing else reads this file.
+_OI15_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi15_snapshots.json")
+_OI15_WINDOW_S = 15 * 60
+_OI15_KEEP_S = 40 * 60
+
+
+def _oi15_secs(fetch_key):
+    """Seconds since midnight IST from the payload timestamp (falls back to now)."""
+    import re as _re_o
+    _m = _re_o.search(r"(\d{2}):(\d{2}):(\d{2})", str(fetch_key or ""))
+    if _m:
+        return int(_m.group(1)) * 3600 + int(_m.group(2)) * 60 + int(_m.group(3))
+    _n = now_ist()
+    return _n.hour * 3600 + _n.minute * 60 + _n.second
+
+
+def _oi15_record(fetch_key, df_band, expiry=None):
+    """Store this fetch's per-strike call/put OI; return (baseline_snap, current_snap). Never raises."""
+    today = now_ist().date().isoformat()
+    try:
+        cur_oi = {str(int(r["strike"])): [float(r.get("call_oi") or 0), float(r.get("put_oi") or 0)]
+                  for r in df_band.to_dict("records")}
+        _k = str(fetch_key or "")
+        cur = {"k": _k, "s": _oi15_secs(_k), "oi": cur_oi}
+        with _MP_TS_LOCK:
+            try:
+                with open(_OI15_FILE, "r") as _f:
+                    _d = json.load(_f)
+                if _d.get("date") != today or str(_d.get("exp")) != str(expiry):
+                    _d = {}
+            except Exception:
+                _d = {}
+            snaps = _d.get("snaps") or []
+            if _k and cur_oi and not any(s.get("k") == _k for s in snaps[-5:]):
+                snaps.append(cur)
+                snaps = [s for s in snaps if cur["s"] - s.get("s", 0) <= _OI15_KEEP_S]
+                _atomic_json_write(_OI15_FILE, {"date": today, "exp": str(expiry), "snaps": snaps})
+        older = [s for s in snaps if s.get("k") != _k and s.get("s", 0) < cur["s"]]
+        if not older:
+            return None, cur
+        full = [s for s in older if cur["s"] - s["s"] >= _OI15_WINDOW_S]
+        base = max(full, key=lambda s: s["s"]) if full else min(older, key=lambda s: s["s"])
+        return base, cur
+    except Exception as _e:
+        try:
+            print(f"[oi15] {_e}", flush=True)
+        except Exception:
+            pass
+        return None, None
+
+
+def _oi15_figure(df_band, spot, base, cur):
+    """Grouped bars per strike: call component up (+) / put component down (−).
+    Solid = build-up, light hatched = unwinding. ◆ = net (call − put), same sign
+    convention as the Δ-Weighted OI Change Momentum chart (+ bearish / − bullish)."""
+    fig = go.Figure()
+    _hh = lambda s: f"{s // 3600:02d}:{(s % 3600) // 60:02d}"
+    if not base or not cur:
+        fig.add_annotation(text="Collecting OI snapshots… (needs at least 2 data fetches)",
+                           xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+                           font=dict(size=13, color="#6B7280"))
+        _title = "★ Δ-Weighted OI Change · last 15 min — collecting"
+    else:
+        xs, cv, pv, nv, cc, pc, cp, pp, ch, ph = [], [], [], [], [], [], [], [], [], []
+        for r in df_band.sort_values("strike").to_dict("records"):
+            k = str(int(r["strike"]))
+            if k not in base["oi"] or k not in cur["oi"]:
+                continue
+            d_c = cur["oi"][k][0] - base["oi"][k][0]
+            d_p = cur["oi"][k][1] - base["oi"][k][1]
+            a_c = abs(float(r.get("call_delta") or 0)); a_p = abs(float(r.get("put_delta") or 0))
+            c_w = d_c * a_c; p_w = d_p * a_p
+            xs.append(int(k)); cv.append(c_w); pv.append(-p_w); nv.append((c_w - p_w) if (c_w or p_w) else None)
+            cc.append("#DC2626" if c_w >= 0 else "#FCA5A5"); cp.append("" if c_w >= 0 else "/")
+            pc.append("#059669" if p_w >= 0 else "#86EFAC"); pp.append("" if p_w >= 0 else "/")
+            ch.append(f"{'Call BUILD-UP' if d_c >= 0 else 'Call UNWINDING'}<br>ΔOI {d_c:+,.0f} · |Δ| {a_c:.2f}")
+            ph.append(f"{'Put BUILD-UP' if d_p >= 0 else 'Put UNWINDING'}<br>ΔOI {d_p:+,.0f} · |Δ| {a_p:.2f}")
+        fig.add_trace(go.Bar(x=xs, y=cv, name="Call side",
+                             marker=dict(color=cc, pattern=dict(shape=cp, fgcolor="#DC2626")),
+                             customdata=ch, hovertemplate="%{x}<br>%{customdata}<br>Δ×ΔOI %{y:+,.0f}<extra></extra>"))
+        fig.add_trace(go.Bar(x=xs, y=pv, name="Put side",
+                             marker=dict(color=pc, pattern=dict(shape=pp, fgcolor="#059669")),
+                             customdata=ph, hovertemplate="%{x}<br>%{customdata}<br>plotted %{y:+,.0f}<extra></extra>"))
+        fig.add_trace(go.Scatter(x=xs, y=nv, name="Net (call − put)", mode="markers",
+                                 marker=dict(symbol="diamond", size=8, color="#111827",
+                                             line=dict(width=1, color="#fff")),
+                                 hovertemplate="%{x}<br>Net Δ×ΔOI %{y:+,.0f}<extra></extra>"))
+        _mins = max(1, round((cur["s"] - base["s"]) / 60))
+        _title = (f"★ Δ-Weighted OI Change · last {_mins} min ({_hh(base['s'])} → {_hh(cur['s'])})"
+                  "<br><sup>Above 0 = bearish pressure · Below 0 = bullish · solid = build-up · hatched = unwinding</sup>")
+    if spot:
+        fig.add_vline(x=spot, line_width=2, line_dash="dash", line_color="#0891B2",
+                      annotation_text=f"Spot {spot:,.0f}", annotation_position="top",
+                      annotation_font=dict(size=9, color="#0891B2"))
+    fig.add_hline(y=0, line_width=1, line_color="#9CA3AF")
+    fig.update_layout(
+        title=dict(text=_title, x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+        height=320, barmode="group", bargap=0.18, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=55, r=18, t=46, b=70), font=dict(color="#1A1A2E", size=11),
+        hoverlabel=dict(bgcolor="#fff", font_color="#1A1A2E", font_size=11),
+        legend=dict(orientation="h", y=-0.25, x=0, font=dict(size=9)),
+        xaxis=dict(title=dict(text="Strike", font=dict(size=10, color="#6B7280")), tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text="Δ×ΔOI (15 min)", font=dict(size=10, color="#6B7280")),
+                   tickfont=dict(size=9), tickformat=",.0f"),
+    )
+    return fig
+
+
+# ─── v35: session Δ-weighted OI change — call/put split traces ──────────────
+# Same pattern as the 15-min chart (_oi15_figure) but over the WHOLE SESSION
+# (call_oi_chg / put_oi_chg vs previous close). Builds traces only; the caller
+# applies the existing Section-4 styling. The net ◆ equals the old single bar
+# (CallOIChg×|Δc| − PutOIChg×|Δp|), so the momentum values are unchanged.
+def _oi_session_split_figure(df_band):
+    fig = go.Figure()
+    xs, cv, pv, nv, cc, pc, cp, pp, ch, ph = [], [], [], [], [], [], [], [], [], []
+    for r in df_band.sort_values("strike").to_dict("records"):
+        d_c = float(r.get("call_oi_chg") or 0); d_p = float(r.get("put_oi_chg") or 0)
+        a_c = abs(float(r.get("call_delta") or 0)); a_p = abs(float(r.get("put_delta") or 0))
+        c_w = d_c * a_c; p_w = d_p * a_p
+        xs.append(int(r["strike"])); cv.append(c_w); pv.append(-p_w)
+        nv.append((c_w - p_w) if (c_w or p_w) else None)
+        cc.append("#DC2626" if c_w >= 0 else "#FCA5A5"); cp.append("" if c_w >= 0 else "/")
+        pc.append("#059669" if p_w >= 0 else "#86EFAC"); pp.append("" if p_w >= 0 else "/")
+        ch.append(f"{'Call BUILD-UP' if d_c >= 0 else 'Call UNWINDING'}<br>ΔOI {d_c:+,.0f} · |Δ| {a_c:.2f}")
+        ph.append(f"{'Put BUILD-UP' if d_p >= 0 else 'Put UNWINDING'}<br>ΔOI {d_p:+,.0f} · |Δ| {a_p:.2f}")
+    fig.add_trace(go.Bar(x=xs, y=cv, name="Call side",
+                         marker=dict(color=cc, pattern=dict(shape=cp, fgcolor="#DC2626")),
+                         customdata=ch, hovertemplate="%{x}<br>%{customdata}<br>Δ×ΔOI %{y:+,.0f}<extra></extra>"))
+    fig.add_trace(go.Bar(x=xs, y=pv, name="Put side",
+                         marker=dict(color=pc, pattern=dict(shape=pp, fgcolor="#059669")),
+                         customdata=ph, hovertemplate="%{x}<br>%{customdata}<br>plotted %{y:+,.0f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=xs, y=nv, name="Net (call − put)", mode="markers",
+                             marker=dict(symbol="diamond", size=7, color="#111827",
+                                         line=dict(width=1, color="#fff")),
+                             hovertemplate="%{x}<br>Net Δ×ΔOI %{y:+,.0f}<extra></extra>"))
+    fig.add_hline(y=0, line_width=1, line_color="#9CA3AF")
+    return fig
+
+
+def _oi_session_split_finish(fig):
+    """Applied AFTER the existing Section-4 styling: grouped bars, no legend (key is in the title)."""
+    fig.update_layout(barmode="group", bargap=0.18, showlegend=False)
+    fig.update_yaxes(tickformat=",.0f")
+    return fig
+
+
+# ─── v39 ADDITION: Rolling-15-min Δ-weighted OI change → MOMENTUM STRENGTH ──
+# Raw strength = −100 × Σ net(Δ×ΔOI) / Σ (|call Δ×ΔOI| + |put Δ×ΔOI|) over the SAME
+# strikes / SAME 15-min baseline used by the "Δ-Weighted OI Change · last 15 min"
+# chart (net = call − put, identical sign convention). Range −100 … +100.
+#   v39.1: POSITIVE = UPWARD momentum strength (green) · NEGATIVE = DOWNWARD (red).
+# Option 1 — ACTIVITY FLOOR: a quiet window can print an extreme ratio from tiny
+#   flow, so the plotted strength = raw × min(1, gross ÷ (0.5 × median gross of
+#   today's ticks)). Full strength only when the window carries at least half the
+#   day's typical flow. Inactive until OI15S_CALIB_N ticks exist (calibrating).
+# Option 2 — SESSION CONTEXT: same formula on the whole-session OI change (vs
+#   previous close), drawn as a faint dotted line. 15-min vs session divergence =
+#   early sign the day's trend is tiring.
+# One point per real data fetch (dedup on payload timestamp), kept in
+# oi15_strength_timeseries.json with NIFTY spot, reset each day.
+# Read-only use of snapshots _oi15_record() already stores — no extra Dhan calls.
+_OI15S_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oi15_strength_timeseries.json")
+_OI15S_KEEP = 500
+OI15S_FLOOR_FRAC = 0.5    # full strength needs ≥ 50% of today's median gross 15-min flow
+OI15S_CALIB_N    = 5      # ticks needed before the activity floor switches on
+
+
+def _oi15_strength(df_band, base, cur):
+    """(raw strength −100..+100, window minutes, gross Δ×ΔOI) from the 15-min snapshots,
+    or (None, None, None)."""
+    try:
+        if not base or not cur:
+            return None, None, None
+        net = gross = 0.0
+        for r in df_band.to_dict("records"):
+            k = str(int(r["strike"]))
+            if k not in base["oi"] or k not in cur["oi"]:
+                continue
+            c_w = (cur["oi"][k][0] - base["oi"][k][0]) * abs(float(r.get("call_delta") or 0))
+            p_w = (cur["oi"][k][1] - base["oi"][k][1]) * abs(float(r.get("put_delta") or 0))
+            net += c_w - p_w
+            gross += abs(c_w) + abs(p_w)
+        win = max(1, round((cur["s"] - base["s"]) / 60))
+        return (round(-100.0 * net / gross, 1) if gross > 0 else 0.0), win, float(gross)   # v39.1: upward = +
+    except Exception as _e:
+        try:
+            print(f"[oi15-strength] {_e}", flush=True)
+        except Exception:
+            pass
+        return None, None, None
+
+
+def _oi_session_strength(df_band):
+    """Option 2: same strength formula on the whole-session OI change (vs previous close)."""
+    try:
+        net = gross = 0.0
+        for r in df_band.to_dict("records"):
+            c_w = float(r.get("call_oi_chg") or 0) * abs(float(r.get("call_delta") or 0))
+            p_w = float(r.get("put_oi_chg") or 0) * abs(float(r.get("put_delta") or 0))
+            net += c_w - p_w
+            gross += abs(c_w) + abs(p_w)
+        return round(-100.0 * net / gross, 1) if gross > 0 else 0.0   # v39.1: upward = +
+    except Exception:
+        return None
+
+
+def _oi15s_record(fetch_key, raw, gross, sess, spot, win_min=None):
+    """Append one tick per fetch (raw, damped strength, gross, session strength, spot);
+    returns today's points. Never raises."""
+    import re as _re_s
+    today = now_ist().date().isoformat()
+    try:
+        with _MP_TS_LOCK:
+            try:
+                with open(_OI15S_FILE, "r") as _f:
+                    _d = json.load(_f)
+                if _d.get("date") != today or _d.get("v") != 2:   # v39.1: sign convention v2
+                    _d = {}
+            except Exception:
+                _d = {}
+            pts = _d.get("pts") or []
+            _k = str(fetch_key or "")
+            if _k and raw is not None and spot and not any(p.get("k") == _k for p in pts[-5:]):
+                # Option 1: activity floor vs today's typical gross 15-min flow
+                _gs = [float(p["g"]) for p in pts if p.get("g")] + ([float(gross)] if gross else [])
+                if len(_gs) >= OI15S_CALIB_N:
+                    _ref = OI15S_FLOOR_FRAC * float(np.median(_gs))
+                    fac = min(1.0, float(gross or 0) / _ref) if _ref > 0 else 1.0
+                else:
+                    fac = None                                  # calibrating — no damping yet
+                _tm = _re_s.search(r"(\d{2}:\d{2}:\d{2})", _k)
+                pts.append({"k": _k, "t": _tm.group(1) if _tm else now_ist().strftime("%H:%M:%S"),
+                            "r": float(raw), "s": round(float(raw) * (fac if fac is not None else 1.0), 1),
+                            "f": (round(fac, 2) if fac is not None else None), "g": float(gross or 0),
+                            "ss": (float(sess) if sess is not None else None),
+                            "spot": float(spot), "w": win_min})
+                pts = pts[-_OI15S_KEEP:]
+                _atomic_json_write(_OI15S_FILE, {"date": today, "v": 2, "pts": pts})
+            return pts
+    except Exception as _e:
+        try:
+            print(f"[oi15-strength ts] {_e}", flush=True)
+        except Exception:
+            pass
+        return []
+
+
+def _oi15s_figure(pts):
+    """Full-width dual-axis time series: activity-floored 15-min momentum strength (left;
+    green above 0 = upward, red below 0 = downward, thin zero line), session strength
+    (faint dotted context line, left) and NIFTY spot (right). Current value in a corner."""
+    fig = go.Figure()
+    if not pts:
+        fig.add_annotation(text="Collecting 15-min momentum strength ticks…", xref="paper", yref="paper",
+                           x=0.5, y=0.5, showarrow=False, font=dict(size=13, color="#6B7280"))
+        fig.update_layout(height=330, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                          margin=dict(l=60, r=60, t=50, b=40))
+        return fig
+    _day = now_ist().date()
+    xs, ys, sp, ss = [], [], [], []
+    for p in pts:
+        try:
+            xs.append(datetime.combine(_day, datetime.strptime(p["t"], "%H:%M:%S").time()))
+            ys.append(float(p["s"])); sp.append(p.get("spot")); ss.append(p.get("ss"))
+        except Exception:
+            continue
+    # insert interpolated zero-crossings so the colour switches exactly at 0
+    px, py = [], []
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        if i > 0:
+            y0, x0 = ys[i - 1], xs[i - 1]
+            if (y0 < 0 < y) or (y0 > 0 > y):
+                px.append(x0 + (x - x0) * (y0 / (y0 - y))); py.append(0.0)
+        px.append(x); py.append(y)
+    up_y = [v if v >= 0 else None for v in py]      # v39.1: positive = upward momentum (green)
+    dn_y = [v if v <= 0 else None for v in py]      # v39.1: negative = downward momentum (red)
+    fig.add_trace(go.Scatter(x=px, y=up_y, name="15-min upward strength (> 0)", mode="lines",
+                             line=dict(color="#059669", width=2.4), fill="tozeroy",
+                             fillcolor="rgba(5,150,105,0.18)", connectgaps=False,
+                             hovertemplate="15-min %{y:+.1f} · UPWARD<extra></extra>"))
+    fig.add_trace(go.Scatter(x=px, y=dn_y, name="15-min downward strength (< 0)", mode="lines",
+                             line=dict(color="#DC2626", width=2.4), fill="tozeroy",
+                             fillcolor="rgba(220,38,38,0.18)", connectgaps=False,
+                             hovertemplate="15-min %{y:+.1f} · DOWNWARD<extra></extra>"))
+    if any(v is not None for v in ss):                 # Option 2: session context
+        fig.add_trace(go.Scatter(x=xs, y=ss, name="Session strength (context)", mode="lines",
+                                 line=dict(color="#6B7280", width=1.6, dash="dot"), opacity=0.75,
+                                 connectgaps=True,
+                                 hovertemplate="Session %{y:+.1f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=xs, y=sp, name="NIFTY spot", mode="lines", yaxis="y2",
+                             line=dict(color="#1E3A8A", width=1.8),
+                             hovertemplate="NIFTY %{y:,.2f}<extra></extra>"))
+    fig.add_hline(y=0, line_width=1, line_color="#6B7280")       # thin zero line
+    # auto-scaling: strength axis symmetric about 0 (covers both strength lines), spot padded
+    _m = max([abs(v) for v in ys] + [abs(v) for v in ss if v is not None] + [5.0]) * 1.15
+    _sv = [v for v in sp if v]
+    _pad = max((max(_sv) - min(_sv)) * 0.10, 5.0) if _sv else 5.0
+    # current value in the top-right corner
+    _last = pts[-1]
+    _cv = ys[-1]
+    _cc = "#059669" if _cv > 0 else ("#DC2626" if _cv < 0 else "#6B7280")
+    _cw = "▲ UPWARD" if _cv > 0 else ("▼ DOWNWARD" if _cv < 0 else "NEUTRAL")
+    _f = _last.get("f")
+    if _f is None:
+        _fl = "activity floor calibrating"
+    elif _f < 1.0:
+        _fl = f"quiet window · damped ×{_f:.2f} (raw {_last.get('r', _cv):+.1f})"
+    else:
+        _fl = "full activity"
+    _sl = (f"session {_last['ss']:+.1f}" if _last.get("ss") is not None else "session —")
+    _div = ""
+    if _last.get("ss") is not None and abs(_cv) >= 15 and abs(_last["ss"]) >= 15 \
+            and (_cv > 0) != (_last["ss"] > 0):
+        _div = "<br><span style='font-size:11px;color:#B45309'><b>⚠ 15-min diverging from session</b></span>"
+    fig.add_annotation(xref="paper", yref="paper", x=0.005, y=0.03, xanchor="left", yanchor="bottom",
+                       showarrow=False, align="left", bgcolor="rgba(255,255,255,0.93)",   # v39.1: lower-left
+                       bordercolor=_cc, borderwidth=2, borderpad=6,
+                       text=(f"<b style='font-size:24px;color:{_cc}'>{_cv:+.1f}</b><br>"
+                             f"<span style='font-size:12px;color:{_cc}'><b>{_cw}</b> momentum</span><br>"
+                             f"<span style='font-size:10px;color:#6B7280'>{_fl} · {_sl}"
+                             + (f" · last {_last['w']} min" if _last.get("w") else "") + "</span>" + _div))
+    fig.update_layout(
+        title=dict(text="★ 15-min Δ-Weighted OI Momentum STRENGTH vs NIFTY · today"
+                        "<br><sup>Strength = 100 × net(call − put Δ×ΔOI) ÷ gross, damped in quiet windows · "
+                        "+100 = max upward (green) · −100 = max downward (red) · dotted = session strength · "
+                        "right axis = NIFTY</sup>",
+                   x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+        height=330, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+        margin=dict(l=60, r=65, t=58, b=40), font=dict(color="#1A1A2E", size=11),
+        legend=dict(orientation="h", y=-0.18, x=0, font=dict(size=10)), hovermode="x unified",
+        xaxis=dict(title=dict(text="Time (IST)", font=dict(size=10, color="#6B7280")),
+                   tickformat="%H:%M", tickfont=dict(size=9)),
+        yaxis=dict(title=dict(text="Momentum strength", font=dict(size=10, color="#6B7280")),
+                   range=[-_m, _m], tickfont=dict(size=9), zeroline=False, gridcolor="#F3F4F6"),
+        yaxis2=dict(title=dict(text="NIFTY spot", font=dict(size=10, color="#1E3A8A")),
+                    overlaying="y", side="right", showgrid=False, tickformat=",.0f",
+                    tickfont=dict(size=9, color="#1E3A8A"),
+                    range=([min(_sv) - _pad, max(_sv) + _pad] if _sv else None)),
+    )
+    return fig
+
+
+def compute_metrics(df, spot, expiry=None, history=None):
+    if df.empty:
+        return {}
+
+    wide_df, atm = select_atm_band(df, spot, STRUCTURAL_BAND)
+    tight_df, _  = select_atm_band(df, spot, SIGNAL_BAND)
+    if wide_df.empty or tight_df.empty:
+        return {}
+
+    t = tight_df.copy()
+    t["intr_c"] = np.maximum(0, spot - t["strike"])
+    t["ev_c"]   = np.maximum(0, t["call_ltp"] - t["intr_c"])
+    t["intr_p"] = np.maximum(0, t["strike"] - spot)
+    t["ev_p"]   = np.maximum(0, t["put_ltp"] - t["intr_p"])
+
+    ev_sum_c = float(t["ev_c"].sum())
+    ev_sum_p = float(t["ev_p"].sum())
+    ev_ratio = ev_sum_c / ev_sum_p if ev_sum_p > 0 else 1.0
+
+    # Strike-wise Call/Put Extrinsic-Value ratio, averaged PER-STRIKE (distinct
+    # from ev_ratio above, which is a ratio-of-sums over the full ATM±SIGNAL_BAND
+    # tight_df). The per-strike average feeds the owner-facing Z-Score charts,
+    # so its band width is shared with the "ATM Vega band width" owner setting
+    # (vega_band_strikes) — the SAME control now governs the strike width for
+    # all 4 Z-Score charts (Raw & OI-Wtd Vega Ratio, Raw & OI-Wtd CE/PE EV
+    # Ratio). Loaded here (pre-backfill) since only band membership is needed,
+    # not vega values themselves — those are captured separately below.
+    try:
+        _zband_n = int(_load_owner_settings().get("vega_band_strikes", 5))
+    except Exception:
+        _zband_n = 5
+    _zband_lo = atm - _zband_n * NIFTY_STEP
+    _zband_hi = atm + _zband_n * NIFTY_STEP
+    t_band = t[t["strike"].between(_zband_lo, _zband_hi)]
+
+    _ev_ratio_per_strike = t_band["ev_c"] / t_band["ev_p"].replace(0, np.nan)
+    ev_ratio_avg_strikewise = (
+        float(_ev_ratio_per_strike.mean(skipna=True))
+        if _ev_ratio_per_strike.notna().any() else 1.0
+    )
+
+    # OI-weighted strike-wise CE/PE EV ratio, same shared band: per strike,
+    # ratio = (Call EV × Call OI) / (Put EV × Put OI), then averaged per-strike
+    # (mirrors ev_ratio_avg_strikewise above but weights each strike's EV by its OI).
+    _ev_oiw_c = t_band["ev_c"] * t_band["call_oi"]
+    _ev_oiw_p = t_band["ev_p"] * t_band["put_oi"]
+    _ev_ratio_oiw_per_strike = _ev_oiw_c / _ev_oiw_p.replace(0, np.nan)
+    ev_ratio_oiw_avg_strikewise = (
+        float(_ev_ratio_oiw_per_strike.mean(skipna=True))
+        if _ev_ratio_oiw_per_strike.notna().any() else 1.0
+    )
+
+    net_delta = float((t["call_oi"] * t["call_delta"]).sum() + (t["put_oi"] * t["put_delta"]).sum())
+    net_gamma = float((t["call_oi"] * t["call_gamma"]).sum() + (t["put_oi"] * t["put_gamma"]).sum())
+    net_theta = float((t["call_oi"] * t["call_theta"]).sum() + (t["put_oi"] * t["put_theta"]).sum())
+    momentum  = float((t["call_oi_chg"] * t["call_delta"]).sum() + (t["put_oi_chg"] * t["put_delta"]).sum())
+
+    # H10 fix (renamed v2): metric previously called "vanna" is NOT textbook vanna
+    # (∂Δ/∂σ). It is an OI-weighted vega×delta triple product / spot — a custom
+    # directional-vega pressure indicator. Renamed to oi_vega_delta_flow for clarity.
+    #   oi_vega_delta_flow = OI-weighted vega×delta product / spot
+    #                        (sign tracks call-vega-dominant vs put-vega-dominant)
+    #   vega_skew          = OI-weighted call-vega / put-vega ratio (NOT IV skew;
+    #                        the actual IV skew is `skew_slope` computed elsewhere)
+    oi_vega_delta_flow = float(
+        ((t["call_oi"] * t["call_vega"] * t["call_delta"]).sum() +
+         (t["put_oi"] * t["put_vega"] * t["put_delta"]).sum()) / max(spot, 1)
+    )
+    sum_vega_c = float((t["call_oi"] * t["call_vega"]).sum())
+    sum_vega_p = float((t["put_oi"] * t["put_vega"]).sum())
+    vega_skew  = sum_vega_c / sum_vega_p if sum_vega_p > 0 else 1.0
+
+    w = wide_df.copy()
+    true_gex, _gex_series, _gamma_flip_naive = compute_true_gex(w, spot)
+    gex = true_gex
+
+    # Gamma flip: use the price-domain zero-gamma method (see
+    # compute_gamma_flip_true docstring) instead of the strike-domain
+    # cumulative-GEX crossing. Falls back to the naive flip if the scanned
+    # spot band contains no sign crossing (e.g. too few strikes returned).
+    _T_flip = 7 / 365
+    if expiry:
+        for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+            try:
+                _exp_dt = datetime.strptime(str(expiry), _fmt).date()
+                _T_flip = max(1 / 365, (_exp_dt - date.today()).days / 365)
+                break
+            except ValueError:
+                continue
+    gamma_flip = compute_gamma_flip_true(w, spot, _T_flip)
+    if gamma_flip is None:
+        gamma_flip = _gamma_flip_naive
+    iv_rank, iv_pct = compute_iv_rank(w, atm)
+    gt_ratio = abs(net_gamma) / max(abs(net_theta), 1e-6)
+    total_coi = float(w["call_oi"].sum())
+    total_poi = float(w["put_oi"].sum())
+    pcr = total_poi / total_coi if total_coi > 0 else 1.0
+
+    atm_row = w[w["strike"] == atm]
+    if not atm_row.empty:
+        atm_iv = float((safe_num(atm_row["call_iv"].iloc[0]) + safe_num(atm_row["put_iv"].iloc[0])) / 2)
+    else:
+        atm_iv = 0.0
+    # ATM band vega captured AFTER IV/greek backfill (see below) so we always
+    # read post-backfill values. Initialise here; overwritten after backfill.
+    _atm_cv = 0.0
+    _atm_pv = 0.0
+
+    # IV backfill if Dhan returns zero IVs
+    try:
+        T_iv = 7 / 365
+        if expiry:
+            for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+                try:
+                    _exp_dt = datetime.strptime(str(expiry), _fmt).date()
+                    T_iv = max(1/365, (_exp_dt - date.today()).days / 365)
+                    break
+                except ValueError:
+                    continue
+        if w["call_iv"].max() < 0.01 and spot > 0:
+            def _bs_iv_row(row, side, T):
+                ltp = safe_num(row[f"{side}_ltp"])
+                K   = safe_num(row["strike"])
+                if ltp <= 0.05 or K <= 0:
+                    return 0.0
+                try:
+                    return round(_solve_iv(ltp, spot, K, T, 0.065, side) * 100, 2)
+                except Exception:
+                    return 0.0
+            w = w.copy()
+            w["call_iv"] = w.apply(lambda r: _bs_iv_row(r, "call", T_iv), axis=1)
+            w["put_iv"]  = w.apply(lambda r: _bs_iv_row(r, "put",  T_iv), axis=1)
+        atm_row2 = w[w["strike"] == atm]
+        if not atm_row2.empty:
+            _c = safe_num(atm_row2["call_iv"].iloc[0])
+            _p = safe_num(atm_row2["put_iv"].iloc[0])
+            if _c > 0 or _p > 0:
+                atm_iv = round(float((_c + _p) / max(1, (_c > 0) + (_p > 0))), 2)
+        if atm_iv > 0:
+            iv_rank, iv_pct = compute_iv_rank(w, atm)
+    except Exception:
+        pass
+
+    # ── Band vega capture (post-backfill) ────────────────────────────────────────
+    # Read vega_band_strikes from persisted owner settings (default 3 = ±150 pts).
+    # OI-weighted sum across the band gives a stable, positioning-aware vega signal
+    # that doesn't jump discontinuously when ATM shifts by one strike.
+    # Placed here (after IV+greek backfill) so we always read filled vega values.
+    try:
+        _vb_settings  = _load_owner_settings()
+        _vega_band_n  = int(_vb_settings.get("vega_band_strikes", 5))
+    except Exception:
+        _vega_band_n  = 5
+    _vb_lo = atm - _vega_band_n * NIFTY_STEP
+    _vb_hi = atm + _vega_band_n * NIFTY_STEP
+    _vb_df = w[w["strike"].between(_vb_lo, _vb_hi)].copy()
+    if not _vb_df.empty and "call_vega" in _vb_df.columns and "put_vega" in _vb_df.columns:
+        _atm_cv     = float((_vb_df["call_oi"] * _vb_df["call_vega"]).sum())  # OI-weighted
+        _atm_pv     = float((_vb_df["put_oi"]  * _vb_df["put_vega"]).sum())   # OI-weighted
+        _atm_cv_raw = float(_vb_df["call_vega"].sum())   # raw Σcall_vega (no OI weighting)
+        _atm_pv_raw = float(_vb_df["put_vega"].sum())    # raw Σput_vega  (no OI weighting)
+    # _atm_cv / _atm_pv / _atm_cv_raw / _atm_pv_raw remain 0.0 if band is empty or columns missing
+
+    # ── CI #2 fix: override cross-sectional iv_rank with TEMPORAL iv_rank
+    # when sufficient history is available. The cross-sectional value is a
+    # smile-position metric (close to 0 for normal NIFTY smiles where ATM sits
+    # near the IV min), which makes the HIGH_VOL / LOW_VOL regime classifier
+    # and the IV-rank-driven strategy branches (Iron Condor ≥65 / Iron Fly ≤35)
+    # systematically misfire. The temporal rank uses a trailing ~20-day window
+    # of ATM IV from `nifty_history.json`.
+    _smile_position = iv_rank  # preserve original for diagnostics
+    _iv_rank_is_temporal = False
+    if history and atm_iv > 0:
+        _temp_ivr, _is_ok = compute_temporal_iv_rank(atm_iv, history)
+        if _is_ok and _temp_ivr is not None:
+            iv_rank = _temp_ivr
+            _iv_rank_is_temporal = True
+
+    # Structural features
+    step = NIFTY_STEP
+    support    = float(wide_df.loc[wide_df["put_oi"].idxmax(), "strike"])
+    resistance = float(wide_df.loc[wide_df["call_oi"].idxmax(), "strike"])
+    max_pain   = compute_max_pain(df)
+
+    atm_window = wide_df[wide_df["strike"].between(atm - 2*step, atm + 2*step)]
+    atm_pressure = float(atm_window["put_oi_chg"].sum() - atm_window["call_oi_chg"].sum())
+
+    near = wide_df[wide_df["strike"].between(atm - 2*step, atm + 2*step)].copy()
+    total_oi  = float((wide_df["call_oi"] + wide_df["put_oi"]).sum())
+    near_oi   = float((near["call_oi"] + near["put_oi"]).sum())
+    near_oi_concentration = near_oi / total_oi if total_oi > 0 else 0.0
+
+    total_oichg = float((wide_df["call_oi_chg"].abs() + wide_df["put_oi_chg"].abs()).sum())
+    near_oichg  = float((near["call_oi_chg"].abs() + near["put_oi_chg"].abs()).sum())
+    near_oichg_concentration = near_oichg / total_oichg if total_oichg > 0 else 0.0
+
+    put_side  = wide_df[wide_df["strike"] <= atm][["strike","put_iv"]].dropna()
+    put_side  = put_side[put_side["put_iv"] > 0.5]
+    call_side = wide_df[wide_df["strike"] >= atm][["strike","call_iv"]].dropna()
+    call_side = call_side[call_side["call_iv"] > 0.5]
+    put_iv_slope = call_iv_slope = 0.0
+    if len(put_side) >= 2:
+        px = (put_side["strike"] - atm) / max(step, 1)
+        put_iv_slope = float(np.polyfit(px, put_side["put_iv"], 1)[0])
+    if len(call_side) >= 2:
+        cx = (call_side["strike"] - atm) / max(step, 1)
+        call_iv_slope = float(np.polyfit(cx, call_side["call_iv"], 1)[0])
+    skew_slope = put_iv_slope - call_iv_slope
+
+    return {
+        "ev_ratio": round(ev_ratio, 3),
+        "ev_ratio_avg_strikewise": round(ev_ratio_avg_strikewise, 4),  # avg of per-strike Sentiment, ATM±vega_band_strikes
+        "ev_ratio_oiw_avg_strikewise": round(ev_ratio_oiw_avg_strikewise, 4),  # avg of per-strike OI-weighted Sentiment, ATM±vega_band_strikes
+        "net_delta": round(net_delta, 0),
+        "net_gamma": round(net_gamma, 6),
+        "net_theta": round(net_theta, 0),
+        "gex": round(gex, 0),
+        "gamma_flip": round(gamma_flip, 0) if gamma_flip is not None else None,
+        "iv_rank": iv_rank,
+        "iv_pct": iv_pct,
+        "iv_rank_is_temporal": _iv_rank_is_temporal,   # CI #2 fix
+        "smile_position": _smile_position,             # CI #2 fix (diagnostic)
+        "vanna": round(oi_vega_delta_flow, 2),            # key kept for downstream compat; value is oi_vega_delta_flow
+        "oi_vega_delta_flow": round(oi_vega_delta_flow, 2),
+        "gt_ratio": round(gt_ratio, 4),
+        "momentum": round(momentum, 0),
+        "vega_skew": round(vega_skew, 3),
+        "pcr": round(pcr, 2),
+        "atm_iv":         round(atm_iv, 2),
+        "atm_call_vega":      round(_atm_cv, 4),      # OI-weighted ΣCall(OI×Vega) across ATM band
+        "atm_put_vega":       round(_atm_pv, 4),      # OI-weighted ΣPut(OI×Vega) across ATM band
+        "atm_call_vega_raw":  round(_atm_cv_raw, 6),  # raw Σcall_vega (no OI weighting)
+        "atm_put_vega_raw":   round(_atm_pv_raw, 6),  # raw Σput_vega  (no OI weighting)
+        "vega_band_strikes": _vega_band_n,             # band half-width used this tick
+        "atm": float(atm),
+        "support": support,
+        "resistance": resistance,
+        "max_pain": float(max_pain),
+        "dist_to_support": round(spot - support, 2),
+        "dist_to_resistance": round(resistance - spot, 2),
+        "wall_width": round(resistance - support, 2),
+        "atm_pressure": round(atm_pressure, 0),
+        "near_oi_concentration": round(near_oi_concentration, 3),
+        "near_oichg_concentration": round(near_oichg_concentration, 3),
+        "skew_slope": round(skew_slope, 3),
+        "call_oi_total": float(wide_df["call_oi"].sum()),
+        "put_oi_total":  float(wide_df["put_oi"].sum()),
+        "df_band": wide_df,
+        "df_signal": tight_df,
+    }
+
+
+
+# ─── IV Smile Scenario Classifier  (IV Smile Master Reference Algorithm) ─────
+def classify_iv_smile_scenario(df_band, m, spot, iv_smile_history=None):
+    """
+    Classifies the live IV smile shape into one of 12 scenarios.
+
+    iv_smile_history: list of dicts [{ts, atm_iv, put_wing_excess, call_wing_excess}, ...]
+    collected intraday by session_state — used for trend-aware disambiguation.
+    Returns a dict with scenario metadata, signals, strategies, confidence, and trend info.
+    """
+    if df_band is None or len(df_band) == 0:
+        return None
+    df = pd.DataFrame(df_band) if isinstance(df_band, list) else df_band.copy()
+    if df.empty or "call_iv" not in df.columns or "put_iv" not in df.columns:
+        return None
+
+    atm     = safe_num(m.get("atm", spot))
+    atm_iv  = safe_num(m.get("atm_iv", 0))
+    iv_rank = safe_num(m.get("iv_rank", 50))
+    step    = NIFTY_STEP
+
+    if atm_iv <= 0:
+        return None
+
+    # OTM wings: 2-6 steps from ATM
+    otm_put_iv = df.loc[
+        df["strike"].between(atm - 6*step, atm - 2*step) & (df["put_iv"]  > 0.5), "put_iv"
+    ]
+    otm_call_iv = df.loc[
+        df["strike"].between(atm + 2*step, atm + 6*step) & (df["call_iv"] > 0.5), "call_iv"
+    ]
+    if len(otm_put_iv) < 2 or len(otm_call_iv) < 2:
+        return None
+
+    put_wing_excess  = float(otm_put_iv.mean())  - atm_iv
+    call_wing_excess = float(otm_call_iv.mean()) - atm_iv
+    skew_asymmetry   = put_wing_excess - call_wing_excess  # +ve = put skew, -ve = call skew
+
+    # ── Intraday trend info from session history ──────────────────────────────
+    trend_info = {"has_trend": False}
+    if iv_smile_history and len(iv_smile_history) >= 3:
+        lookback = min(len(iv_smile_history) - 1, 8)   # ~2 hours at 15-min refresh
+        # v4: Exponentially weighted trend — recent ticks matter more
+        _WEIGHTS = [0.30, 0.22, 0.15, 0.10, 0.07, 0.06, 0.05, 0.05]
+        _wts = _WEIGHTS[:lookback]
+        _hist_slice = iv_smile_history[-(lookback + 1):]
+        ref = _hist_slice[0]
+        d_atm = atm_iv - safe_num(ref.get("atm_iv", atm_iv))
+        d_put = put_wing_excess - safe_num(ref.get("put_wing_excess", put_wing_excess))
+        d_call = call_wing_excess - safe_num(ref.get("call_wing_excess", call_wing_excess))
+        # Weighted multi-tick trend detection
+        w_d_atm = 0.0; w_d_put = 0.0; w_d_call = 0.0
+        for wi, wt in enumerate(_wts):
+            h = _hist_slice[wi] if wi < len(_hist_slice) else _hist_slice[-1]
+            h_next = _hist_slice[wi + 1] if wi + 1 < len(_hist_slice) else _hist_slice[-1]
+            w_d_atm  += wt * (safe_num(h_next.get("atm_iv", 0)) - safe_num(h.get("atm_iv", 0)))
+            w_d_put  += wt * (safe_num(h_next.get("put_wing_excess", 0)) - safe_num(h.get("put_wing_excess", 0)))
+            w_d_call += wt * (safe_num(h_next.get("call_wing_excess", 0)) - safe_num(h.get("call_wing_excess", 0)))
+        peak_atm = max(r.get("atm_iv", 0) for r in iv_smile_history)
+        # CI #9 fix: previously a SECOND `trend_info = {...}` assignment here
+        # silently overwrote this richer weighted dict, discarding
+        # `weighted_d_atm/put/call` and `lookback`. The weighted computation ran
+        # every tick and was thrown away. We now keep the weighted version and
+        # surface all fields. Downstream consumers (_sc closure + Scenario 8
+        # check at L1130) only read `has_trend` and `peak_atm_iv`, which both
+        # versions provided — so this fix preserves behavior while exposing
+        # the weighted fields for future scenario rules.
+        trend_info = {
+            "has_trend":      True,
+            "d_atm_iv":       round(d_atm, 2),
+            "d_put_wing":     round(d_put, 2),
+            "d_call_wing":    round(d_call, 2),
+            "peak_atm_iv":    round(peak_atm, 2),
+            "ticks":          len(iv_smile_history),
+            "weighted_d_atm":  round(w_d_atm, 2),
+            "weighted_d_put":  round(w_d_put, 2),
+            "weighted_d_call": round(w_d_call, 2),
+            "lookback":       lookback,
+        }
+
+    def _sc(sid, name, badge, bc, signals, strategies, confidence, description):
+        return {
+            "scenario_id":     sid,
+            "scenario_name":   name,
+            "badge":           badge,
+            "badge_color":     bc,
+            "atm_iv":          round(atm_iv, 2),
+            "put_wing_excess": round(put_wing_excess,  2),
+            "call_wing_excess":round(call_wing_excess, 2),
+            "skew_asymmetry":  round(skew_asymmetry,   2),
+            "iv_rank":         round(iv_rank, 1),
+            "signals":         signals,
+            "strategies":      strategies,
+            "confidence":      confidence,
+            "description":     description,
+            "trend":           trend_info,
+        }
+
+    # Scenario 12: Inverted Smile
+    if put_wing_excess < -2.0 and call_wing_excess < -2.0:
+        return _sc(12, "Inverted Smile / Vol Smirk", "ANOMALY", "#F59E0B",
+            ["ATM IV exceeds OTM wings on both sides — extremely rare",
+             "Likely a data artifact, bid-ask spread illusion, or illiquid strikes",
+             "Check strike-level prices before acting on any signal here"],
+            ["VERIFY DATA FIRST", "BUY WINGS IF REAL", "RATIO SPREAD"], 45,
+            "ATM IV higher than both wings. Almost certainly a data artifact. Verify prices.")
+
+    # Scenario 8: Compressed IV / Coiled Spring
+    if iv_rank <= 20 and abs(put_wing_excess) < 3.0 and abs(call_wing_excess) < 3.0:
+        if trend_info["has_trend"] and trend_info["peak_atm_iv"] > atm_iv * 1.5:
+            return _sc(11, "Post-Event IV Crush", "VOL COLLAPSE", "#6B7280",
+                ["ATM IV crushed from session peak {:.1f}% to now {:.1f}% (rank {:.0f}%ile)".format(
+                    trend_info['peak_atm_iv'], atm_iv, iv_rank),
+                 "Entire surface deflated — the event has resolved",
+                 "Straddle buyers lose even if direction was right (vega loss dominates)",
+                 "Crush confirmed by intraday session history"],
+                ["SELL STRADDLES", "IRON CONDOR", "COLLECT THETA"], 92,
+                "Post-event IV crush confirmed by intraday history. Peak {:.1f}% to now {:.1f}%. Premium-selling regime.".format(
+                    trend_info['peak_atm_iv'], atm_iv))
+        return _sc(8, "Compressed IV / Coiled Spring", "BREAKOUT ALERT", "#D97706",
+            ["ATM IV at multi-week low (rank {:.0f}%ile) — market in deep sleep".format(iv_rank),
+             "Both wings flat — total smile compression",
+             "Market underpricing future moves — vol explosion imminent",
+             "Direction unknown — but the magnitude of the move will be large",
+             "Theta decay is the enemy: do not buy too early, manage timing"],
+            ["BUY STRADDLE", "BUY STRANGLE", "AVOID SELLING VOL"], 85,
+            "IV rank {:.0f}%ile, both wings flat. Classic coiled spring. Buy vol but manage theta.".format(iv_rank))
+
+    # Scenario 11: Post-Event IV Crush (snapshot only)
+    if iv_rank <= 15 and put_wing_excess < 2.0 and call_wing_excess < 2.0:
+        return _sc(11, "Post-Event IV Crush", "VOL COLLAPSE", "#6B7280",
+            ["Entire surface deflated — event has resolved",
+             "Straddle buyers lose even if direction was right (vega loss dominates)",
+             "Good time to sell premium going forward — vol regime has reset"],
+            ["SELL STRADDLES", "IRON CONDOR", "COLLECT THETA"], 88,
+            "Post-event IV crush (rank {:.0f}%ile). Everything deflated. Premium-selling regime.".format(iv_rank))
+
+    # Scenario 2: Crash Fear / Panic
+    if put_wing_excess > 12.0 and iv_rank >= 65:
+        extra = []
+        if trend_info["has_trend"]:
+            if trend_info["d_put_wing"] > 3.0:
+                extra.append("TREND: PUT WING ACCELERATING +{:.1f}pts in ~30 min — panic building".format(trend_info['d_put_wing']))
+            elif trend_info["d_put_wing"] < -2.0:
+                extra.append("TREND: PUT WING DEFLATING {:.1f}pts — panic may be peaking/reversing".format(trend_info['d_put_wing']))
+        return _sc(2, "Crash Fear / Panic Mode", "EXTREME BEAR", "#DC2626",
+            ["OTM puts {:.1f} vol pts above ATM — explosive put demand".format(put_wing_excess),
+             "ATM IV very elevated (rank {:.0f}%ile) — whole surface lifted".format(iv_rank),
+             "Massive put buying: retail panic + institutional hedging simultaneously",
+             "PCR likely spiking above 1.3-1.5 (verify vs recent rolling baseline)",
+             "Contrarian: calls are SKEW-cheap relative to puts — NOT cheap in absolute vega terms"] + extra,
+            ["BUY CALL (SKEW-CHEAP, NOT VOL-CHEAP)", "SELL PUT SPREADS", "DO NOT SELL NAKED PUTS"], 88,
+            "Panic: puts {:.1f}pts above ATM, IV rank {:.0f}%ile. Calls skew-cheap but expensive in absolute vega.".format(put_wing_excess, iv_rank))
+
+    # Scenario 10: Pre-Event Volatility Spike
+    if put_wing_excess > 5.0 and call_wing_excess > 5.0 and abs(skew_asymmetry) < 4.0 and iv_rank >= 55:
+        extra = []
+        if trend_info["has_trend"] and trend_info["d_put_wing"] > 1.5 and trend_info["d_call_wing"] > 1.5:
+            extra.append("TREND: BOTH WINGS BUILDING put+{:.1f}pts call+{:.1f}pts last 30 min — vol accumulation active".format(
+                trend_info['d_put_wing'], trend_info['d_call_wing']))
+        return _sc(10, "Pre-Event Volatility Spike", "EVENT RISK", "#D97706",
+            ["Both wings elevated symmetrically — binary event pricing",
+             "Market cannot pick direction: straddle is the only honest trade",
+             "WARNING: IV already peaked at rank {:.0f}%ile — pre-event straddles often lose".format(iv_rank),
+             "Only buy straddle if realized move will exceed the implied move priced in",
+             "Best edge: sell vol AFTER the event resolves, not before"] + extra,
+            ["STRADDLE PRE-EVENT (IF MOVE > IMPLIED)", "SELL VOL POST-EVENT", "AVOID NAKED WRITES"], 90,
+            "Binary event: both wings +{:.1f}/{:.1f}pts symmetrically at IV rank {:.0f}%ile.".format(put_wing_excess, call_wing_excess, iv_rank))
+
+    # Scenario 5: Melt-Up / Euphoric Rally
+    if call_wing_excess > 4.0 and put_wing_excess < 1.5:
+        return _sc(5, "Melt-Up / Euphoric Rally", "EXTREME BULL", "#22C55E",
+            ["Put wing collapsed — nobody hedging downside (pure euphoria state)",
+             "OTM calls sharply bid: {:.1f}pts above ATM — lottery-ticket call buying".format(call_wing_excess),
+             "ATM IV often paradoxically LOW despite rising market (IV crush on drift up)",
+             "DANGER: put collapse = no downside protection = violent reversal risk",
+             "Smart money typically fades by selling OTM calls into the melt-up"],
+            ["SELL OTM CALLS", "BUY CHEAP PUTS", "TRAIL STOPS TIGHT"], 78,
+            "Euphoria: put wing flat ({:.1f}pts), calls steeply bid {:.1f}pts. Reversal risk rising.".format(put_wing_excess, call_wing_excess))
+
+    # Scenario 4: Call Skew Dominant — RARE on NIFTY
+    if call_wing_excess > put_wing_excess and call_wing_excess > 3.0 and skew_asymmetry < -2.0:
+        return _sc(4, "Call Skew Dominant (Positive Skew)", "BULLISH", "#22C55E",
+            ["Call IV exceeds put IV — rare positive skew on NIFTY",
+             "Aggressive OTM call buying — breakout or budget/event anticipation",
+             "Typical before budget, results seasons, or global melt-up phases",
+             "RARE on NIFTY — treat as high-conviction bullish signal when seen"],
+            ["BUY CALL SPREADS", "SELL PUT SKEW", "LONG FUTURES"], 82,
+            "Positive skew: call wing {:.1f}pts vs put wing {:.1f}pts. Rare on NIFTY — high conviction bullish.".format(call_wing_excess, put_wing_excess))
+
+    # Scenario 9: Two-Sided Fork
+    if put_wing_excess > 3.5 and call_wing_excess > 2.5 and 0.5 < skew_asymmetry < 6.0 and iv_rank < 50:
+        return _sc(9, "Two-Sided Fork", "MILD BEAR", "#D97706",
+            ["Both wings bid but ATM compressed: put+{:.1f}pts call+{:.1f}pts".format(put_wing_excess, call_wing_excess),
+             "Call wing bid = bulls not fully exiting, two-sided uncertainty",
+             "Net put skew ({:+.1f}pts) = directional bearish positioning warranted".format(skew_asymmetry),
+             "Both wings elevated does NOT mean sell both wings — use asymmetric plays",
+             "Avoid symmetric writes (strangle/condor) — use directional bearish setups"],
+            ["BEAR PUT SPREAD", "LONG PUT / SHORT CALL", "AVOID SYMMETRIC WRITES"], 78,
+            "Fork: put+{:.1f}pts call+{:.1f}pts, ATM compressed. Net put skew — directional bearish plays.".format(put_wing_excess, call_wing_excess))
+
+    # Scenario 6: Post-Crash Relief Rally
+    if put_wing_excess > 4.0 and call_wing_excess > 1.0 and 2.0 < skew_asymmetry <= 8.0 and 20 < iv_rank < 55:
+        extra = []
+        conf = 65
+        if trend_info["has_trend"]:
+            if trend_info["d_put_wing"] < -1.5:
+                extra.append("TREND: PUT WING DEFLATING {:.1f}pts — relief confirmed by intraday trend".format(trend_info['d_put_wing']))
+                conf = 80
+            if trend_info["d_call_wing"] > 1.0:
+                extra.append("TREND: CALL WING RISING +{:.1f}pts — early call buying confirms recovery".format(trend_info['d_call_wing']))
+                conf = min(conf + 5, 85)
+        return _sc(6, "Post-Crash Relief Rally", "RECOVERING", "#2563EB",
+            ["Put wing still elevated at {:.1f}pts but potentially deflating from panic peak".format(put_wing_excess),
+             "Call wing rising ({:.1f}pts) — early call buying as market stabilizes".format(call_wing_excess),
+             "IV contraction underway — IV crush is a tailwind for long delta positions",
+             "Long calls gain doubly: delta gain + vega gain (falling IV = vol tailwind)",
+             "Confirm with market breadth — not all relief rallies sustain to new highs"] + extra,
+            ["BUY CALLS (IV FALLING)", "CLOSE PUT HEDGES", "LONG FUTURES"], conf,
+            "Relief: puts still {:.1f}pts elevated but deflating, calls {:.1f}pts and rising.".format(put_wing_excess, call_wing_excess))
+
+    # Scenario 1: Classic Put Skew (Negative Skew)
+    if put_wing_excess >= 4.0 and call_wing_excess < 3.5 and skew_asymmetry >= 2.0:
+        extra = []
+        if trend_info["has_trend"] and trend_info["d_put_wing"] > 1.5:
+            extra.append("TREND: SKEW BUILDING put wing+{:.1f}pts last 30 min — skew pressure increasing".format(trend_info['d_put_wing']))
+        return _sc(1, "Classic Put Skew (Negative Skew)", "BEARISH", "#EF4444",
+            ["OTM puts {:.1f} vol pts above ATM — standard hedging mode".format(put_wing_excess),
+             "Call wing flat/cheap — calls not in demand",
+             "Institutions buying downside protection (collars/spreads/put spreads)",
+             "Market assigning fat left-tail probability — orderly, not panic",
+             "NOT a crash signal — systematic hedging, not capitulation"] + extra,
+            ["BUY PUT SPREAD", "SELL CALL SKEW", "RISK REVERSAL SHORT"], 80,
+            "Classic negative skew: OTM puts {:.1f}pts above ATM, calls flat. Orderly hedging, not panic.".format(put_wing_excess))
+
+    # Scenario 3: Bearish Drift / Slow Bleed
+    if 2.0 <= put_wing_excess < 4.0 and call_wing_excess < 2.0:
+        return _sc(3, "Bearish Drift / Slow Bleed", "MILD BEAR", "#D97706",
+            ["Put wing moderately elevated ({:.1f}pts) — gradual slope, not steep".format(put_wing_excess),
+             "Call wing flat — bulls absent or covering long positions",
+             "Systematic put buying — hedgers protecting long portfolios",
+             "Watch for ATM IV expansion — that signals acceleration toward panic mode"],
+            ["BEAR PUT SPREAD", "SHORT FUTURES", "AVOID CALLS"], 72,
+            "Slow bleed: put wing {:.1f}pts, calls flat. Watch ATM IV for acceleration signal.".format(put_wing_excess))
+
+    # Scenario 7: Flat / Symmetric Smile
+    if abs(skew_asymmetry) <= 2.0 and put_wing_excess > 0 and call_wing_excess > 0:
+        return _sc(7, "Flat / Symmetric Smile", "NEUTRAL", "#6B7280",
+            ["Put wing {:.1f}pts ≈ call wing {:.1f}pts — balanced book".format(put_wing_excess, call_wing_excess),
+             "Market sees equal probability of up and down moves",
+             "No directional preference — balanced (relatively rare in practice on NIFTY)",
+             "Seen post-resolution of major events (budget, Fed, results seasons)"],
+            ["IRON CONDOR", "SHORT STRANGLE (IF IV ELEVATED)", "SELL BOTH WINGS"], 65,
+            "Symmetric smile: put+{:.1f}pts approx call+{:.1f}pts. No directional edge.".format(put_wing_excess, call_wing_excess))
+
+    # Fallback
+    return _sc(0, "Indeterminate / Transitional", "NEUTRAL", "#6B7280",
+        ["Pattern does not cleanly match any known scenario",
+         "put_wing={:.1f}pts, call_wing={:.1f}pts, skew={:.1f}pts".format(put_wing_excess, call_wing_excess, skew_asymmetry),
+         "May be a transitional state — collect more data ticks for trend context"],
+        ["WAIT FOR CLARITY"], 0,
+        "No clean scenario match. Wings: put={:.1f}pts, call={:.1f}pts.".format(put_wing_excess, call_wing_excess))
+
+# ─── Bias engine  IDENTICAL to Dash app ─────────────────────────────────────
+def compute_nifty_bias(m, history=None):
+    if not m:
+        return {"bias_score": 0.0, "confidence": 0.0, "regime": "NO DATA",
+                "direction": "NEUTRAL", "factors": []}
+    history = history or []
+    factors = []
+    direction = 0.0
+    confidence = 0.0
+    BW = BIAS_WEIGHTS
+
+    if m["net_delta"] > 0:
+        direction += BW["net_delta"]; factors.append("Net delta bullish")
+    elif m["net_delta"] < 0:
+        direction -= BW["net_delta"]; factors.append("Net delta bearish")
+
+    if m["momentum"] > 0:
+        direction += BW["momentum"]; factors.append("OI momentum bullish")
+    elif m["momentum"] < 0:
+        direction -= BW["momentum"]; factors.append("OI momentum bearish")
+
+    # EV signal now uses the raw per-strike average CE/PE EV ratio
+    # (ev_ratio_avg_strikewise, same series as the Z-Score charts) instead of
+    # the legacy ratio-of-sums ev_ratio.
+    _ev_sig = m.get("ev_ratio_avg_strikewise", m["ev_ratio"])
+    if _ev_sig >= BW["ev_ratio_bull"]:
+        direction += BW["ev_ratio"]; factors.append("Call premium stronger")
+    elif _ev_sig <= BW["ev_ratio_bear"]:
+        direction -= BW["ev_ratio"]; factors.append("Put premium stronger")
+
+    if m["atm_pressure"] > 0:
+        direction += BW["atm_pressure"]; factors.append("ATM put support stronger")
+    elif m["atm_pressure"] < 0:
+        direction -= BW["atm_pressure"]; factors.append("ATM call pressure stronger")
+
+    if m["skew_slope"] > BW["skew_slope_threshold"]:
+        direction -= BW["skew_slope"]; factors.append("Downside IV skew stronger")
+    elif m["skew_slope"] < -BW["skew_slope_threshold"]:
+        direction += BW["skew_slope"]; factors.append("Upside call skew improving")
+
+    if m["vanna"] > 0:
+        direction += BW["vanna"]
+    elif m["vanna"] < 0:
+        direction -= BW["vanna"]
+
+    regime, vol_regime, near_flip = classify_gamma_regime(
+        gex=m["gex"], wall_width=m["wall_width"], momentum=m["momentum"],
+        atm_iv=m["atm_iv"], iv_rank=m.get("iv_rank", 50),
+        spot=m.get("atm", 0), gamma_flip=m.get("gamma_flip"),
+    )
+    if "PINNED" in regime or "RANGE" in regime:
+        confidence += BW["regime_range"]; factors.append(f"GEX regime: {regime} [{vol_regime}]")
+    elif "TREND" in regime:
+        confidence += BW["regime_trend"]; factors.append(f"GEX regime: {regime} [{vol_regime}]")
+    elif "FLIP" in regime:
+        confidence += BW["regime_transition"]; factors.append(f"⚠ Gamma Flip Zone [{vol_regime}]")
+    else:
+        confidence += BW["regime_transition"]
+    if near_flip:
+        factors.append("⚠ Near Gamma Flip  elevated breakout risk")
+
+    if m["near_oi_concentration"] >= BW["near_oi_min"]:
+        confidence += BW["near_oi_concentration"]; factors.append("Near-ATM OI concentrated")
+    if m["near_oichg_concentration"] >= BW["near_oichg_min"]:
+        confidence += BW["near_oichg_concentration"]; factors.append("Fresh OI active near ATM")
+    if abs(m["dist_to_support"]) < BW["wall_proximity_pts"] or abs(m["dist_to_resistance"]) < BW["wall_proximity_pts"]:
+        confidence += BW["wall_proximity"]; factors.append("Spot close to active wall")
+
+    if history:
+        prev = history[-1]
+        prev_support    = safe_num(prev.get("support",    m["support"]))
+        prev_resistance = safe_num(prev.get("resistance", m["resistance"]))
+        prev_max_pain   = safe_num(prev.get("max_pain",   m["max_pain"]))
+        prev_wall_width = safe_num(prev.get("wall_width", m["wall_width"]))
+        if m["support"] > prev_support and m["resistance"] >= prev_resistance:
+            direction += BW["wall_shift"]; factors.append("Walls shifting higher")
+        elif m["support"] <= prev_support and m["resistance"] < prev_resistance:
+            direction -= BW["wall_shift"]; factors.append("Walls shifting lower")
+        if m["max_pain"] > prev_max_pain:
+            direction += BW["max_pain_drift"]; factors.append("Max pain drifting up")
+        elif m["max_pain"] < prev_max_pain:
+            direction -= BW["max_pain_drift"]; factors.append("Max pain drifting down")
+        if m["wall_width"] < prev_wall_width and m["gex"] > 0:
+            confidence += BW["range_compression"]; factors.append("Range compressing")
+        elif m["wall_width"] > prev_wall_width and m["gex"] < 0:
+            confidence += BW["expansion_building"]; factors.append("Expansion structure building")
+
+    if len(history) >= 2:
+        recent = history[-2:]
+        nds  = [safe_num(x.get("net_delta", 0)) for x in recent] + [safe_num(m["net_delta"])]
+        moms = [safe_num(x.get("momentum",  0)) for x in recent] + [safe_num(m["momentum"])]
+        if all(x > 0 for x in nds) and all(x > 0 for x in moms):
+            confidence += BW["persistence"]; factors.append("Bullish persistence")
+        elif all(x < 0 for x in nds) and all(x < 0 for x in moms):
+            confidence += BW["persistence"]; factors.append("Bearish persistence")
+
+    bias_score = max(-100, min(100, round(direction, 1)))
+
+    # FIX (Issue 3): raw confidence sum has a structural ceiling of ~73
+    # (regime_trend 25 + near_oi 12 + near_oichg 12 + wall_proximity 8 +
+    #  range_compression/expansion 6 + persistence 10 = 73).
+    # Normalise against that max so a fully confirming market reads ~100%.
+    _CONF_MAX = (
+        BW["regime_trend"]
+        + BW["near_oi_concentration"]
+        + BW["near_oichg_concentration"]
+        + BW["wall_proximity"]
+        + max(BW["range_compression"], BW["expansion_building"])
+        + BW["persistence"]
+    )  # = 73
+    confidence = round(max(0.0, min(100.0, (confidence / _CONF_MAX) * 100)), 1)
+
+    if bias_score >= BW["bias_bull_threshold"]:
+        direction_label = "BULLISH"
+    elif bias_score <= BW["bias_bear_threshold"]:
+        direction_label = "BEARISH"
+    else:
+        direction_label = "NEUTRAL"
+
+    return {
+        "bias_score": bias_score,
+        "confidence": confidence,
+        "regime":     regime,
+        "vol_regime": vol_regime,
+        "near_flip":  near_flip,
+        "direction":  direction_label,
+        "factors":    factors[:6],
+    }
+
+
+# ─── Section 3 & 4 Bias Engine ───────────────────────────────────────────────
+def compute_section34_bias(df_band_records, m, spot, roll_discount=1.0, front_expiry=None, skew_baseline=None):
+    """
+    5-signal market bias from Section 3 (metrics) + Section 4 (±10 strike band).
+    Score range: -100 (strongly bearish) to +100 (strongly bullish).
+
+    Signal 1 — Moneyness-Adjusted Δ-Weighted Net OI    (±35 pts)
+    Signal 2 — Moneyness-Adjusted OI Momentum          (±25 pts)
+    Signal 3 — Key Level Position (S/R + GEX×Flip + Max Pain) (±20 pts)
+    Signal 4 — OTM IV Skew                             (±12 pts)
+    Signal 5 — PCR Contrarian                          (±8  pts)
+    """
+    if not df_band_records or not m or spot <= 0:
+        return {"bias_score": 0.0, "direction": "NEUTRAL", "signal_breakdown": {}}
+
+    df = pd.DataFrame(df_band_records).copy()
+    if df.empty:
+        return {"bias_score": 0.0, "direction": "NEUTRAL", "signal_breakdown": {}}
+
+    for col in ["strike", "call_oi", "put_oi", "call_oi_chg", "put_oi_chg",
+                "call_delta", "put_delta", "call_iv", "put_iv"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    # Section 3 anchors
+    support    = safe_num(m.get("support",    spot))
+    resistance = safe_num(m.get("resistance", spot))
+    max_pain   = safe_num(m.get("max_pain",   spot))
+    gamma_flip = m.get("gamma_flip")
+    gex        = safe_num(m.get("gex", 0))
+    if gamma_flip is not None:
+        gamma_flip = safe_num(gamma_flip)
+
+    # ATM band: ±0.3% of spot (≈ ±70 pts at Nifty 23 000)
+    atm_band = spot * 0.003
+
+    call_delta_abs = df["call_delta"].abs()
+    put_delta_abs  = df["put_delta"].abs()
+
+    # Moneyness weights:
+    #   OTM calls (k > spot) and ATM → full weight (1.0); ITM calls (k < spot−band) → 0.35
+    #   OTM puts  (k < spot) and ATM → full weight (1.0); ITM puts  (k > spot+band) → 0.35
+    call_wt = df["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)
+    put_wt  = df["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)
+
+    # ── v4 #3: Smart Money OI Quality Filter ────────────────────────────
+    # Filter out retail noise: only count OI changes >= significance floor
+    # and within 5 strikes of ATM (where institutional activity concentrates)
+    _OI_MOMENTUM_FLOOR = max(100, df["call_oi_chg"].abs().median() * 0.1)
+    _near_mask = df["strike"].between(spot - 5 * NIFTY_STEP, spot + 5 * NIFTY_STEP)
+    _smart_mask = (df["call_oi_chg"].abs() >= _OI_MOMENTUM_FLOOR) | \
+                 (df["put_oi_chg"].abs() >= _OI_MOMENTUM_FLOOR)
+    _quality_mask = _near_mask & _smart_mask
+    _quality_df = df[_quality_mask].copy() if _quality_mask.any() else df.copy()
+    # Use _quality_df for Signal 1 and Signal 2 instead of full df
+    _qf = _quality_df
+
+    # ── Signal 1: Moneyness-Adjusted Δ-Weighted Net OI (±35 pts) ─────────────
+    # Positive = put-side dominant = BULLISH (floor > ceiling)
+    # Negative = call-side dominant = BEARISH (ceiling > floor)
+    # Uses smart-money quality filter (_qf) — near-ATM, significant OI changes only
+    sum_call_s1 = (_qf["call_oi"] * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
+    sum_put_s1  = (_qf["put_oi"]  * _qf["put_delta"].abs()  * _qf["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)).sum()
+    denom_s1    = sum_call_s1 + sum_put_s1
+    s1 = ((sum_put_s1 - sum_call_s1) / denom_s1 * 35.0) if denom_s1 > 0 else 0.0
+    s1 = max(-35.0, min(35.0, s1))
+
+    # ── Signal 2: Moneyness-Adjusted OI Momentum (±25 pts) ───────────────────
+    net_mom   = (
+        (_qf["put_oi_chg"]  * _qf["put_delta"].abs()  * _qf["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)).sum()
+      - (_qf["call_oi_chg"] * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
+    )
+    abs_mom   = (
+        (_qf["put_oi_chg"].abs()  * _qf["put_delta"].abs()  * _qf["strike"].apply(lambda k: 1.0 if k <= (spot + atm_band) else 0.35)).sum()
+      + (_qf["call_oi_chg"].abs() * _qf["call_delta"].abs() * _qf["strike"].apply(lambda k: 1.0 if k >= (spot - atm_band) else 0.35)).sum()
+    )
+    s2 = (net_mom / abs_mom * 25.0) if abs_mom > 0 else 0.0
+    # roll_discount < 1.0 when detect_roll_activity() identifies mechanical expiry
+    # roll as the dominant cause of OI change — prevents institutional roll from
+    # being misread as genuine directional selling / covering pressure.
+    s2 = round(max(-25.0, min(25.0, s2)) * roll_discount, 1)
+
+    # ── Signal 3: Key Level Position (±20 pts) ────────────────────────────────
+    # Sub-A: Spot vs S/R band (±6 pts)
+    if resistance > support > 0:
+        midpoint = (support + resistance) / 2.0
+        if spot > resistance:
+            s3a = 6.0    # breakout above resistance
+        elif spot > midpoint:
+            s3a = 3.0    # upper half of range
+        elif spot > support:
+            s3a = -3.0   # lower half of range
+        else:
+            s3a = -6.0   # breakdown below support
+    else:
+        s3a = 0.0
+
+    # Sub-B: Gamma Flip × GEX quadrant (±10 pts)
+    if gamma_flip and gamma_flip > 0:
+        above_flip = spot > gamma_flip
+        pos_gex    = gex >= 0
+        if above_flip and pos_gex:
+            s3b = 10.0    # stable + supported: ideal bullish backdrop
+        elif above_flip and not pos_gex:
+            s3b = 4.0     # trending up but volatile (negative GEX amplifies)
+        elif not above_flip and pos_gex:
+            s3b = -4.0    # oscillating below pivot
+        else:
+            s3b = -10.0   # trending down, dealer flow amplifies falls
+    else:
+        s3b = 3.0 if gex >= 0 else -3.0  # fallback: GEX sign only
+
+    # Sub-C: Max Pain gravitational pull (±4 pts)
+    if max_pain > 0 and spot > 0:
+        pull_pct = (max_pain - spot) / spot * 100.0
+        if   pull_pct >  0.5: s3c =  4.0
+        elif pull_pct >  0.15: s3c =  2.0
+        elif pull_pct < -0.5: s3c = -4.0
+        elif pull_pct < -0.15: s3c = -2.0
+        else:                  s3c =  0.0
+    else:
+        s3c = 0.0
+
+    s3 = max(-20.0, min(20.0, s3a + s3b + s3c))
+
+    # ── Signal 4: Normalised IV Skew — ±9 pts level + ±3 pts intraday = ±12 total ─
+    # FIX (v4.1): Raw skew is always positive in normal Nifty sessions, causing a
+    # persistent ~5–7 pt bearish drag even in calm markets.
+    #
+    # Solution (Option 1 — ATM IV normalisation):
+    #   norm_skew = (put_OTM_IV − call_OTM_IV) / ATM_IV × 100
+    # Normal Nifty range ≈ 20–40% (baseline ~30%). Signal fires only on EXCESS above
+    # that baseline, removing the spurious chronic bearish tilt.
+    #
+    # The remaining ±3 pts (intraday momentum, Option 2) are added by the caller
+    # using session_state to anchor against the opening norm_skew each session.
+    otm_call_mask = df["strike"] > (spot + atm_band)
+    otm_put_mask  = df["strike"] < (spot - atm_band)
+    atm_mask      = df["strike"].between(spot - atm_band, spot + atm_band)
+
+    valid_civ = df.loc[otm_call_mask, "call_iv"][df.loc[otm_call_mask, "call_iv"] > 0.5]
+    valid_piv = df.loc[otm_put_mask,  "put_iv" ][df.loc[otm_put_mask,  "put_iv" ] > 0.5]
+
+    # ATM IV: regime baseline — average of ATM calls + puts (both sides for robustness)
+    atm_c = df.loc[atm_mask, "call_iv"][df.loc[atm_mask, "call_iv"] > 0.5]
+    atm_p = df.loc[atm_mask, "put_iv" ][df.loc[atm_mask, "put_iv" ] > 0.5]
+    atm_iv_level = (
+        pd.concat([atm_c, atm_p]).mean()
+        if (len(atm_c) + len(atm_p)) > 0 else 15.0
+    )
+
+    if len(valid_civ) > 0 and len(valid_piv) > 0 and atm_iv_level > 1.0:
+        raw_skew  = valid_piv.mean() - valid_civ.mean()   # positive = put fear premium
+        norm_skew = (raw_skew / atm_iv_level) * 100.0     # as % of ATM IV
+
+        # Fix #4: Use caller-supplied adaptive baseline (trailing median of norm_skew
+        # over recent neutral sessions from bias history). Falls back to 30.0 when
+        # insufficient history exists (first boot, cold start, etc.).
+        NORMAL_SKEW_BASELINE = skew_baseline if skew_baseline is not None else 30.0
+        excess = norm_skew - NORMAL_SKEW_BASELINE
+        # 20 pct-pt excess maps to full ±9 level score
+        s4 = max(-9.0, min(9.0, -(excess / 20.0) * 9.0))
+    else:
+        raw_skew  = 0.0
+        norm_skew = 30.0   # assume neutral when IV data unavailable
+        s4        = 0.0
+
+    # ── Signal 5: IV Term Structure (±8 pts) — placeholder, injected by caller ──
+    # REPLACED from PCR Contrarian (v4.1) to eliminate the S1/S5 OI-data redundancy.
+    # Both S1 and PCR derive from put_OI / call_OI quantities — information is
+    # double-counted at effectively ±43 pts on the same underlying measure.
+    #
+    # The IV Term Structure signal uses front vs back expiry ATM IV (not OI at all),
+    # making it genuinely orthogonal to S1. Normal contango (back IV > front IV)
+    # signals calm market. Backwardation (front IV > back IV) signals acute near-term
+    # fear. Scored via the existing compute_term_structure_signal() ts_score field,
+    # with an automatic DTE confidence weight applied by the caller to suppress the
+    # signal when front-expiry DTE ≤ 2 days (IV noise-dominated near expiry).
+    s5 = 0.0   # always 0 here; real value injected in main flow after _ts_data available
+
+    # ── Aggregate ─────────────────────────────────────────────────────────────
+    bias_score = max(-100.0, min(100.0, round(s1 + s2 + s3 + s4 + s5, 1)))
+
+    # ── Signal 6: Bias Velocity / Acceleration (±10 pts) ────────────────
+    # v4 NEW: Rate-of-change of composite bias — the most LEADING signal.
+    # Requires bias_history (session state) passed via function param.
+    s6 = 0.0
+    _bias_hist = None  # will be populated by caller
+    # We store a placeholder; the actual velocity is computed in the
+    # main flow where bias_history is available, then injected.
+    bias_score_raw = s1 + s2 + s3 + s4 + s5
+
+    if   bias_score >=  15: direction = "BULLISH"
+    elif bias_score <= -15: direction = "BEARISH"
+    else:                   direction = "NEUTRAL"
+
+    # v4: expose smart money quality strikes count for the Leading Signals panel
+    _qcount = int(_quality_mask.sum())
+
+    return {
+        "bias_score":  bias_score,
+        "direction":   direction,
+        "quality_strikes_count":  _qcount,
+        "roll_discount_applied":  round(roll_discount, 2),
+        "roll_window_active":     is_roll_window(front_expiry),  # Fix #3: pass expiry for dynamic weekday
+        # v4.1: norm_skew returned so caller can anchor intraday delta (Option 2)
+        "norm_skew":   round(norm_skew, 2),
+        "signal_breakdown": {
+            "S1 Net OI":     round(s1, 1),
+            "S2 Momentum":   round(s2, 1),   # already roll-discounted
+            "S3 Key Levels": round(s3, 1),
+            "S4 IV Skew":    round(s4, 1),   # level component only (±9 pts)
+            "S5 Term Str":   round(s5, 1),   # 0.0 here; real value injected by caller
+            "S6 Velocity":   0.0,   # populated by caller with bias_history
+        },
+    }
+
+
+def strategy_recommendation(bias, m, history=None):
+    history = history or []
+    atm        = int(m.get("atm", 0))
+    support    = int(m.get("support", 0))
+    resistance = int(m.get("resistance", 0))
+    step       = NIFTY_STEP
+    gamma_flip = m.get("gamma_flip")
+    iv_rank    = m.get("iv_rank", 50)
+    momentum   = m.get("momentum", 0)
+    # Raw per-strike average CE/PE EV ratio (Z-Score chart series) replaces
+    # the legacy ratio-of-sums ev_ratio for the EV bias signal.
+    ev_ratio   = m.get("ev_ratio_avg_strikewise", m.get("ev_ratio", 1.0))
+    pcr        = m.get("pcr", 1.0)
+    skew_slope = m.get("skew_slope", 0)
+    near_oichg = m.get("near_oichg_concentration", 0.5)
+    gex        = m.get("gex", 0)
+    confidence = bias.get("confidence", 0)
+    regime     = bias.get("regime", "TRANSITION")
+    direction  = bias.get("direction", "NEUTRAL")
+    vol_regime = bias.get("vol_regime", "MID_VOL")
+    near_flip  = bias.get("near_flip", False)
+    iv_ctx     = f"IV Rank {iv_rank:.0f} ({vol_regime})"
+
+    if not atm or not support or not resistance:
+        return {"name": "WAIT", "legs": "ATM/wall data unavailable", "color": BLUE,
+                "market_mode": regime, "mode_color": BLUE, "iv_context": iv_ctx}
+    if confidence < BIAS_WEIGHTS["confidence_min_strategy"]:
+        return {"name": "WAIT", "legs": "No clear edge  await regime confirmation", "color": BLUE,
+                "market_mode": regime, "mode_color": BLUE, "iv_context": iv_ctx}
+
+    if near_flip or "FLIP" in regime:
+        flip_str = f"{int(gamma_flip)}" if gamma_flip is not None else "N/A"
+        return {"name": "⚠ Long Straddle / Strangle",
+                "legs": f"Buy {atm} CE + {atm} PE (Straddle) OR Buy {atm+step} CE + {atm-step} PE (Strangle). Flip @ {flip_str}.",
+                "color": PINK, "market_mode": regime, "mode_color": PINK,
+                "iv_context": f"FLIP ZONE  IV Rank {iv_rank:.0f}"}
+
+    if gex < 0:
+        recent_gex_neg = sum(1 for h in history[-3:] if safe_num(h.get("gex", 1)) < 0)
+        if recent_gex_neg >= 2:
+            if direction == "BEARISH":
+                return {"name": "Bear Put Spread (GEX Trend Day)",
+                        "legs": f"Buy {atm} PE | Sell {atm-2*step} PE",
+                        "color": RED, "market_mode": regime, "mode_color": RED,
+                        "iv_context": f"GEX negative  {iv_ctx}"}
+            elif direction == "BULLISH":
+                return {"name": "Bull Call Spread (GEX Trend Day)",
+                        "legs": f"Buy {atm} CE | Sell {atm+2*step} CE",
+                        "color": GREEN, "market_mode": regime, "mode_color": GREEN,
+                        "iv_context": f"GEX negative  {iv_ctx}"}
+            else:
+                return {"name": "WAIT  GEX Negative",
+                        "legs": "Await directional confirmation.",
+                        "color": BLUE, "market_mode": regime, "mode_color": BLUE,
+                        "iv_context": f"GEX negative  {iv_ctx}"}
+
+    if near_oichg < 0.40:
+        if direction == "BULLISH" and momentum > 0:
+            return {"name": "Bull Call Spread (Weak Pin)",
+                    "legs": f"Buy {atm} CE | Sell {atm+2*step} CE",
+                    "color": GREEN, "market_mode": regime, "mode_color": GREEN,
+                    "iv_context": f"Near OI Chg {near_oichg*100:.0f}%  pin soft"}
+        elif direction == "BEARISH" and momentum < 0:
+            return {"name": "Bear Put Spread (Weak Pin)",
+                    "legs": f"Buy {atm} PE | Sell {atm-2*step} PE",
+                    "color": RED, "market_mode": regime, "mode_color": RED,
+                    "iv_context": f"Near OI Chg {near_oichg*100:.0f}%  pin soft"}
+        else:
+            return {"name": "WAIT  Pin Weakening",
+                    "legs": f"Near OI Chg% {near_oichg*100:.0f}%  pin soft, avoid IC.",
+                    "color": BLUE, "market_mode": regime, "mode_color": BLUE, "iv_context": iv_ctx}
+
+    if gamma_flip is not None and history:
+        prev_atm = safe_num(history[-1].get("atm", atm))
+        if atm > gamma_flip and prev_atm < gamma_flip:
+            return {"name": "Bull Call Spread (Flip Recapture)",
+                    "legs": f"Buy {atm} CE | Sell {atm+2*step} CE. Confirm with GEX.",
+                    "color": GREEN, "market_mode": regime, "mode_color": GREEN,
+                    "iv_context": f"Flip recapture @ {int(gamma_flip)}"}
+
+    mom_bull = momentum > 0; mom_bear = momentum < 0
+    ev_bull  = ev_ratio >= BIAS_WEIGHTS["ev_ratio_bull"]
+    ev_bear  = ev_ratio <= BIAS_WEIGHTS["ev_ratio_bear"]
+    mec      = (mom_bull and ev_bear) or (mom_bear and ev_bull)
+
+    if pcr > 1.4 and momentum > 0 and not mec:
+        return {"name": "Bull Call Spread (PCR Contrarian)",
+                "legs": f"Buy {atm} CE | Sell {atm+2*step} CE  PCR {pcr:.2f} extreme",
+                "color": GREEN, "market_mode": regime, "mode_color": GREEN,
+                "iv_context": f"PCR contrarian bull  {iv_ctx}"}
+    if pcr < 0.55 and momentum < 0 and not mec:
+        return {"name": "Bear Put Spread (PCR Contrarian)",
+                "legs": f"Buy {atm} PE | Sell {atm-2*step} PE  PCR {pcr:.2f} extreme",
+                "color": RED, "market_mode": regime, "mode_color": RED,
+                "iv_context": f"PCR contrarian bear  {iv_ctx}"}
+
+    wide_put_wing = skew_slope > 0.3
+    put_sell = support + step
+    put_buy  = support - (2 * step if wide_put_wing else step)
+    size_note = " ⚠ Half size (conflict)" if mec else ""
+
+    if "RANGE" in regime or "PINNED" in regime:
+        gex_pos_ticks = sum(1 for h in history[-3:] if safe_num(h.get("gex", -1)) > 0)
+        gex_confirmed = gex_pos_ticks >= 2 or len(history) < 2
+        if not gex_confirmed:
+            return {"name": "WAIT  GEX Not Yet Confirmed",
+                    "legs": f"GEX positive for only {gex_pos_ticks}/3 ticks",
+                    "color": AMBER, "market_mode": regime, "mode_color": AMBER, "iv_context": iv_ctx}
+        if iv_rank >= 65:
+            return {"name": f"Iron Condor  High IV{size_note}",
+                    "legs": f"Sell {put_sell} PE / Buy {put_buy} PE + Sell {resistance-step} CE / Buy {resistance+step} CE",
+                    "color": AMBER, "market_mode": regime, "mode_color": AMBER,
+                    "iv_context": f"IV Rank {iv_rank:.0f}  ideal IC setup"}
+        elif iv_rank <= 35:
+            return {"name": f"Iron Fly  Low IV{size_note}",
+                    "legs": f"Sell {atm} CE / Buy {atm+2*step} CE + Sell {atm} PE / Buy {atm-2*step} PE",
+                    "color": GOLD, "market_mode": regime, "mode_color": GOLD,
+                    "iv_context": f"IV Rank {iv_rank:.0f}  Iron Fly preferred"}
+        else:
+            return {"name": f"Iron Condor / Iron Fly{size_note}",
+                    "legs": f"Sell {put_sell} PE / Buy {put_buy} PE + Sell {resistance-step} CE / Buy {resistance+step} CE",
+                    "color": AMBER, "market_mode": regime, "mode_color": AMBER, "iv_context": iv_ctx}
+
+    if direction == "BULLISH":
+        if iv_rank <= 40:
+            return {"name": f"Bull Call Spread (Debit){size_note}",
+                    "legs": f"Buy {atm} CE | Sell {atm+2*step} CE",
+                    "color": GREEN, "market_mode": regime, "mode_color": GREEN,
+                    "iv_context": f"IV Rank {iv_rank:.0f}  cheap debit"}
+        else:
+            return {"name": f"Bull Put Spread (Credit){size_note}",
+                    "legs": f"Sell {support} PE | Buy {support-step} PE",
+                    "color": GREEN, "market_mode": regime, "mode_color": GREEN,
+                    "iv_context": f"IV Rank {iv_rank:.0f}  sell premium below support"}
+    if direction == "BEARISH":
+        if iv_rank <= 40:
+            return {"name": f"Bear Put Spread (Debit){size_note}",
+                    "legs": f"Buy {atm} PE | Sell {atm-2*step} PE",
+                    "color": RED, "market_mode": regime, "mode_color": RED,
+                    "iv_context": f"IV Rank {iv_rank:.0f}  cheap debit"}
+        else:
+            return {"name": f"Bear Call Spread (Credit){size_note}",
+                    "legs": f"Sell {resistance} CE | Buy {resistance+step} CE",
+                    "color": RED, "market_mode": regime, "mode_color": RED,
+                    "iv_context": f"IV Rank {iv_rank:.0f}  sell above resistance"}
+
+    return {"name": "WAIT / BREAKOUT WATCH",
+            "legs": f"Watch {support} support / {resistance} resistance",
+            "color": BLUE, "market_mode": regime, "mode_color": BLUE, "iv_context": iv_ctx}
+
+
+# ── v4: Wall Strength Index REMOVED (replaced by Leading Signals panel) ──
+
+
+
+
+
+# ─── Market Sentiments  IDENTICAL to Dash app ────────────────────────────────
+N_TICKS_SENTIMENT = 15
+
+def compute_market_sentiments(history):
+    if not history or len(history) < 3:
+        return None
+    recent  = history[-N_TICKS_SENTIMENT:]
+    n       = len(recent)
+    last    = recent[-1]
+    warming = n < 5
+
+    def safe_arr(key):
+        return np.array([safe_num(x.get(key, 0)) for x in recent], dtype=float)
+
+    def zscore_latest(arr):
+        if len(arr) < 2: return 0.0
+        std = arr.std()
+        return float((arr[-1] - arr.mean()) / std) if std > 1e-9 else 0.0
+
+    def classify_pcr_abs(pcr):
+        if   pcr > 1.3: return "Bullish", GREEN
+        elif pcr > 0.8: return "SideWays", AMBER
+        else:           return "Bearish", RED
+
+    def classify_nd_abs(nd):
+        # CHANGE 3 (audit fix): flipped to WRITING convention.
+        # net_delta = sum(call_oi*call_delta) + sum(put_oi*put_delta) with put_delta<0.
+        # nd > 0  =>  call-side delta-weighted OI dominant  =>  CALL WRITING  =>  BEARISH.
+        # nd < 0  =>  put-side  delta-weighted OI dominant  =>  PUT  WRITING  =>  BULLISH.
+        # (was previously treated as a buying-convention signal, which contradicts the
+        # S3/4 writer-positioning engine and the Combined Decision panel.)
+        if   nd >  5000: return "Bearish", RED
+        elif nd < -5000: return "Bullish", GREEN
+        else:            return "SideWays", AMBER
+
+    def classify_gex_abs(gex):
+        if   gex >  500: return "SideWays", AMBER
+        elif gex < -500: return "Bearish", RED
+        else:            return "SideWays", AMBER
+
+    def classify_iv_abs(iv):
+        if   iv > 18: return "Bearish", RED
+        elif iv > 14: return "SideWays", AMBER
+        else:         return "Bullish", GREEN
+
+    def classify_z(z):
+        if z >  0.8: return "Bullish", GREEN
+        if z < -0.8: return "Bearish", RED
+        return "SideWays", AMBER
+
+    iv_arr  = safe_arr("atm_iv");    pcr_arr = safe_arr("pcr")
+    nd_arr  = safe_arr("net_delta"); gex_arr = safe_arr("gex")
+    iv_z    = zscore_latest(iv_arr); pcr_z   = zscore_latest(pcr_arr)
+    nd_z    = zscore_latest(nd_arr); gex_z   = zscore_latest(gex_arr)
+
+    raw_iv  = safe_num(last.get("atm_iv", 0));   raw_pcr = safe_num(last.get("pcr", 1))
+    raw_nd  = safe_num(last.get("net_delta", 0)); raw_gex = safe_num(last.get("gex", 0))
+
+    use_abs_iv  = iv_arr.std()  < 1e-9; use_abs_pcr = pcr_arr.std() < 1e-9
+    use_abs_nd  = nd_arr.std()  < 1e-9; use_abs_gex = gex_arr.std() < 1e-9
+
+    vega_label,     vega_color     = classify_iv_abs(raw_iv)   if use_abs_iv  else classify_z(iv_z)
+    oi_label,       oi_color       = classify_pcr_abs(raw_pcr) if use_abs_pcr else classify_z(-pcr_z)
+    # CHANGE 3 (audit fix): negate nd_z to match writing convention (see classify_nd_abs).
+    strength_label, strength_color = classify_nd_abs(raw_nd)   if use_abs_nd  else classify_z(-nd_z)
+    theta_label,    theta_color    = classify_gex_abs(raw_gex) if use_abs_gex else classify_z(gex_z)
+
+    abs_score = (
+        (1 if oi_label=="Bullish" else -1 if oi_label=="Bearish" else 0) * 2.5 +
+        (1 if strength_label=="Bullish" else -1 if strength_label=="Bearish" else 0) * 3.0 +
+        (1 if vega_label=="Bullish" else -1 if vega_label=="Bearish" else 0) * 2.5 +
+        (1 if theta_label=="Bullish" else -1 if theta_label=="Bearish" else 0) * 2.0
+    )
+    # CHANGE 3 (audit fix): -nd_z to flip from buying convention to writing convention.
+    z_score_raw = (0.30 * (-nd_z) + 0.25 * iv_z + 0.25 * (-pcr_z) + 0.20 * gex_z) * 5
+    all_flat = use_abs_iv and use_abs_pcr and use_abs_nd and use_abs_gex
+    pos_score = round(float(np.clip(abs_score if all_flat else z_score_raw, -10, 10)), 2)
+
+    if   pos_score >  2.0: pos_dot = GREEN
+    elif pos_score < -2.0: pos_dot = RED
+    else:                  pos_dot = AMBER
+
+    labels = [vega_label, theta_label, oi_label, strength_label]
+    bulls  = labels.count("Bullish"); bears = labels.count("Bearish")
+
+    if   bulls >= 3 and pos_score >  2.0: overall, ov_color = "BUY",      GREEN
+    elif bears >= 3 and pos_score < -2.0: overall, ov_color = "SELL",     RED
+    elif oi_label == "Bearish" and bulls >= 2:
+        overall, ov_color = "No Trade", AMBER
+    else:
+        overall, ov_color = "No Trade", MUTED
+
+    if   pos_score >  4.0: pos_caption = "POS is strongly bullish"
+    elif pos_score >  1.0: pos_caption = "POS is neutral to +ve"
+    elif pos_score > -1.0: pos_caption = "POS is neutral"
+    elif pos_score > -4.0: pos_caption = "POS is neutral to -ve"
+    else:                  pos_caption = "POS is strongly bearish"
+
+    mode_note = " · Absolute mode (warming up)" if all_flat else " · Z-score mode"
+    return dict(
+        vega_label=vega_label, vega_color=vega_color,
+        theta_label=theta_label, theta_color=theta_color,
+        oi_label=oi_label, oi_color=oi_color,
+        strength_label=strength_label, strength_color=strength_color,
+        pos_score=pos_score, pos_dot=pos_dot,
+        overall=overall, overall_color=ov_color,
+        pos_caption=pos_caption + mode_note,
+        n_ticks=n, warming=warming,
+    )
+
+
+# ─── Synthetic Future / Basis Triangulation  IDENTICAL to Dash app ───────────
+def compute_synthetic_future(df_band, spot, atm, expiry_str, r=0.065):
+    if df_band is None or len(df_band) == 0 or spot <= 0 or atm <= 0:
+        return None
+    if isinstance(df_band, list):
+        df_s10 = pd.DataFrame(df_band)
+    else:
+        df_s10 = df_band.copy()
+    if df_s10.empty or "strike" not in df_s10.columns:
+        return None
+    atm_rows = df_s10[df_s10["strike"] == atm]
+    if atm_rows.empty:
+        idx = (df_s10["strike"] - atm).abs().idxmin()
+        atm_rows = df_s10.iloc[[idx]]
+    row      = atm_rows.iloc[0]
+    call_ltp = safe_num(row.get("call_ltp", 0))
+    put_ltp  = safe_num(row.get("put_ltp",  0))
+    if call_ltp <= 0 or put_ltp <= 0:
+        return None
+    synthetic = call_ltp - put_ltp + atm
+    T = 7.0 / 365
+    try:
+        for _fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+            try:
+                _exp = datetime.strptime(str(expiry_str), _fmt).date()
+                T = max((_exp - date.today()).days, 0) / 365
+                break
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    fair_future  = spot * np.exp(r * T)   # H9 fix: was spot*(1+r*T) (simple interest);
+                                           # the synthetic call-put+K is a continuous-compounding
+                                           # forward per BS assumptions. Mismatch was numerically
+                                           # tiny for short DTE but methodologically inconsistent.
+    fair_basis   = fair_future - spot
+    synth_basis  = synthetic  - spot
+    synth_excess = synthetic  - fair_future
+    return {"spot":round(spot,2),"synthetic":round(synthetic,2),"fair_future":round(fair_future,2),
+            "fair_basis":round(fair_basis,2),"synth_basis":round(synth_basis,2),
+            "synth_excess":round(synth_excess,2),"call_ltp":round(call_ltp,2),
+            "put_ltp":round(put_ltp,2),"atm":int(atm),"T_days":round(T*365,1)}
+
+
+def compute_basis_signals(sf, traded_future):
+    if sf is None:
+        return None
+    spot         = sf["spot"]; synthetic = sf["synthetic"]; fair_future = sf["fair_future"]
+    fair_basis   = sf["fair_basis"]; synth_basis = sf["synth_basis"]; synth_excess = sf["synth_excess"]
+    has_traded   = (traded_future is not None and safe_num(traded_future, 0) > 0)
+    if has_traded:
+        traded_future = safe_num(traded_future)
+        traded_basis  = traded_future - spot
+        traded_excess = traded_future - fair_future
+        basis_gap     = traded_future - synthetic
+    else:
+        traded_future = traded_basis = traded_excess = basis_gap = None
+
+    thr = max(spot * 0.0004, 5.0)
+    signals = []; net_bias = 0
+    if synth_excess > thr:
+        signals.append(("Call premium bid above carry  options leaning bullish", GREEN)); net_bias += 1
+    elif synth_excess < -thr:
+        signals.append(("Put premium bid above carry  options leaning bearish", RED));    net_bias -= 1
+    else:
+        signals.append(("Options pricing near fair carry  no directional lean", MUTED))
+
+    if has_traded:
+        if traded_excess > thr:
+            signals.append(("Futures premium above fair carry  institutional longs dominant", GREEN)); net_bias += 1
+        elif traded_excess < -thr:
+            signals.append(("Futures below fair carry  hedge/short pressure present", RED));           net_bias -= 1
+        else:
+            signals.append(("Futures at fair carry  carry-neutral positioning", MUTED))
+        if basis_gap > thr:
+            signals.append((f"Futures leads synthetic by {basis_gap:+.1f}pts  bullish lead", GREEN)); net_bias += 2
+        elif basis_gap < -thr:
+            signals.append((f"Futures lags synthetic by {abs(basis_gap):.1f}pts  bearish lean", RED)); net_bias -= 2
+        else:
+            signals.append((f"Futures and synthetic aligned (gap {basis_gap:+.1f}pts)", MUTED))
+
+    if   net_bias >= 3:  sc, sl = GREEN,   "STRONGLY BULLISH"
+    elif net_bias == 2:  sc, sl = GREEN,   "BULLISH"
+    elif net_bias == 1:  sc, sl = "#10B981","MILDLY BULLISH"
+    elif net_bias == -1: sc, sl = AMBER,   "MILDLY BEARISH"
+    elif net_bias == -2: sc, sl = RED,     "BEARISH"
+    elif net_bias <= -3: sc, sl = RED,     "STRONGLY BEARISH"
+    else:                sc, sl = MUTED,   "NEUTRAL"
+
+    return {"spot":spot,"synthetic":synthetic,"fair_future":fair_future,
+            "traded_future":traded_future,"has_traded":has_traded,
+            "fair_basis":fair_basis,"synth_basis":synth_basis,"synth_excess":synth_excess,
+            "traded_basis":traded_basis,"traded_excess":traded_excess,"basis_gap":basis_gap,
+            "signals":signals,"net_bias":net_bias,"summary_label":sl,"summary_color":sc,
+            "T_days":sf["T_days"],"atm":sf["atm"],"call_ltp":sf["call_ltp"],"put_ltp":sf["put_ltp"]}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENHANCED PRICE CONFIRMATION LAYER  (v7 addition — surgical)
+#   Module A: VWAP + Opening Range  (Dhan /v2/charts/intraday)
+#   Module B: Term Structure         (second expiry from /v2/optionchain)
+#   Module C: India VIX              (Dhan instrument master + LTP feed)
+# All three are read-only additions. No existing variables modified.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Module A: VWAP + Opening Range ───────────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_nifty_intraday_candles():
+    """
+    Fetch today's 1-min OHLCV for the near-month NIFTY Futures contract from
+    Dhan /v2/charts/intraday.  Uses the actual futures security ID resolved via
+    _resolve_futures_id() so VWAP is computed on real traded volume, not the
+    synthetic index tick count.
+    Returns list of dicts {ts, open, high, low, close, volume} or [] on failure.
+    """
+    if not USE_DHAN:
+        return []
+    # Resolve near-month NIFTY futures security ID (reuses existing helper)
+    _fut_sec_id, _fut_expiry = _resolve_futures_id()
+    if not _fut_sec_id:
+        return []
+    today_str = date.today().strftime("%Y-%m-%d")
+    try:
+        # H1+H2+H3 fix: shared helper — status check, success validation, retry/backoff.
+        data = _dhan_post(
+            "https://api.dhan.co/v2/charts/intraday",
+            {
+                "securityId":      str(_fut_sec_id),
+                "exchangeSegment": "NSE_FNO",
+                "instrument":      "FUTIDX",
+                "interval":        "1",
+                "oi":              False,
+                "fromDate":        f"{today_str} 09:15:00",
+                "toDate":          f"{today_str} 15:30:00",
+            },
+            timeout=15,
+        )
+        ts_arr  = data.get("timestamp", [])
+        op_arr  = data.get("open",      [])
+        hi_arr  = data.get("high",      [])
+        lo_arr  = data.get("low",       [])
+        cl_arr  = data.get("close",     [])
+        vo_arr  = data.get("volume",    [])
+        if not ts_arr:
+            return []
+        # M7 fix: validate array lengths — partial responses were silently zero-filled,
+        # producing fake 0-volume / 0-price candles that corrupt VWAP & Opening Range.
+        n = len(ts_arr)
+        for arr_name, arr in (("open", op_arr), ("high", hi_arr),
+                              ("low", lo_arr), ("close", cl_arr),
+                              ("volume", vo_arr)):
+            if len(arr) != n:
+                try:
+                    print(f"[fetch_nifty_intraday_candles] array length mismatch: "
+                          f"ts={n} {arr_name}={len(arr)} — discarding response", flush=True)
+                except Exception:
+                    pass
+                return []
+        candles = []
+        for i, ts in enumerate(ts_arr):
+            candles.append({
+                "ts":     int(ts),
+                "open":   float(op_arr[i]),
+                "high":   float(hi_arr[i]),
+                "low":    float(lo_arr[i]),
+                "close":  float(cl_arr[i]),
+                "volume": float(vo_arr[i]),
+            })
+        return candles
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_nifty_intraday_candles] error: {e}", flush=True)
+        except Exception:
+            pass
+        return []
+
+
+def compute_vwap_opening_range(candles):
+    """
+    From today's 1-min candles compute:
+      - Opening Range high/low  (first 15 candles = 9:15–9:30)
+      - Running VWAP (cumulative typical-price × volume / cumulative volume)
+      - Current candle vs VWAP position
+    Returns dict or None if data insufficient.
+    """
+    if not candles or len(candles) < 2:
+        return None
+    # Opening Range: first 15 1-min candles (9:15–9:29)
+    or_candles = candles[:15]
+    or_high  = max(c["high"]  for c in or_candles)
+    or_low   = min(c["low"]   for c in or_candles)
+    or_mid   = (or_high + or_low) / 2.0
+    # VWAP: cumulative (typical_price × volume) / cumulative_volume
+    cum_tpv = 0.0
+    cum_vol = 0.0
+    for c in candles:
+        tp = (c["high"] + c["low"] + c["close"]) / 3.0
+        cum_tpv += tp * c["volume"]
+        cum_vol += c["volume"]
+    vwap = cum_tpv / cum_vol if cum_vol > 0 else 0.0
+    last_close = candles[-1]["close"]
+    # Signal derivation
+    above_vwap = last_close > vwap if vwap > 0 else None
+    or_position = (
+        "ABOVE_OR"  if last_close > or_high else
+        "BELOW_OR"  if last_close < or_low  else
+        "INSIDE_OR"
+    )
+    # Score contribution: +10 (above both), -10 (below both), else proportional
+    if vwap > 0 and above_vwap and or_position == "ABOVE_OR":
+        price_score = 10.0
+        price_label = "Bullish — price above VWAP & Opening Range"
+        price_color = "#059669"
+    elif vwap > 0 and (not above_vwap) and or_position == "BELOW_OR":
+        price_score = -10.0
+        price_label = "Bearish — price below VWAP & Opening Range"
+        price_color = "#DC2626"
+    elif vwap > 0 and above_vwap:
+        price_score = 5.0
+        price_label = "Mildly bullish — above VWAP, inside Opening Range"
+        price_color = "#10B981"
+    elif vwap > 0 and not above_vwap:
+        price_score = -5.0
+        price_label = "Mildly bearish — below VWAP, inside/above Opening Range"
+        price_color = "#F59E0B"
+    else:
+        price_score = 0.0
+        price_label = "VWAP unavailable (pre-session or no volume)"
+        price_color = "#6B7280"
+    return {
+        "vwap":        round(vwap, 2),
+        "or_high":     round(or_high, 2),
+        "or_low":      round(or_low, 2),
+        "or_mid":      round(or_mid, 2),
+        "last_close":  round(last_close, 2),
+        "above_vwap":  above_vwap,
+        "or_position": or_position,
+        "price_score": price_score,
+        "price_label": price_label,
+        "price_color": price_color,
+        "n_candles":   len(candles),
+    }
+
+
+# ── Module B: Term Structure (front vs back expiry ATM IV) ───────────────────
+@st.cache_data(ttl=60, show_spinner=False)   # v29: 60 s (raw chain shared via _v29_oc_raw)
+def fetch_back_expiry_atm_iv(back_expiry: str):
+    """
+    Fetch the back-month option chain and return ATM IV only.
+    Runs concurrently with the main front-expiry fetch; same Dhan endpoint.
+    Rate limit note: 1 unique request per 3s — this is a different expiry
+    so qualifies as a unique request per Dhan docs.
+    """
+    if not USE_DHAN or not back_expiry:
+        return None
+    sec = DHAN_SECURITY["NIFTY"]
+    try:
+        # H1+H2+H3 fix: shared helper.
+        resp = _v29_oc_raw(back_expiry, max_age=_v29_back_age())   # v29: shared, 60 s
+        data = resp.get("data", {}) or {}
+        spot = float(data.get("last_price") or data.get("ltp") or 0)
+        oc   = data.get("oc", {}) or {}
+        if spot <= 0 or not oc:
+            return None
+        # Find ATM strike
+        strikes = [safe_num(k) for k in oc.keys() if safe_num(k) > 0]
+        if not strikes:
+            return None
+        atm_k = min(strikes, key=lambda x: abs(x - spot))
+        chain = oc.get(str(float(atm_k)), oc.get(f"{atm_k:.6f}", {})) or {}
+        ce_iv = safe_num((chain.get("ce", {}) or {}).get("implied_volatility", 0))
+        pe_iv = safe_num((chain.get("pe", {}) or {}).get("implied_volatility", 0))
+        atm_iv_back = 0.0
+        if ce_iv > 0.5 and pe_iv > 0.5:
+            atm_iv_back = (ce_iv + pe_iv) / 2.0
+        elif ce_iv > 0.5:
+            atm_iv_back = ce_iv
+        elif pe_iv > 0.5:
+            atm_iv_back = pe_iv
+        return round(atm_iv_back, 2) if atm_iv_back > 0 else None
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_back_expiry_atm_iv] error: {e}", flush=True)
+        except Exception:
+            pass
+        return None
+
+
+# ─── Roll Detection — Inter-Expiry OI Comparison ────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)   # v29: 60 s (raw chain shared via _v29_oc_raw)
+def fetch_back_expiry_oi_band(back_expiry: str):
+    """
+    Fetch strike-level OI + OI change for the back expiry — lightweight version.
+    Returns only the columns needed for roll detection:
+        strike, call_oi, put_oi, call_oi_chg, put_oi_chg
+    Unlike fetch_back_expiry_atm_iv(), this fetches the FULL OI band so we can
+    compare OI changes at shared strikes between front and back expiry.
+    """
+    if not USE_DHAN or not back_expiry:
+        return pd.DataFrame()
+    sec = DHAN_SECURITY["NIFTY"]
+    try:
+        # H1+H2+H3 fix: shared helper.
+        resp = _v29_oc_raw(back_expiry, max_age=_v29_back_age())   # v29: shared, 60 s
+        data = resp.get("data", {}) or {}
+        oc   = data.get("oc", {}) or {}
+        if not oc:
+            return pd.DataFrame()
+        # H6 fix: use int(float(...)) for OI parsing
+        def _safe_int(v):
+            try:
+                return int(float(v or 0))
+            except (TypeError, ValueError):
+                return 0
+        rows = []
+        for strike_str, chain in oc.items():
+            K  = safe_num(strike_str, 0)
+            if K <= 0:
+                continue
+            ce = (chain or {}).get("ce", {}) or {}
+            pe = (chain or {}).get("pe", {}) or {}
+            c_oi      = _safe_int(ce.get("oi", 0))
+            c_prev_oi = _safe_int(ce.get("previous_oi", 0))
+            p_oi      = _safe_int(pe.get("oi", 0))
+            p_prev_oi = _safe_int(pe.get("previous_oi", 0))
+            rows.append({
+                "strike":      K,
+                "call_oi":     c_oi,
+                "put_oi":      p_oi,
+                "call_oi_chg": c_oi - c_prev_oi,
+                "put_oi_chg":  p_oi - p_prev_oi,
+            })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        return df.sort_values("strike").reset_index(drop=True)
+    except (DhanAPIError, Exception) as e:
+        try:
+            print(f"[fetch_back_expiry_oi_band] error: {e}", flush=True)
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+
+def is_roll_window(front_expiry_str: str = None) -> bool:
+    """
+    Fix #3: Derive roll window from actual expiry date rather than hardcoded Tuesday.
+
+    When front_expiry_str is supplied the expiry weekday is read from the date,
+    so the function stays correct if SEBI ever moves the weekly settlement day again.
+    Falls back to the current hardcoded schedule (Tuesday) when no expiry is given.
+
+    Roll window = afternoon of the day-before-expiry (14:00 IST → EOD) + all of expiry day.
+    """
+    n  = now_ist()
+    wd = n.weekday()   # 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
+    hm = (n.hour, n.minute)
+
+    if front_expiry_str:
+        try:
+            _exp_dt   = date.fromisoformat(front_expiry_str)
+            expiry_wd = _exp_dt.weekday()         # weekday of expiry (e.g. 1 = Tuesday)
+            prev_wd   = (expiry_wd - 1) % 7      # day before expiry (e.g. 0 = Monday)
+            if wd == prev_wd and hm >= (14, 0):  # afternoon roll-start
+                return True
+            if wd == expiry_wd:                  # all of expiry day
+                return True
+            return False
+        except Exception:
+            pass  # malformed expiry string — fall through to hardcoded default
+
+    # Hardcoded fallback: NIFTY 50 expiry = Tuesday (SEBI schedule since Sep 2023)
+    if wd == 1 and hm >= (14, 0):   # Tuesday afternoon
+        return True
+    if wd == 2:                      # All day Wednesday
+        return True
+    return False
+
+
+def detect_roll_activity(front_df, back_df, spot: float) -> dict:
+    """
+    Distinguish mechanical OI roll from genuine directional liquidation.
+
+    Roll signature   : front OI falling AND back OI rising at the SAME strike.
+    Liquidation sig  : front OI falling with NO corresponding back-expiry build.
+
+    Returns:
+      roll_fraction     (float 0–1) : share of unwinding front strikes that have
+                                      a matching back-expiry build.
+      roll_detected     (bool)      : True if roll_fraction >= 0.50
+      momentum_discount (float 0–1) : multiplier applied to S2 — scales linearly
+                                      from 1.0 (no roll) → 0.20 (pure roll).
+                                      Never fully zero: real positioning co-exists.
+      roll_pts_call / _put (int)    : net call/put OI draining from front expiry
+      details           (list[str]) : human-readable lines for the UI card
+    """
+    _base = {
+        "roll_fraction": 0.0, "roll_detected": False,
+        "momentum_discount": 1.0,
+        "roll_pts_call": 0, "roll_pts_put": 0,
+        "details": [],
+    }
+    if front_df is None or front_df.empty or back_df is None or back_df.empty:
+        _base["details"] = ["Back-expiry OI unavailable — roll detection inactive"]
+        return _base
+
+    # Near-ATM band: ±10 strikes where rolls concentrate
+    lo = spot - 10 * NIFTY_STEP
+    hi = spot + 10 * NIFTY_STEP
+    f = front_df[front_df["strike"].between(lo, hi)].copy()
+    b = back_df[back_df["strike"].between(lo, hi)].copy()
+    if f.empty or b.empty:
+        _base["details"] = ["Insufficient near-ATM OI data for roll detection"]
+        return _base
+
+    shared = pd.merge(
+        f[["strike", "call_oi_chg", "put_oi_chg"]],
+        b[["strike", "call_oi_chg", "put_oi_chg"]],
+        on="strike", suffixes=("_f", "_b"),
+    )
+    if shared.empty:
+        _base["details"] = ["No shared strikes between front and back expiry"]
+        return _base
+
+    # Significance threshold: ignore trivial lot movements
+    _MIN_LOTS = 100
+    call_unwind = shared["call_oi_chg_f"] < -_MIN_LOTS
+    call_roll   = call_unwind & (shared["call_oi_chg_b"] >  _MIN_LOTS // 2)
+    put_unwind  = shared["put_oi_chg_f"]  < -_MIN_LOTS
+    put_roll    = put_unwind  & (shared["put_oi_chg_b"]  >  _MIN_LOTS // 2)
+
+    total_unwind   = call_unwind.sum() + put_unwind.sum()
+    total_roll     = call_roll.sum()   + put_roll.sum()
+    roll_fraction  = (total_roll / total_unwind) if total_unwind > 0 else 0.0
+
+    roll_pts_call = int(shared.loc[call_unwind, "call_oi_chg_f"].sum())
+    roll_pts_put  = int(shared.loc[put_unwind,  "put_oi_chg_f"].sum())
+
+    # Linear discount: 1.0 at 0% roll → 0.20 at 100% roll
+    momentum_discount = round(max(0.20, 1.0 - roll_fraction * 0.80), 2)
+    roll_detected     = roll_fraction >= 0.50
+
+    details = []
+    if roll_detected:
+        details.append(
+            f"⚠ ROLL: {roll_fraction*100:.0f}% of near-ATM OI unwind matched "
+            f"by back-expiry build — S2 discounted to {momentum_discount*100:.0f}%"
+        )
+        if roll_pts_call < -500:
+            details.append(f"Call roll: {roll_pts_call:,} lots draining front expiry")
+        if roll_pts_put < -500:
+            details.append(f"Put roll: {roll_pts_put:,} lots draining front expiry")
+    elif total_unwind > 0:
+        details.append(
+            f"Liquidation dominant ({roll_fraction*100:.0f}% roll fraction) — "
+            f"OI unwind is genuine; S2 at full strength"
+        )
+    else:
+        details.append("No significant near-ATM OI unwind detected")
+
+    return {
+        "roll_fraction":      round(roll_fraction, 3),
+        "roll_detected":      roll_detected,
+        "momentum_discount":  momentum_discount,
+        "roll_pts_call":      roll_pts_call,
+        "roll_pts_put":       roll_pts_put,
+        "details":            details,
+    }
+
+
+def compute_term_structure_signal(front_atm_iv: float, back_atm_iv, front_expiry: str = None):
+    """
+    Compute term structure slope and derive a bias signal.
+    front_atm_iv: ATM IV of nearest expiry (already in main metrics)
+    back_atm_iv:  ATM IV of second expiry from fetch_back_expiry_atm_iv()
+    front_expiry: ISO date string of front expiry (YYYY-MM-DD) from Dhan API.
+                  Used to detect expiry day dynamically — no weekday hardcoding.
+
+    Normal contango  (front < back): market calm, range bias confirmed.
+    Flat term structure (|slope| < 1): transitional.
+    Backwardation (front > back): near-term event risk, directional move likely.
+
+    NOTE: On expiry day the front IV collapses to near-zero, making the slope
+    unreliable. Signal is suppressed when DTE ≤ 0 (i.e., today IS expiry day).
+    Previously hardcoded to Thursday; now dynamically derived from front_expiry
+    so it works correctly for Tuesday expiry (and any future schedule changes).
+    """
+    from datetime import date as _date
+    # Expiry-day guard: suppress when today is the actual front expiry date.
+    # DTE is computed from the real expiry string — no day-of-week assumption.
+    _suppress = False
+    if front_expiry:
+        try:
+            _dte = (_date.fromisoformat(front_expiry) - _date.today()).days
+            if _dte <= 0:
+                _suppress = True
+        except Exception:
+            pass   # bad date string — don't suppress, degrade gracefully
+    if _suppress:
+        return {
+            "available":   False,
+            "front_iv":    round(front_atm_iv, 2) if front_atm_iv else 0.0,
+            "back_iv":     None,
+            "slope":       None,
+            "regime":      "EXPIRY_DAY",
+            "ts_label":    "Expiry day — term structure suppressed (front IV unreliable)",
+            "ts_color":    "#6B7280",
+            "ts_score":    0.0,
+        }
+    if not back_atm_iv or back_atm_iv <= 0 or front_atm_iv <= 0:
+        return {
+            "available":   False,
+            "front_iv":    round(front_atm_iv, 2),
+            "back_iv":     None,
+            "slope":       None,
+            "regime":      "UNAVAILABLE",
+            "ts_label":    "Term structure data unavailable",
+            "ts_color":    "#6B7280",
+            "ts_score":    0.0,
+        }
+    slope = front_atm_iv - back_atm_iv   # positive = backwardation
+    if slope > 2.0:
+        regime    = "BACKWARDATION"
+        ts_label  = f"Backwardation: front IV {front_atm_iv:.1f}% > back {back_atm_iv:.1f}% (+{slope:.1f}pts) — near-term event risk"
+        ts_color  = "#DC2626"
+        ts_score  = -8.0   # near-term fear → reduce range/condor confidence
+    elif slope > 0.5:
+        regime    = "MILD_BACK"
+        ts_label  = f"Mild backwardation: front {front_atm_iv:.1f}% > back {back_atm_iv:.1f}% (+{slope:.1f}pts) — elevated near-term demand"
+        ts_color  = "#F59E0B"
+        ts_score  = -4.0
+    elif slope < -2.0:
+        regime    = "STEEP_CONTANGO"
+        ts_label  = f"Steep contango: front {front_atm_iv:.1f}% < back {back_atm_iv:.1f}% ({slope:.1f}pts) — market calm, range trades favoured"
+        ts_color  = "#059669"
+        ts_score  = +5.0
+    elif slope < -0.5:
+        regime    = "CONTANGO"
+        ts_label  = f"Contango: front {front_atm_iv:.1f}% < back {back_atm_iv:.1f}% ({slope:.1f}pts) — normal structure"
+        ts_color  = "#10B981"
+        ts_score  = +3.0
+    else:
+        regime    = "FLAT"
+        ts_label  = f"Flat term structure: front {front_atm_iv:.1f}% ≈ back {back_atm_iv:.1f}% ({slope:+.1f}pts) — transitional"
+        ts_color  = "#6B7280"
+        ts_score  = 0.0
+    return {
+        "available":  True,
+        "front_iv":   round(front_atm_iv, 2),
+        "back_iv":    round(back_atm_iv, 2),
+        "slope":      round(slope, 2),
+        "regime":     regime,
+        "ts_label":   ts_label,
+        "ts_color":   ts_color,
+        "ts_score":   ts_score,
+    }
+
+
+# ── Module C: India VIX ───────────────────────────────────────────────────────
+_vix_id_cache = _V36["vix_id"]          # v36: persistent
+
+def _resolve_india_vix_id():
+    """Look up India VIX security ID from the Dhan instruments master CSV."""
+    if "VIX" in _vix_id_cache:
+        return _vix_id_cache["VIX"]
+    master = _load_dhan_instrument_master()
+    if master is None:
+        return None
+    try:
+        cols = set(master.columns)
+        tsym_col  = next((c for c in ["SEM_TRADING_SYMBOL", "SM_SYMBOL_NAME"] if c in cols), None)
+        secid_col = next((c for c in ["SEM_SMST_SECURITY_ID", "SEM_SECURITY_ID"] if c in cols), None)
+        seg_col   = next((c for c in ["SEM_EXM_EXCH_ID"] if c in cols), None)
+        if not tsym_col or not secid_col:
+            return None
+        df = master.copy()
+        if seg_col:
+            df = df[df[seg_col].astype(str).str.strip().str.upper() == "NSE"]
+        mask = df[tsym_col].astype(str).str.strip().str.upper().str.contains("VIX", na=False)
+        vix_rows = df[mask]
+        if vix_rows.empty:
+            return None
+        sec_id = str(int(float(vix_rows.iloc[0][secid_col])))
+        _vix_id_cache["VIX"] = sec_id
+        return sec_id
+    except Exception:
+        return None
+
+
+_vix_ltp_cache_v7 = _V36["vix_ltp"]     # v36: persistent
+_VIX_CACHE_SEC = 58
+
+def fetch_india_vix_ltp():
+    """
+    Fetch India VIX LTP via Dhan /v2/marketfeed/ltp using the VIX security ID.
+    Falls back to 0.0 if unavailable (graceful — VIX not a required signal).
+    """
+    if not USE_DHAN:
+        return 0.0
+    now = time.time()
+    if now - _vix_ltp_cache_v7["ts"] < _VIX_CACHE_SEC and _vix_ltp_cache_v7["ltp"] > 0:
+        return _vix_ltp_cache_v7["ltp"]
+    if now - _vix_ltp_cache_v7.get("fail_ts", 0.0) < _VIX_CACHE_SEC:   # v36: failure cooldown
+        return _vix_ltp_cache_v7.get("ltp", 0.0)
+    _vix_ltp_cache_v7["fail_ts"] = now          # cleared below on success
+    vix_id = _resolve_india_vix_id()
+    if not vix_id:
+        return 0.0
+    try:
+        # H1+H2+H3 fix: shared helper.
+        rjson = _dhan_post(
+            "https://api.dhan.co/v2/marketfeed/ltp",
+            {"NSE_INDEX": [int(vix_id)]},
+            timeout=8,
+        )
+        seg = (rjson.get("data") or {}).get("NSE_INDEX") or {}
+        for _, info in seg.items():
+            ltp = float(info.get("last_price") or info.get("ltp") or 0)
+            if ltp > 0:
+                _vix_ltp_cache_v7["ltp"] = ltp
+                _vix_ltp_cache_v7["ts"]  = now
+                _vix_ltp_cache_v7["fail_ts"] = 0.0
+                return ltp
+    except (DhanAPIError, Exception) as e:
+        if "429" in str(e) or "805" in str(e):                  # v38: back off 5 min on rate-limit
+            _vix_ltp_cache_v7["fail_ts"] = now + 240
+        try:
+            print(f"[fetch_india_vix_ltp] error: {e}", flush=True)
+        except Exception:
+            pass
+    return _vix_ltp_cache_v7.get("ltp", 0.0)
+
+
+def classify_vix_signal(vix_val: float, vix_history: list):
+    """
+    Classify India VIX level and intraday change into a bias signal.
+    vix_history: list of float (recent VIX readings in session)
+
+    VIX < 13   : Very low — complacency / range-bound — bearish contrarian risk
+    13–15      : Low-normal — calm trending environment
+    15–18      : Normal — balanced
+    18–22      : Elevated — caution, directional but volatile
+    > 22       : High fear — mean-reversion / protective bias
+    """
+    if vix_val <= 0:
+        return {
+            "available": False,
+            "vix":       0.0,
+            "regime":    "UNAVAILABLE",
+            "vix_label": "India VIX unavailable",
+            "vix_color": "#6B7280",
+            "vix_score": 0.0,
+            "vix_change":None,
+        }
+    # Intraday change
+    vix_change = None
+    if len(vix_history) >= 2:
+        vix_change = round(vix_val - vix_history[-2], 2)
+    # Classify level
+    if vix_val > 22:
+        regime = "HIGH_FEAR"; vix_color = "#DC2626"; vix_score = -8.0
+        vix_label = f"VIX {vix_val:.1f} — HIGH FEAR: elevated put demand, mean-reversion risk"
+    elif vix_val > 18:
+        regime = "ELEVATED"; vix_color = "#F59E0B"; vix_score = -4.0
+        vix_label = f"VIX {vix_val:.1f} — Elevated: volatile conditions, reduce size"
+    elif vix_val > 15:
+        regime = "NORMAL"; vix_color = "#6B7280"; vix_score = 0.0
+        vix_label = f"VIX {vix_val:.1f} — Normal range: no regime distortion"
+    elif vix_val > 13:
+        regime = "LOW_CALM"; vix_color = "#10B981"; vix_score = +3.0
+        vix_label = f"VIX {vix_val:.1f} — Low/calm: range trades and premium selling favoured"
+    else:
+        regime = "COMPLACENCY"; vix_color = "#F59E0B"; vix_score = -3.0
+        vix_label = f"VIX {vix_val:.1f} — Very low: complacency alert, contrarian reversal risk"
+    # Spike modifier
+    if vix_change is not None and vix_change >= 1.5:
+        vix_label += f"  ⚡ Spike +{vix_change:.2f} pts this tick"
+        vix_score  = min(vix_score - 3.0, -3.0)
+        vix_color  = "#DC2626"
+    elif vix_change is not None and vix_change <= -1.5:
+        vix_label += f"  ↓ Deflating {vix_change:.2f} pts"
+        vix_score  = max(vix_score + 2.0, 2.0)
+    return {
+        "available":  True,
+        "vix":        round(vix_val, 2),
+        "regime":     regime,
+        "vix_label":  vix_label,
+        "vix_color":  vix_color,
+        "vix_score":  vix_score,
+        "vix_change": vix_change,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMBINED BIAS DECISION ENGINE  (Chapter 17 & 18)  —  merged inline in v4
+# Previously: from combined_bias_engine import generate_combined_decision
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_s34_band(score: float) -> str:
+    """Map S3/4 bias score to a band letter A-E."""
+    if   score >= 51:   return "A"   # Strong Bull
+    elif score >= 16:   return "B"   # Mild Bull
+    elif score >= -15:  return "C"   # Neutral
+    elif score >= -50:  return "D"   # Mild Bear
+    else:               return "E"   # Strong Bear
+
+
+# IV Smile composite buckets
+_BEARISH_FEAR_IDS    = {1, 2, 3, 9}   # Put Skew, Crash Fear, Bearish Drift, Two-Sided Fork
+_BULLISH_NEUTRAL_IDS = {4, 5, 6}     # Call Skew, Melt-Up, Post-Crash Relief
+
+def get_smile_bucket(scenario_id: int) -> str:
+    if scenario_id in _BEARISH_FEAR_IDS:
+        return "BEARISH_FEAR"
+    elif scenario_id in _BULLISH_NEUTRAL_IDS:
+        return "BULLISH_NEUTRAL"
+    else:
+        return "NEUTRAL"
+
+
+# ── 4-Quadrant metadata ─────────────────────────────────────────────────────
+_QUADRANT_META = {
+    "Q1": {
+        "name":   "Full Bull Alignment",
+        "short":  "Q1 — FULL BULL",
+        "color":  "#059669",
+        "badge_bg": "#ECFDF5",
+        "description": (
+            "Structure is bullish (S3/4 positive) AND the IV Smile confirms "
+            "that sentiment is NOT overly fearful. Both engines agree — highest "
+            "probability bullish environment. Favour long delta, call spreads, "
+            "and systematic put-selling when IV rank is elevated."
+        ),
+        "action": "LEAN BULLISH  —  long delta, call debit spreads, theta-selling below spot",
+    },
+    "Q2": {
+        "name":   "Structural Bull / Sentiment Cautious",
+        "short":  "Q2 — STRUCTURAL BULL / CAUTIOUS",
+        "color":  "#D97706",
+        "badge_bg": "#FFFBEB",
+        "description": (
+            "OI structure and momentum are bullish BUT the IV Smile is showing "
+            "put-skew or fear. Institutions are hedging into the rally. The move "
+            "can continue but at risk of a sharp reversal if the put-wing keeps "
+            "building. Reduce position size; favour protective collars or limited-risk "
+            "long structures. Watch S4 IV Skew component for further divergence."
+        ),
+        "action": "BULLISH WITH CAUTION  —  reduced size, hedge with put spreads, trail stops",
+    },
+    "Q3": {
+        "name":   "Structural Bear / Sentiment Recovering",
+        "short":  "Q3 — STRUCTURAL BEAR / RECOVERING",
+        "color":  "#2563EB",
+        "badge_bg": "#EFF6FF",
+        "description": (
+            "OI structure and momentum are bearish BUT the IV Smile is showing "
+            "relief or call buying — fear is deflating. This is the most nuanced "
+            "quadrant: it can precede a bottom or be a dead-cat bounce. Do NOT "
+            "short aggressively into a deflating put-wing. Wait for S3/4 score to "
+            "turn less negative before adding long exposure."
+        ),
+        "action": "CAUTIOUSLY BEARISH  —  cover shorts on IV crush, wait for structure to improve",
+    },
+    "Q4": {
+        "name":   "Full Bear Alignment",
+        "short":  "Q4 — FULL BEAR",
+        "color":  "#DC2626",
+        "badge_bg": "#FEF2F2",
+        "description": (
+            "Structure is bearish (S3/4 negative) AND the IV Smile confirms "
+            "fear / put-skew. Both engines agree — highest probability bearish "
+            "environment. Favour short delta, put spreads, and call-selling above "
+            "resistance. Highest confidence short signal when S3/4 <= -40 and "
+            "smile is Crash Fear (Sc02)."
+        ),
+        "action": "LEAN BEARISH  —  short delta, put debit spreads, bear call spreads above resistance",
+    },
+    "CN": {
+        "name":   "Neutral / No Edge",
+        "short":  "CN — NEUTRAL",
+        "color":  "#6B7280",
+        "badge_bg": "#F9FAFB",
+        "description": (
+            "Either the S3/4 score is in the neutral band (-15 to +15) or the IV "
+            "Smile is indeterminate / pre-event. Neither engine provides a reliable "
+            "directional edge. Avoid directional positions; favour premium-selling "
+            "structures (iron condors) only if IV rank supports it."
+        ),
+        "action": "NO DIRECTIONAL EDGE  —  avoid naked direction, favour non-directional structures",
+    },
+}
+
+
+def classify_quadrant(s34_score: float, scenario_id: int) -> dict:
+    """4-Quadrant classification with optional enhanced-price-layer override."""
+    band         = get_s34_band(s34_score)
+    smile_bucket = get_smile_bucket(scenario_id)
+
+    if band == "C":
+        q = "CN"
+    elif band in ("A", "B"):
+        if   smile_bucket == "BULLISH_NEUTRAL": q = "Q1"
+        elif smile_bucket == "BEARISH_FEAR":    q = "Q2"
+        else:                                    q = "Q1"
+    else:
+        if   smile_bucket == "BULLISH_NEUTRAL": q = "Q3"
+        elif smile_bucket == "BEARISH_FEAR":    q = "Q4"
+        else:                                    q = "Q4"
+
+    meta = _QUADRANT_META[q]
+    return {
+        "quadrant":     q,
+        "name":         meta["name"],
+        "short":        meta["short"],
+        "color":        meta["color"],
+        "badge_bg":     meta["badge_bg"],
+        "description":  meta["description"],
+        "action":       meta["action"],
+        "smile_bucket": smile_bucket,
+        "s34_band":     band,
+    }
+
+
+# ── Divergence metadata ────────────────────────────────────────────────────
+_DIVERGENCE_META = {
+    1: {
+        "type":   "Type 1 — Capitulation Bottom",
+        "color":  "#059669",
+        "badge_bg": "#ECFDF5",
+        "detail": (
+            "S3/4 is at extreme bear levels (<=-51) AND the IV Smile is showing "
+            "Crash Fear (Sc02, put wing >12pts + IV rank >=65). When both engines "
+            "simultaneously hit maximum bearish readings, the risk/reward for new "
+            "short positions deteriorates sharply. Hedgers are already in — they "
+            "are the sellers of the rally that follows. Watch for put-wing deflation "
+            "as the first sign of capitulation completing."
+        ),
+        "warning": "POTENTIAL CAPITULATION BOTTOM — do not initiate new shorts at these levels",
+    },
+    2: {
+        "type":   "Type 2 — Structural Ceiling",
+        "color":  "#D97706",
+        "badge_bg": "#FFFBEB",
+        "detail": (
+            "S3/4 is at strong bull levels (>=+51) BUT the IV Smile is building "
+            "a put-skew (Sc01/Sc03). This indicates institutions are hedging long "
+            "positions even as the structural score peaks. Smart money is reducing "
+            "risk at the top — a classic ceiling pattern. Reduce longs and avoid "
+            "adding fresh long exposure at these combined readings."
+        ),
+        "warning": "STRUCTURAL CEILING SIGNAL — smart money hedging long positions; consider reducing longs",
+    },
+    3: {
+        "type":   "Type 3 — Squeeze Warning",
+        "color":  "#9333EA",
+        "badge_bg": "#FAF5FF",
+        "detail": (
+            "S3/4 is neutral (-15 to +15) AND the IV Smile is showing maximum "
+            "compression (Sc08 — Coiled Spring / IV rank <=20). The market is "
+            "building energy for a move of unknown direction. Directional biases "
+            "are unreliable here. Favour long-vol structures (straddles/strangles) "
+            "but be mindful of theta decay — time the entry carefully."
+        ),
+        "warning": "SQUEEZE WARNING — breakout imminent; direction unknown; favour long vol",
+    },
+    4: {
+        "type":   "Type 4 — Bear Trap",
+        "color":  "#2563EB",
+        "badge_bg": "#EFF6FF",
+        "detail": (
+            "S3/4 is negative (D or E band, score <=-16) BUT the IV Smile is "
+            "showing call buying or relief (Sc04, Sc05, Sc06). Sentiment is "
+            "recovering even as the structure looks bearish — the hallmark of a "
+            "bear trap. Shorts caught in this divergence face a rapid squeeze. "
+            "Cover or reduce short exposure when this signal activates."
+        ),
+        "warning": "BEAR TRAP RISK — call buying despite bearish OI structure; cover shorts",
+    },
+    5: {
+        "type":   "Type 5 — Pre-Move Setup",
+        "color":  "#B45309",
+        "badge_bg": "#FEF3C7",
+        "detail": (
+            "PCR is at an extreme level AND S3/4 is moderately biased AND the "
+            "IV Smile is directionally aligned. This combination suggests smart "
+            "money positioning ahead of a move. Watch for confirmation via "
+            "intraday OI velocity and gamma flip proximity before acting."
+        ),
+        "warning": "PRE-MOVE SETUP — smart money positioning; wait for OI velocity / GEX confirmation",
+    },
+}
+
+
+def detect_divergence_type(
+    s34_score: float,
+    scenario_id: int,
+    pcr: float = 1.0,
+    div_proximity: float = 0.0,
+) -> dict | None:
+    """
+    Returns a divergence dict or None if no divergence is active.
+
+    v4 enhancement: when div_proximity >= 60 but the hard thresholds are not
+    yet met, return a SOFT / APPROACHING divergence with reduced urgency so
+    the dashboard can show early warning.
+    """
+    band         = get_s34_band(s34_score)
+    smile_bucket = get_smile_bucket(scenario_id)
+
+    # ── Hard divergence triggers (unchanged from v3) ──────────────────────
+    # Type 1: Capitulation Bottom
+    if band == "E" and scenario_id == 2:
+        d = _DIVERGENCE_META[1].copy()
+        d["divergence_id"] = 1
+        d["strength"] = "HARD"
+        return d
+
+    # Type 2: Structural Ceiling
+    if band == "A" and scenario_id in (1, 3):
+        d = _DIVERGENCE_META[2].copy()
+        d["divergence_id"] = 2
+        d["strength"] = "HARD"
+        return d
+
+    # Type 4: Bear Trap
+    if band in ("D", "E") and smile_bucket == "BULLISH_NEUTRAL":
+        d = _DIVERGENCE_META[4].copy()
+        d["divergence_id"] = 4
+        d["strength"] = "HARD"
+        return d
+
+    # Type 3: Squeeze Warning
+    if band == "C" and scenario_id == 8:
+        d = _DIVERGENCE_META[3].copy()
+        d["divergence_id"] = 3
+        d["strength"] = "HARD"
+        return d
+
+    # Type 5: Pre-Move Setup
+    if (pcr < 0.70 or pcr > 1.55) and abs(s34_score) >= 20 and scenario_id in (1, 2, 3, 4, 5, 6):
+        d = _DIVERGENCE_META[5].copy()
+        d["divergence_id"] = 5
+        d["strength"] = "HARD"
+        return d
+
+    # ── v4 SOFT / APPROACHING divergence (proximity score >= 60) ─────────
+    if div_proximity >= 60:
+        # Determine which divergence type is closest to triggering
+        soft_id = None
+        if s34_score < -30 and scenario_id in (1, 2, 3, 9):
+            soft_id = 1   # approaching Capitulation Bottom
+        elif s34_score > 30 and scenario_id in (1, 3, 9):
+            soft_id = 2   # approaching Structural Ceiling
+        elif abs(s34_score) < 20 and scenario_id == 8:
+            soft_id = 3   # approaching Squeeze
+        elif s34_score < -10 and smile_bucket == "BULLISH_NEUTRAL":
+            soft_id = 4   # approaching Bear Trap
+        elif (pcr < 0.85 or pcr > 1.40) and abs(s34_score) >= 12 and scenario_id in (1, 2, 3, 4, 5, 6):
+            soft_id = 5   # approaching Pre-Move
+
+        if soft_id is not None:
+            d = _DIVERGENCE_META[soft_id].copy()
+            d["divergence_id"] = soft_id
+            d["strength"] = "APPROACHING"
+            d["proximity_score"] = div_proximity
+            d["warning"] = (
+                f"APPROACHING {d['type'].split(' — ')[0].upper()} "
+                f"(proximity {div_proximity:.0f}/100) — monitor closely, not yet confirmed"
+            )
+            d["detail"] = (
+                d["detail"]
+                + f"\n\n[Early Warning] Proximity score is {div_proximity:.0f}/100, "
+                f"indicating this divergence type is approaching trigger thresholds. "
+                f"Watch for hard trigger confirmation in the next 1-3 ticks."
+            )
+            return d
+
+    return None
+
+
+def _confidence_label(s34_score: float, smile_confidence: float, quadrant: str,
+                      enhanced_bias: dict | None = None) -> tuple:
+    """
+    Returns (label, color) for overall combined confidence.
+    v4: when enhanced_bias is provided, its enhanced_conf can boost the label.
+    """
+    magnitude = abs(s34_score)
+
+    if quadrant in ("Q1", "Q4"):
+        if magnitude >= 51 and smile_confidence >= 75:
+            label, color = "HIGH", "#059669"
+        elif magnitude >= 20 and smile_confidence >= 60:
+            label, color = "MODERATE-HIGH", "#16A34A"
+        else:
+            label, color = "MODERATE", "#D97706"
+    elif quadrant in ("Q2", "Q3"):
+        label, color = "MODERATE", "#D97706"
+    else:
+        label, color = "LOW", "#6B7280"
+
+    # v4: Enhanced price layer can upgrade MODERATE → MODERATE-HIGH
+    # when all 4 sub-signals agree (agreement_pct == 100) and enhanced_conf >= 65
+    if enhanced_bias and label == "MODERATE":
+        _econf = safe_num(enhanced_bias.get("enhanced_conf", 0))
+        _agree = safe_num(enhanced_bias.get("agreement_pct", 0))
+        if _econf >= 65 and _agree >= 100:
+            label, color = "MODERATE-HIGH", "#16A34A"
+
+    return label, color
+
+
+def generate_combined_decision(
+    s34: dict,
+    smile: dict | None,
+    m: dict,
+    enhanced_bias: dict | None = None,
+) -> dict:
+    """
+    Master combined decision function (v4 — merged inline + enhanced price layer).
+
+    Parameters
+    ----------
+    s34           : dict from compute_section34_bias()
+    smile         : dict from classify_iv_smile_scenario() or None
+    m             : dict from compute_metrics()
+    enhanced_bias : dict from compute_enhanced_price_bias() or None  [v4 NEW]
+
+    Returns a verdict dict consumed by the dashboard panel.
+    """
+    # Fallbacks for smile
+    fallback_smile_id   = 0
+    fallback_smile_name = "Indeterminate"
+    fallback_smile_conf = 0.0
+
+    s34_score     = float(s34.get("bias_score", 0))
+    s34_direction = s34.get("direction", "NEUTRAL")
+    s34_breakdown = s34.get("signal_breakdown", {})
+
+    pcr = float(m.get("pcr", 1.0)) if m else 1.0
+    iv_rank = safe_num(m.get("iv_rank", 50)) if m else 50.0
+
+    if smile is None:
+        scenario_id   = fallback_smile_id
+        scenario_name = fallback_smile_name
+        smile_conf    = fallback_smile_conf
+    else:
+        scenario_id   = int(smile.get("scenario_id", 0))
+        scenario_name = smile.get("scenario_name", "Unknown")
+        smile_conf    = float(smile.get("confidence", 0))
+
+    smile_bucket = get_smile_bucket(scenario_id)
+    quad_info    = classify_quadrant(s34_score, scenario_id)
+
+    # ── v4: Pass divergence proximity into divergence detector ───────────
+    # Compute a quick inline proximity if not already available from caller
+    _div_prox = 0.0
+    if enhanced_bias:
+        # Use the same proximity logic as the Leading Signals panel
+        _scores = []
+        _t1_s34 = max(0, min(100, (abs(s34_score) - 40) / 11 * 100)) if s34_score < -40 else 0
+        _t1_smile = max(0, min(100, (iv_rank - 50) / 15 * 100)) if iv_rank > 50 else 0
+        if scenario_id in (1, 2, 3): _t1_smile = max(_t1_smile, 60)
+        _scores.append((_t1_s34 + _t1_smile) / 2)
+
+        _t2_s34 = max(0, min(100, (s34_score - 40) / 11 * 100)) if s34_score > 40 else 0
+        _t2_smile = 70 if scenario_id in (1, 3) else (30 if scenario_id in (2, 9) else 0)
+        _scores.append((_t2_s34 + _t2_smile) / 2)
+
+        _t3_neutral = max(0, min(100, (15 - abs(s34_score)) / 15 * 100)) if abs(s34_score) < 15 else 0
+        _t3_compress = max(0, min(100, (25 - iv_rank) / 5 * 100)) if iv_rank < 25 else 0
+        _scores.append((_t3_neutral + _t3_compress) / 2)
+
+        _t5_pcr = 0
+        if pcr < 0.70: _t5_pcr = max(0, min(100, (0.70 - pcr) / 0.20 * 100))
+        elif pcr > 1.55: _t5_pcr = max(0, min(100, (pcr - 1.55) / 0.25 * 100))
+        _t5_s34 = max(0, min(100, (abs(s34_score) - 15) / 15 * 100)) if abs(s34_score) > 15 else 0
+        _scores.append((_t5_pcr + _t5_s34) / 2)
+
+        _div_prox = round(max(_scores), 1) if _scores else 0.0
+
+    divergence = detect_divergence_type(s34_score, scenario_id, pcr, div_proximity=_div_prox)
+    conf_label, conf_color = _confidence_label(s34_score, smile_conf, quad_info["quadrant"],
+                                                enhanced_bias=enhanced_bias)
+
+    # ── v4: Enhanced price layer can shift quadrant in borderline cases ───
+    # When enhanced_bias strongly disagrees with the quadrant (enhanced_score
+    # opposite sign, |enhanced_score| >= 35, agreement_pct == 0), and the
+    # original quadrant was a weak Q2/Q3, we can flip to CN.
+    _quadrant_overridden = False
+    if enhanced_bias:
+        _e_score = safe_num(enhanced_bias.get("enhanced_score", 0))
+        _e_agree = safe_num(enhanced_bias.get("agreement_pct", 0))
+        _orig_q  = quad_info["quadrant"]
+        # Q2 = structural bull / sentiment cautious → if enhanced says BEARISH, downgrade to CN
+        if _orig_q == "Q2" and _e_score <= -35 and _e_agree == 0:
+            quad_info = _QUADRANT_META["CN"].copy()
+            quad_info["quadrant"] = "CN"
+            quad_info["smile_bucket"] = smile_bucket
+            quad_info["s34_band"] = get_s34_band(s34_score)
+            quad_info["description"] += (
+                " [v4 OVERRIDDEN to CN: Enhanced Price Layer (VWAP/TermStructure/VIX) "
+                "strongly disagrees with the structural bull reading. "
+                "Price action, term structure, and VIX all point bearish — "
+                "the structural OI bull signal is likely a head-fake.]"
+            )
+            _quadrant_overridden = True
+            conf_label, conf_color = "LOW", "#6B7280"
+        # Q3 = structural bear / sentiment recovering → if enhanced says BULLISH, upgrade to CN
+        elif _orig_q == "Q3" and _e_score >= 35 and _e_agree == 0:
+            quad_info = _QUADRANT_META["CN"].copy()
+            quad_info["quadrant"] = "CN"
+            quad_info["smile_bucket"] = smile_bucket
+            quad_info["s34_band"] = get_s34_band(s34_score)
+            quad_info["description"] += (
+                " [v4 OVERRIDDEN to CN: Enhanced Price Layer (VWAP/TermStructure/VIX) "
+                "strongly disagrees with the structural bear reading. "
+                "Price action, term structure, and VIX all point bullish — "
+                "the structural OI bear signal is likely a bear trap.]"
+            )
+            _quadrant_overridden = True
+            conf_label, conf_color = "LOW", "#6B7280"
+
+    # ── Build explanation lines ───────────────────────────────────────────
+    lines: list = []
+
+    # Line 1: S3/4 summary
+    band = quad_info.get("s34_band", get_s34_band(s34_score))
+    band_desc = {
+        "A": "strong bull (+51 to +100)",
+        "B": "mild bull (+16 to +50)",
+        "C": "neutral (-15 to +15)",
+        "D": "mild bear (-50 to -16)",
+        "E": "strong bear (-100 to -51)",
+    }
+    lines.append(
+        f"S3/4 Engine: score {s34_score:+.0f} -> Band {band} ({band_desc.get(band, '')}) "
+        f"- {s34_direction} structural bias."
+    )
+
+    # Line 2: IV Smile summary
+    if smile is None:
+        lines.append("IV Smile Engine: insufficient data - classification pending.")
+    else:
+        lines.append(
+            f"IV Smile Engine: {scenario_name} (Sc{scenario_id:02d}) "
+            f"-> {smile_bucket.replace('_', ' ')} bucket "
+            f"[confidence {smile_conf:.0f}%]."
+        )
+
+    # Line 3: Quadrant result
+    _quad_short = quad_info.get("short", quad_info.get("quadrant", "CN"))
+    _quad_desc  = quad_info.get("description", "")
+    lines.append(f"Combined Quadrant: {_quad_short}. {_quad_desc}")
+
+    # Line 4: Signal bridge (S4 IV Skew)
+    s4_val = s34_breakdown.get("S4 IV Skew", None)
+    if s4_val is not None:
+        s4_sign = "put-skew detected" if s4_val < 0 else ("call-skew / flat" if s4_val > 0 else "neutral")
+        lines.append(
+            f"S4 IV Skew (bridge signal): {s4_val:+.0f}/12 -> {s4_sign}. "
+            "This shared signal links both engines - use it to validate alignment."
+        )
+
+    # Line 5: v4 Enhanced Price Layer contribution
+    if enhanced_bias:
+        _e_score = safe_num(enhanced_bias.get("enhanced_score", 0))
+        _e_conf  = safe_num(enhanced_bias.get("enhanced_conf", 0))
+        _n_avail = enhanced_bias.get("new_signals_available", 0)
+        _price_s = safe_num(enhanced_bias.get("price_score", 0))
+        _ts_s    = safe_num(enhanced_bias.get("ts_score", 0))
+        _vix_s   = safe_num(enhanced_bias.get("vix_score", 0))
+        lines.append(
+            f"Enhanced Price Layer (v4): VWAP/OR {_price_s:+.1f}, "
+            f"TermStructure {_ts_s:+.1f}, VIX {_vix_s:+.1f} "
+            f"({_n_avail}/3 live) -> enhanced score {_e_score:+.1f} "
+            f"[conf {_e_conf:.0f}%]."
+        )
+        if _quadrant_overridden:
+            lines.append(
+                "QUADRANT OVERRIDDEN by Enhanced Price Layer: Q2/Q3 -> CN. "
+                "Price-action signals strongly disagree with OI structure."
+            )
+
+    # Line 6: Divergence note (if active)
+    if divergence:
+        _strength = divergence.get("strength", "HARD")
+        if _strength == "APPROACHING":
+            lines.append(
+                f"EARLY WARNING - {divergence['type']}: {divergence['warning']}"
+            )
+        else:
+            lines.append(
+                f"DIVERGENCE ACTIVE: {divergence['type']} - {divergence['warning']}"
+            )
+
+    available = True
+    if smile is None:
+        available = False
+
+    return {
+        "quadrant":          quad_info.get("quadrant", "CN"),
+        "quadrant_name":     quad_info.get("name", "Neutral / No Edge"),
+        "quadrant_short":    quad_info.get("short", "CN — NEUTRAL"),
+        "quadrant_color":    quad_info.get("color", "#6B7280"),
+        "badge_bg":          quad_info.get("badge_bg", "#F9FAFB"),
+        "action":            quad_info.get("action", ""),
+        "explanation_lines": lines,
+        "divergence":        divergence,
+        "confidence_label":  conf_label,
+        "confidence_color":  conf_color,
+        "s34_score":         s34_score,
+        "s34_direction":     s34_direction,
+        "s34_band":          band,
+        "smile_scenario":    scenario_name,
+        "smile_bucket":      smile_bucket,
+        "smile_confidence":  smile_conf,
+        "pcr":               pcr,
+        "available":         available,
+        # v4 new keys
+        "enhanced_score":    safe_num(enhanced_bias.get("enhanced_score", 0)) if enhanced_bias else 0.0,
+        "enhanced_conf":     safe_num(enhanced_bias.get("enhanced_conf", 0))  if enhanced_bias else 0.0,
+        "quadrant_overridden": _quadrant_overridden,
+        "div_proximity":     _div_prox,
+    }
+
+
+# ══ END COMBINED BIAS DECISION ENGINE (inline) ═════════════════════════════
+
+
+# ── Enhanced combined price bias aggregator ───────────────────────────────────
+def compute_enhanced_price_bias(vwap_or, ts_signal, vix_signal, s34_score: float, spot: float):
+    """
+    Combine the three new signals with the existing S3/4 score into one
+    Enhanced Bias Score (-100 to +100) and confidence rating.
+
+    Base weights (total 100 pts):
+      S3/4 options flow  : 70 pts  (existing engine, unchanged)
+      VWAP + OR          : 10 pts  (new — price confirmation)
+      Term Structure      : 10 pts  (new — IV slope confirmation)
+      India VIX           : 10 pts  (new — volatility regime)
+
+    DYNAMIC REDISTRIBUTION: when a new-signal module is unavailable its 10 pts
+    are redistributed to S3/4 so the enhanced score never deflates below the
+    raw S3/4 score when the new layers have no data.
+
+    The final score is the weighted sum scaled to [-100, +100].
+    Confidence is boosted when all four signals agree.
+    """
+    price_s = safe_num(vwap_or["price_score"])  if vwap_or  else 0.0
+    ts_s    = safe_num(ts_signal["ts_score"])   if ts_signal else 0.0
+    vix_s   = safe_num(vix_signal["vix_score"]) if vix_signal else 0.0
+
+    # Determine which new modules are live
+    price_live = vwap_or  is not None and vwap_or.get("n_candles", 0) > 5
+    ts_live    = ts_signal  is not None and ts_signal.get("available", False)
+    vix_live   = vix_signal is not None and vix_signal.get("available", False)
+
+    # Dynamic weight allocation: unavailable modules cede their 10 pts to S3/4
+    w_price = 10 if price_live else 0
+    w_ts    = 10 if ts_live    else 0
+    w_vix   = 10 if vix_live   else 0
+    w_s34   = 100 - w_price - w_ts - w_vix   # absorbs freed weight; min 70, max 100
+
+    # Normalise each signal to its weight bucket
+    s34_contrib   = (s34_score / 100.0) * w_s34
+    price_contrib = (price_s   / 10.0)  * w_price
+    ts_contrib    = (ts_s      / 8.0)   * w_ts   # ts_score max ±8
+    vix_contrib   = (vix_s     / 8.0)   * w_vix  # vix_score max ±8
+
+    raw_score = s34_contrib + price_contrib + ts_contrib + vix_contrib
+    enhanced_score = round(max(-100.0, min(100.0, raw_score)), 1)
+
+    # Signal agreement for confidence
+    # H14 fix: agreement_pct was previously measured against the SIGN of
+    # `enhanced_score` itself — which is dominated by s34 (weight w_s34=50).
+    # The score and its confidence were circularly derived from the same inputs:
+    # a strongly-weighted s34 component would dominate the score sign, then
+    # agreement_pct would mechanically read ~1.0 (since s34's sign matches the
+    # score sign). Confidence became a function of s34 weight, not of genuine
+    # cross-signal corroboration.
+    # Fix: measure agreement against s34's sign (the dominant input), not the
+    # output score. Non-s34 signals (price/ts/vix) that agree with s34 boost
+    # confidence; non-s34 signals that disagree pull it down. s34 itself is
+    # excluded from the agreement count so the metric reflects corroboration
+    # FROM the other signals, not self-agreement.
+    signs_non_s34 = []
+    if price_s   != 0:   signs_non_s34.append(1 if price_s   > 0 else -1)
+    if ts_s      != 0:   signs_non_s34.append(1 if ts_s      > 0 else -1)
+    if vix_s     != 0:   signs_non_s34.append(1 if vix_s     > 0 else -1)
+    s34_sign = 1 if s34_score > 0 else (-1 if s34_score < 0 else 0)
+    if s34_sign != 0 and signs_non_s34:
+        agree_count = sum(1 for s in signs_non_s34 if s == s34_sign)
+        agreement_pct = agree_count / len(signs_non_s34)
+    else:
+        # s34 is zero or no other signals available — fall back to old formula
+        signs = []
+        if s34_score != 0:   signs.append(1 if s34_score > 0 else -1)
+        if price_s   != 0:   signs.append(1 if price_s   > 0 else -1)
+        if ts_s      != 0:   signs.append(1 if ts_s      > 0 else -1)
+        if vix_s     != 0:   signs.append(1 if vix_s     > 0 else -1)
+        agree_count = sum(1 for s in signs if s == (1 if enhanced_score >= 0 else -1))
+        agreement_pct = agree_count / max(len(signs), 1)
+
+    base_confidence = min(abs(enhanced_score), 100)
+    conf_bonus      = agreement_pct * 20.0   # up to +20 when all agree
+    enhanced_conf   = round(min(100.0, base_confidence * (0.4 + 0.6 * agreement_pct)), 1)
+
+    if   enhanced_score >= 30:  direction = "BULLISH";    color = "#059669"
+    elif enhanced_score >= 10:  direction = "MILDLY BULLISH"; color = "#10B981"
+    elif enhanced_score <= -30: direction = "BEARISH";    color = "#DC2626"
+    elif enhanced_score <= -10: direction = "MILDLY BEARISH"; color = "#F59E0B"
+    else:                       direction = "NEUTRAL";    color = "#6B7280"
+
+    # Determine how many new signals are live (reuse booleans from weight calc)
+    new_signals_available = sum([price_live, ts_live, vix_live])
+
+    return {
+        "enhanced_score":          enhanced_score,
+        "direction":               direction,
+        "color":                   color,
+        "enhanced_conf":           enhanced_conf,
+        "agreement_pct":           round(agreement_pct * 100, 0),
+        "s34_score":               s34_score,
+        "price_score":             price_s,
+        "ts_score":                ts_s,
+        "vix_score":               vix_s,
+        "new_signals_available":   new_signals_available,
+    }
+
+# ══ END ENHANCED PRICE CONFIRMATION LAYER ════════════════════════════════════
+
+
+# ─── History helpers ──────────────────────────────────────────────────────────
+def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_excess=None, basis_gap=None, traded_basis=None):
+    return {
+        "ts":              now_ist().strftime("%Y-%m-%dT%H:%M:%S"),
+        "spot":            spot,
+        "atm_iv":          m.get("atm_iv", 0),
+        # Zero-vega guard: store None (not 0.0) when both sides are zero so the
+        # Vega Diff chart filter (`if _cv is not None and _pv is not None`) drops
+        # the tick cleanly rather than plotting a meaningless zero flatline.
+        "atm_call_vega":      m.get("atm_call_vega")     if safe_num(m.get("atm_call_vega",     0)) > 0 else None,
+        "atm_put_vega":       m.get("atm_put_vega")      if safe_num(m.get("atm_put_vega",      0)) > 0 else None,
+        "atm_call_vega_raw":  m.get("atm_call_vega_raw") if safe_num(m.get("atm_call_vega_raw", 0)) > 0 else None,
+        "atm_put_vega_raw":   m.get("atm_put_vega_raw")  if safe_num(m.get("atm_put_vega_raw",  0)) > 0 else None,
+        # Strike-wise CE/PE Extrinsic-Value ratio, ATM±vega_band_strikes, averaged per-strike
+        "ev_ratio_avg_strikewise": m.get("ev_ratio_avg_strikewise") if safe_num(m.get("ev_ratio_avg_strikewise", 0)) > 0 else None,
+        # Same, but OI-weighted per strike (Call EV×Call OI / Put EV×Put OI)
+        "ev_ratio_oiw_avg_strikewise": m.get("ev_ratio_oiw_avg_strikewise") if safe_num(m.get("ev_ratio_oiw_avg_strikewise", 0)) > 0 else None,
+        "net_delta":    m.get("net_delta", 0),
+        "oi_net_delta": m.get("momentum", 0),
+        "momentum":     m.get("momentum", 0),
+        "max_pain":     m.get("max_pain", 0),
+        "support":      m.get("support", 0),
+        "resistance":   m.get("resistance", 0),
+        "gex":          m.get("gex", 0),
+        "pcr":          m.get("pcr", 0),
+        "atm_pressure": m.get("atm_pressure", 0),
+        "wall_width":   m.get("wall_width", 0),
+        "gamma_flip":   m.get("gamma_flip", None),
+        "iv_rank":      m.get("iv_rank", 50),
+        "gt_ratio":     m.get("gt_ratio", 0),
+        "atm":          m.get("atm", 0),
+        # Bug fix: this was never copied from `m` before, so the live chart's
+        # band-width inference (`_vd_band_n`, read from history) always fell
+        # back to the hardcoded default of 2 regardless of the owner's actual
+        # "ATM Vega band width" setting — the underlying vega/EV values were
+        # always computed with the correct configured band, only the chart
+        # title/label silently showed the wrong number of strikes.
+        "vega_band_strikes": m.get("vega_band_strikes", 5),
+        "call_oi_total":call_oi_total,
+        "put_oi_total": put_oi_total,
+        "synth_excess": synth_excess,
+        "basis_gap":    basis_gap,
+        "traded_basis": traded_basis,
+        "call_dw_flow": float(sum(r.get("call_oi_chg", 0) * abs(r.get("call_delta", 0.3))
+                               for r in m.get("_df_band_records", []))),
+        "put_dw_flow":  float(sum(r.get("put_oi_chg", 0) * abs(r.get("put_delta", 0.3))
+                               for r in m.get("_df_band_records", []))),
+    }
+
+
+# ─── Fetch + compute ──────────────────────────────────────────────────────────
+# Server-side cache: shared across ALL visitor sessions in the same process.
+# Visitors only read from this cache; only the timed expiry triggers a new API call.
+#
+# CI #7 fix: separate "fetch in progress" flag from the cache itself so concurrent
+# visitors don't serialize on the network call. Pattern:
+#   - Acquire lock briefly. If cache fresh → return cached payload.
+#   - If cache stale AND no fetch in progress → set fetch_in_progress=True,
+#     release lock, do the fetch, re-acquire lock, store payload, clear flag.
+#   - If cache stale AND fetch already in progress → return stale payload
+#     (stale-while-revalidate).
+_srv_cache_lock      = _SH["srv_lock"]      # v27: shared across reruns/visitors
+_srv_cache           = _SH["srv_cache"]     # v27: shared across reruns/visitors
+_srv_fetch_in_progress = False     # CI #7 fix: single-flight flag
+
+def _raw_fetch_and_compute(expiry_override=None, history=None):
+    """Actual Dhan API fetch — never called directly by visitors."""
+    df, spot, expiry, source = get_option_chain(expiry_override)
+    if df.empty:
+        return None, source
+
+    m = compute_metrics(df, spot, expiry, history=history)
+    if not m:
+        return None, source
+
+    df_band  = m.pop("df_band", df)
+    df_sig   = m.pop("df_signal", df)
+
+    traded_fut   = fetch_futures_ltp(expiry, spot)   # v24: spot enables sanity guard
+    _atm         = safe_num(m.get("atm", 0))
+    _df_band_lst = df_band.fillna(0).to_dict("records")
+    m["_df_band_records"] = _df_band_lst
+
+    sf           = compute_synthetic_future(_df_band_lst, spot, _atm, expiry)
+    synth_excess = round(sf["synth_excess"], 2) if sf else None
+    traded_basis = round(safe_num(traded_fut) - spot, 2) if traded_fut and safe_num(traded_fut) > 0 else None
+    basis_gap    = round(safe_num(traded_fut) - sf["synthetic"], 2) if sf and traded_fut and safe_num(traded_fut) > 0 else None
+
+    payload = {
+        "symbol":  SYMBOL,
+        "source":  source,
+        "spot":    spot,
+        "expiry":  expiry,
+        "metrics": m,
+        "df_band": _df_band_lst,
+        "df_signal": df_sig.fillna(0).to_dict("records"),
+        "traded_future": traded_fut if traded_fut and safe_num(traded_fut) > 0 else None,
+        "synth_excess":  synth_excess,
+        "basis_gap":     basis_gap,
+        "traded_basis":  traded_basis,
+        "ts_ist":        ist_str(),
+        "is_live":       is_market_hours() and USE_DHAN,
+    }
+    # v27: synthetic-forward bias ladder + 25Δ RR (Final Decision Matrix) — once per fetch
+    payload["fdm_bias"] = _fdmb_snapshot(df, spot, expiry)
+    return payload, source
+
+
+def get_server_data(expiry_override=None, _from_bg=False):
+    """
+    Returns (payload, source, last_fetch_ts) for ALL visitors.
+    Only calls Dhan API when the owner-configured refresh interval has elapsed.
+    Visitor page-refreshes (every 60 s) NEVER trigger a new API call.
+    last_fetch_ts is the Unix timestamp of the most recent Dhan fetch — used by
+    callers to dedup history entries so one data snapshot → exactly one entry.
+
+    CI #7 fix: single-flight refresh — the lock is held only for the cache
+    check, NOT during the network call. Concurrent visitors return the stale
+    payload while one thread refreshes (stale-while-revalidate).
+    """
+    global _srv_cache, _srv_fetch_in_progress
+    settings = _load_owner_settings()
+    interval = settings.get("refresh_interval", REFRESH_SECONDS)
+    expiry_to_use = expiry_override or settings.get("selected_expiry")
+
+    # ── Phase 1: brief lock to check cache freshness ──
+    with _srv_cache_lock:
+        now = time.time()
+        cache_expired = (now - _srv_cache["last_fetch_ts"]) >= interval
+        if not cache_expired and _srv_cache["payload"] is not None:
+            # Cache fresh — return immediately
+            return (
+                _srv_cache.get("payload"),
+                _srv_cache.get("source", "N/A"),
+                _srv_cache.get("last_fetch_ts", 0.0),
+            )
+        # v36 FIX: no payload yet and the last attempt failed < 20 s ago → don't retry
+        # (previously the 40-s wait loop could fire ~80 full fetches per visitor).
+        if _srv_cache["payload"] is None and (now - _SH.get("fail_ts", 0.0)) < 20:
+            return (None, "API ERROR", 0.0)
+        # Cache stale — check if another thread is already fetching
+        # v27 fix: a fetch older than 120 s is treated as dead (its thread was stopped)
+        if _SH["inflight"]["v"] and (now - _SH["inflight"].get("ts", 0.0)) < 120:   # shared single-flight flag
+            # Stale-while-revalidate: return what we have, let the other thread finish
+            return (
+                _srv_cache.get("payload"),
+                _srv_cache.get("source", "N/A"),
+                _srv_cache.get("last_fetch_ts", 0.0),
+            )
+        # Claim the fetch slot
+        _SH["inflight"]["v"] = True
+        _SH["inflight"]["ts"] = now
+
+    # ── Phase 2: do the network call WITHOUT holding the lock ──
+    # v27 fix: Streamlit stops a visitor's script run (page reload, new rerun, tab
+    # closed) by raising a BaseException inside it. Phase 3 therefore runs in a
+    # `finally`, otherwise the SHARED in-flight flag stayed True for ever and every
+    # visitor got "Could not fetch option chain data" until the server restarted.
+    payload, source = None, "API ERROR"
+    try:
+        try:
+            _hist_for_ivr = _load_history()
+            payload, source = _raw_fetch_and_compute(expiry_to_use, history=_hist_for_ivr)
+        except Exception:
+            payload, source = None, "API ERROR"
+    finally:
+        # ── Phase 3: re-acquire lock to update cache + clear flag (always) ──
+        with _srv_cache_lock:
+            _SH["inflight"]["v"] = False
+            if payload is not None:
+                _srv_cache["payload"] = payload
+                _srv_cache["source"]  = source
+                _srv_cache["last_fetch_ts"] = time.time()
+            # If payload is None (fetch failed), keep the previous stale payload
+            # but bump last_fetch_ts by a short cooldown to prevent retry storms.
+            elif _srv_cache["payload"] is not None:
+                _srv_cache["last_fetch_ts"] = time.time() - max(0, interval - 30)  # 30s cooldown
+            else:
+                _SH["fail_ts"] = time.time()          # v36: cold-start failure cooldown
+
+    # v27: record the shared history tick right after a successful fetch.
+    # Background fetches outside market hours are not recorded (as before, after-hours
+    # ticks are only recorded when a visitor is actually viewing).
+    if payload is not None and (not _from_bg or is_market_hours()):
+        _v27_record_history_tick(_srv_cache.get("payload"), _srv_cache.get("last_fetch_ts", 0.0))
+
+    return (
+        _srv_cache.get("payload"),
+        _srv_cache.get("source", "N/A"),
+        _srv_cache.get("last_fetch_ts", 0.0),
+    )
+
+
+def _force_server_refresh(expiry_override=None):
+    """Owner-only: clear ALL caches so the next get_server_data() fetches fresh data.
+
+    CI #4 fix: previously only zeroed `_srv_cache["last_fetch_ts"]`. That left
+    three Streamlit-cached fetchers (intraday candles, back-expiry OI band,
+    back-expiry ATM IV) and two module-level LTP caches serving stale data for
+    their full TTLs. The owner clicked "Refresh Now" and saw a partially stale
+    dashboard. Now we clear everything explicitly.
+    """
+    global _srv_cache
+    with _srv_cache_lock:
+        _srv_cache["last_fetch_ts"] = 0.0   # expire the cache immediately
+
+    # CI #4 fix: clear Streamlit's @st.cache_data layer
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    # CI #4 fix: clear module-level LTP caches (futures + VIX)
+    # These are read by `fetch_futures_ltp` / `fetch_india_vix_ltp` and were
+    # previously left serving stale values for ~60s after a manual refresh.
+    try:
+        _fut_ltp_cache["ts"] = 0.0
+    except Exception:
+        pass
+    try:
+        _vix_ltp_cache_v7["ts"] = 0.0
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SERVER-SIDE PERSISTENT STATE: History + Settings + Bias/Smile history
+# ─────────────────────────────────────────────────────────────────────────────
+_BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
+_HISTORY_FILE       = os.path.join(_BASE_DIR, "nifty_history.json")
+_SETTINGS_FILE      = os.path.join(_BASE_DIR, "nifty_settings.json")
+_BIAS_HISTORY_FILE  = os.path.join(_BASE_DIR, "nifty_bias_history.json")
+_SMILE_HISTORY_FILE = os.path.join(_BASE_DIR, "nifty_smile_history.json")
+
+# CI #6 fix: single process-wide lock for ALL persistent-state writes.
+# Prevents concurrent visitor sessions from corrupting the JSON files via
+# interleaved read-modify-write cycles (which the previous bare `open(w)` calls
+# allowed — last writer wins, file can be truncated if process is killed mid-write).
+_persist_lock = _SH["persist_lock"]   # v27: shared across reruns/visitors
+
+# H25 fix: TTL cache for _load_owner_settings. The function was being called
+# 2-3× per rerun from multiple sites (sidebar, get_server_data, banner) and
+# each call did an `open + json.load`. With N visitors refreshing every 60s,
+# that's 2-3N disk reads/minute for a file that changes only when the owner
+# toggles a setting. 5s TTL coalesces reads within a single rerun.
+_owner_settings_cache = {"data": None, "ts": 0.0}
+_OWNER_SETTINGS_TTL = 5.0   # seconds
+
+# H26 fix: mtime check for _load_bias_history. The function reads the entire
+# JSON file from disk every rerun (60s) per visitor for cross-visitor dedup.
+# With mtime check, we only re-read when the file actually changed.
+_bias_history_cache = {"data": None, "mtime": -1.0}
+
+
+def _atomic_json_write(path, obj):
+    """CI #6 fix: atomic JSON write via write-temp-then-os.replace.
+
+    - Writes to `<path>.tmp` first, then atomically renames to `<path>` via
+      os.replace (POSIX atomicity guarantee).
+    - Refuses to write NaN/Infinity (allow_nan=False) so the file stays
+      RFC-8259 compliant and parseable by non-Python tools.
+    - Caller must already hold _persist_lock if cross-file atomicity matters.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f, allow_nan=False)
+        os.replace(tmp, path)   # atomic on POSIX
+    except (TypeError, ValueError) as e:
+        # NaN/Infinity in obj — refuse to corrupt the file
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        # Re-raise so the caller's `except Exception: pass` logs nothing,
+        # but the existing file on disk is preserved.
+        raise
+
+
+# ── Main tick history ─────────────────────────────────────────────────────────
+def _load_history():
+    """Load history from disk on fresh session start."""
+    with _persist_lock:
+        try:
+            with open(_HISTORY_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data[-500:]
+        except Exception:
+            pass
+    return []
+
+def _save_history(history):
+    """Persist history to disk after every new tick."""
+    with _persist_lock:
+        try:
+            _atomic_json_write(_HISTORY_FILE, history[-500:])
+        except Exception:
+            pass
+
+
+# ── Owner settings (refresh interval, selected expiry) ───────────────────────
+def _load_owner_settings():
+    # H25 fix: TTL cache — coalesce multiple calls within 5 seconds.
+    now = time.time()
+    if (_owner_settings_cache["data"] is not None and
+        now - _owner_settings_cache["ts"] < _OWNER_SETTINGS_TTL):
+        return _owner_settings_cache["data"]
+    with _persist_lock:
+        try:
+            with open(_SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {"refresh_interval": REFRESH_SECONDS, "selected_expiry": None}
+    _owner_settings_cache["data"] = data
+    _owner_settings_cache["ts"]   = now
+    return data
+
+def _save_owner_settings(settings):
+    with _persist_lock:
+        try:
+            _atomic_json_write(_SETTINGS_FILE, settings)
+        except Exception:
+            pass
+    # H25 fix: invalidate the TTL cache so the next read picks up the new value
+    _owner_settings_cache["data"] = None
+    _owner_settings_cache["ts"]   = 0.0
+
+# ── S3/4 Bias chart history (persisted so mid-session joiners see full chart) ─
+def _load_bias_history():
+    # H26 fix: mtime check — only re-read when the file actually changed.
+    # Was reading the entire JSON every rerun per visitor for cross-visitor dedup.
+    try:
+        current_mtime = os.path.getmtime(_BIAS_HISTORY_FILE)
+    except OSError:
+        current_mtime = -1.0
+    # Cache hit if mtime is unchanged AND we have data (or both are -1 = file missing)
+    if current_mtime == _bias_history_cache["mtime"]:
+        return _bias_history_cache["data"] if _bias_history_cache["data"] is not None else []
+    with _persist_lock:
+        try:
+            with open(_BIAS_HISTORY_FILE, "r") as f:
+                data = json.load(f)
+                data = data if isinstance(data, list) else []
+        except Exception:
+            data = []
+    _bias_history_cache["data"]  = data
+    _bias_history_cache["mtime"] = current_mtime
+    return data
+
+def _save_bias_history(bh):
+    with _persist_lock:
+        try:
+            _atomic_json_write(_BIAS_HISTORY_FILE, bh[-60:])
+        except Exception:
+            pass
+    # H26 fix: invalidate mtime cache so next read picks up the new file
+    _bias_history_cache["data"]  = None
+    _bias_history_cache["mtime"] = -1.0
+
+# ── IV Smile history (persisted so mid-session joiners get trend context) ─────
+def _load_smile_history():
+    with _persist_lock:
+        try:
+            with open(_SMILE_HISTORY_FILE, "r") as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+def _save_smile_history(sh):
+    with _persist_lock:
+        try:
+            _atomic_json_write(_SMILE_HISTORY_FILE, sh[-20:])
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v27 — SYNTHETIC-FORWARD BIAS LADDER + 25Δ RR SKEW  (inside Shantanu's Final
+#        Decision Matrix; computed ONCE per data fetch, server-side, attached to
+#        the payload as payload["fdm_bias"] — independent add-on)
+#
+#   Per strike K (ATM ± 5, mid prices):
+#       F_K   = K + (C_mid − P_mid) · e^(rT)          put-call-parity synthetic forward
+#       P_K   = F_K − Spot                              synthetic forward premium (pts)
+#       w_K   = |ΔOI_call · Δ_call| + |ΔOI_put · Δ_put| delta-weighted OI change (vs previous day)
+#       u_K   = (call half-spread + put half-spread) · e^(rT)   quote uncertainty of F_K
+#   NOISE CONTROLS (v27.1)
+#     1. like-for-like change: Δ = weighted median of (P_K now − P_K previous) over strikes
+#        present in BOTH snapshots, using the SAME (current) weights → no composition /
+#        weight-jump effects
+#     2. noise floor from the quotes: floor = 1.2533 · weighted-median(√(u_now² + u_prev²)) / √n_eff;
+#        a change smaller than the floor reads "within quote noise"
+#     3. clean inputs: both legs need a live bid & ask with spread ≤ 5 % of mid; strikes whose
+#        F_K is > 3 MAD from the median F are dropped as stale/outliers; Bias = WEIGHTED MEDIAN
+#     4. confirmation: RISING / FALLING is "confirmed" only after 3 consecutive snapshots in
+#        the same direction, each beyond its noise floor; a 3-snapshot EMA of Δ is also shown
+#     5. 25Δ RR from IVs solved from MID prices (not LTP), on liquid strikes within ATM ± 10,
+#        with its own spread-based noise floor and the same 3-snapshot confirmation
+#   Direction uses only previous snapshots (no anchor, no z-score):
+#       rising  → call buyers / put sellers gaining (bullish)
+#       falling → put buyers / call sellers gaining (bearish)
+# ═══════════════════════════════════════════════════════════════════════════════
+FDMB_STRIKES     = 5      # ladder: ATM ± 5
+FDMB_RR_STRIKES  = 10     # 25Δ RR uses liquid strikes within ATM ± 10
+FDMB_SPREAD_MAX  = 0.05   # max bid-ask spread / mid for a leg to be used
+FDMB_MAD_K       = 3.0    # outlier trim: |F_K − median F| > 3 MAD
+FDMB_CONFIRM_N   = 3      # consecutive snapshots needed to confirm a direction
+FDMB_EMA_SPAN    = 3      # EMA span (snapshots) for the smoothed change
+FDMB_HIST_KEEP   = 10
+FDMB_ALERT_KEEP  = 60     # v28: joint-confirmation alerts kept per day (shown newest first)
+FDMB_ALERT_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fdm_alert_archive")
+FDMB_STATE_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fdm_bias_state.json")
+_fdmb_lock = _SH["fdmb_lock"]   # shared across reruns/visitors
+
+
+def _v27_json_clean(o):
+    """Strict-JSON-safe copy (NaN/inf → None, numpy → python)."""
+    if isinstance(o, dict):
+        return {str(k): _v27_json_clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_v27_json_clean(v) for v in o]
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating, float)):
+        f = float(o)
+        return f if np.isfinite(f) else None
+    return o
+
+
+def _fdmb_quote(ltp, bid, ask):
+    """(mid, half_spread, ok) — ok only for a live two-sided quote with spread ≤ FDMB_SPREAD_MAX of mid."""
+    try:
+        bid, ask = float(bid or 0), float(ask or 0)
+        if bid > 0 and ask > bid:
+            mid = 0.5 * (bid + ask)
+            return mid, 0.5 * (ask - bid), (ask - bid) / mid <= FDMB_SPREAD_MAX
+    except Exception:
+        pass
+    return float(ltp or 0), None, False
+
+
+def _fdmb_T(expiry_str):
+    """Calendar time to expiry 15:30 IST in years, floored at 5 minutes."""
+    try:
+        ed = datetime.strptime(str(expiry_str)[:10], "%Y-%m-%d")
+        secs = (IST.localize(ed.replace(hour=15, minute=30)) - now_ist()).total_seconds()
+    except Exception:
+        secs = 3 * 86400
+    return max(secs, 300.0) / (365.0 * 86400.0)
+
+
+def _fdmb_wmedian(vals, wts):
+    """Weighted median; falls back to the plain median when all weights are zero."""
+    pairs = [(v, w) for v, w in zip(vals, wts) if v is not None and np.isfinite(v)]
+    if not pairs:
+        return None
+    if sum(w for _, w in pairs) <= 0:
+        return float(np.median([v for v, _ in pairs]))
+    pairs.sort()
+    tot = sum(w for _, w in pairs)
+    acc = 0.0
+    for v, w in pairs:
+        acc += w
+        if acc >= 0.5 * tot:
+            return float(v)
+    return float(pairs[-1][0])
+
+
+def _fdmb_neff(wts):
+    s1, s2 = sum(wts), sum(w * w for w in wts)
+    return (s1 * s1 / s2) if s2 > 0 else float(len(wts) or 1)
+
+
+def _fdmb_rr25(df, spot, T, atm):
+    """25Δ RR from IVs solved from MID prices on liquid strikes within ATM ± FDMB_RR_STRIKES.
+    Returns (ivc25, ivp25, rr25, rr_unc) in vol points; rr_unc from half-spread / vega."""
+    r = RISK_FREE_RATE
+    lo, hi = atm - FDMB_RR_STRIKES * NIFTY_STEP, atm + FDMB_RR_STRIKES * NIFTY_STEP
+    c_pts, p_pts = [], []
+    for _, x in df[df["strike"].between(lo, hi)].iterrows():
+        K = float(x["strike"])
+        for side, pre, pts in (("CE", "call", c_pts), ("PE", "put", p_pts)):
+            mid, hs, ok = _fdmb_quote(x.get(f"{pre}_ltp", 0), x.get(f"{pre}_bid", 0), x.get(f"{pre}_ask", 0))
+            if not ok:
+                continue
+            iv = _solve_iv(mid, spot, K, T, r, side)
+            if iv is None or not np.isfinite(iv) or iv <= 0.005:
+                continue
+            dlt, _, _, vega = _bs_greeks(spot, K, T, r, iv, side)
+            if vega <= 0:
+                continue
+            pts.append((float(dlt), iv * 100.0, hs / vega))      # (delta, IV %, IV uncertainty vol pts)
+
+    def _interp(pts, target):
+        pts = sorted(pts)
+        if len(pts) < 2:
+            return None, None
+        xs = np.array([p[0] for p in pts])
+        if not (xs.min() <= target <= xs.max()):
+            return None, None
+        return (float(np.interp(target, xs, [p[1] for p in pts])),
+                float(np.interp(target, xs, [p[2] for p in pts])))
+    ivc, uc = _interp(c_pts, 0.25)
+    ivp, up = _interp(p_pts, -0.25)
+    if ivc is None or ivp is None:
+        return ivc, ivp, None, None
+    return ivc, ivp, ivc - ivp, float(np.sqrt((uc or 0) ** 2 + (up or 0) ** 2))
+
+
+def _fdmb_confirm(hist, key, floor_key, n=FDMB_CONFIRM_N):
+    """Count consecutive latest snapshots (incl. current) whose change in `key` exceeds its
+    noise floor in the same direction. Returns (direction 'up'/'down'/None, count)."""
+    k, sign = 0, 0
+    for h in reversed(hist):
+        d, fl = h.get(key), h.get(floor_key) or 0.0
+        if d is None or abs(d) <= fl:
+            break
+        s = 1 if d > 0 else -1
+        if sign == 0:
+            sign = s
+        if s != sign:
+            break
+        k += 1
+    return ("up" if sign > 0 else "down" if sign < 0 else None), k
+
+
+def _fdmb_ema(vals, span=FDMB_EMA_SPAN):
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    a, e = 2.0 / (span + 1.0), vals[0]
+    for v in vals[1:]:
+        e = a * v + (1 - a) * e
+    return float(e)
+
+
+def _fdmb_snapshot(df, spot, expiry):
+    """Compute the current synthetic-forward bias + 25Δ RR with the noise controls above,
+    compare with the previous snapshot (persisted in fdm_bias_state.json) and store this one.
+    Called once per real data fetch. Never raises."""
+    try:
+        if df is None or df.empty or not spot:
+            return None
+        r = RISK_FREE_RATE
+        T = _fdmb_T(expiry)
+        growth = float(np.exp(r * T))
+        ks = sorted(float(k) for k in df["strike"].dropna().unique())
+        atm = min(ks, key=lambda k: abs(k - spot))
+        i0 = ks.index(atm)
+        keep = set(ks[max(0, i0 - FDMB_STRIKES): i0 + FDMB_STRIKES + 1])
+
+        rows = []
+        for _, x in df[df["strike"].isin(keep)].sort_values("strike").iterrows():
+            K = float(x["strike"])
+            c, chs, cok = _fdmb_quote(x.get("call_ltp", 0), x.get("call_bid", 0), x.get("call_ask", 0))
+            p, phs, pok = _fdmb_quote(x.get("put_ltp", 0), x.get("put_bid", 0), x.get("put_ask", 0))
+            cd = abs(float(x.get("call_delta", 0) or 0)) or 0.5
+            pdl = abs(float(x.get("put_delta", 0) or 0)) or 0.5
+            c_w = abs(float(x.get("call_oi_chg", 0) or 0)) * cd
+            p_w = abs(float(x.get("put_oi_chg", 0) or 0)) * pdl
+            rec = {"K": K, "c_w": c_w, "p_w": p_w, "w": c_w + p_w, "used": False,
+                   "why": None, "F": None, "prem": None, "unc": None}
+            for _pre, _k in (("call", "c_vs_avg"), ("put", "p_vs_avg")):        # v29: LTP vs day average
+                try:
+                    _l, _a = float(x.get(f"{_pre}_ltp", 0) or 0), float(x.get(f"{_pre}_avg", 0) or 0)
+                    rec[_k] = (_l / _a - 1.0) if (_l > 0 and _a > 0) else None
+                except Exception:
+                    rec[_k] = None
+            if not (cok and pok) or c <= 0 or p <= 0:
+                rec["why"] = "wide/no quote"
+            else:
+                F_K = K + (c - p) * growth
+                rec.update({"F": float(F_K), "prem": float(F_K - spot), "unc": float((chs + phs) * growth), "used": True})
+            rows.append(rec)
+
+        used = [rr for rr in rows if rr["used"]]
+        if len(used) >= 3:                                   # outlier trim (stale quotes)
+            Fs = np.array([rr["F"] for rr in used])
+            med = float(np.median(Fs))
+            mad = float(np.median(np.abs(Fs - med)))
+            lim = FDMB_MAD_K * max(mad * 1.4826, 0.5)
+            for rr in used:
+                if abs(rr["F"] - med) > lim:
+                    rr["used"], rr["why"] = False, "outlier (stale?)"
+        used = [rr for rr in rows if rr["used"]]
+        if not used:
+            return None
+
+        wts = [rr["w"] for rr in used]
+        wsum = sum(wts)
+        weighted = wsum > 0
+        bias = _fdmb_wmedian([rr["prem"] for rr in used], wts if weighted else [1.0] * len(used))
+        for rr in rows:
+            rr["wpct"] = (rr["w"] / wsum) if (rr["used"] and wsum > 0) else None
+        level_unc = 1.2533 * _fdmb_wmedian([rr["unc"] for rr in used], wts if weighted else [1.0] * len(used)) \
+            / np.sqrt(_fdmb_neff(wts if weighted else [1.0] * len(used)))
+
+        # v29: OI-weighted median of (call LTP vs its day average) − (put LTP vs its day average)
+        _va = [((rr["c_vs_avg"] - rr["p_vs_avg"]), rr["w"]) for rr in used
+               if rr.get("c_vs_avg") is not None and rr.get("p_vs_avg") is not None]
+        avg_tilt = _fdmb_wmedian([v for v, _ in _va], [w if weighted else 1.0 for _, w in _va]) if _va else None
+        ivc, ivp, rr25, rr_unc = _fdmb_rr25(df, spot, T, atm)
+        now_ts = now_ist().strftime("%Y-%m-%dT%H:%M:%S")
+        cur = {"ts": now_ts, "expiry": str(expiry), "spot": float(spot), "bias": float(bias),
+               "weighted": weighted, "level_unc": float(level_unc), "rr25": rr25, "rr_unc": rr_unc,
+               "ivc25": ivc, "ivp25": ivp, "fair_carry": float(spot * (growth - 1.0)),
+               "synth_f": float(spot + bias), "n_used": len(used), "n_total": len(rows), "rows": rows,
+               "avg_tilt": avg_tilt}
+
+        with _fdmb_lock:
+            try:
+                with open(FDMB_STATE_FILE, "r") as f:
+                    st_ = json.load(f)
+            except Exception:
+                st_ = {}
+            prev, hist = st_.get("last"), st_.get("hist") or []
+            if prev and (prev.get("expiry") != cur["expiry"] or str(prev.get("ts", ""))[:10] != now_ts[:10]):
+                prev, hist = None, []                        # new day or new expiry → start over
+
+            # 1+2. like-for-like change over common strikes with current weights + quote noise floor
+            d_like = floor = d_raw = None
+            n_common = 0
+            if prev:
+                pmap = {pr["K"]: pr for pr in prev.get("rows", []) if pr.get("used")}
+                diffs, dw, du = [], [], []
+                for rr in used:
+                    pr = pmap.get(rr["K"])
+                    if pr is None:
+                        continue
+                    rr["d_prem"] = rr["prem"] - pr["prem"]
+                    diffs.append(rr["d_prem"]); dw.append(rr["w"] if weighted else 1.0)
+                    du.append(float(np.sqrt(rr["unc"] ** 2 + (pr.get("unc") or 0) ** 2)))
+                n_common = len(diffs)
+                if diffs:
+                    d_like = _fdmb_wmedian(diffs, dw)
+                    floor = 1.2533 * _fdmb_wmedian(du, dw) / np.sqrt(_fdmb_neff(dw))
+                if prev.get("bias") is not None:
+                    d_raw = cur["bias"] - prev["bias"]
+            d_rr = (rr25 - prev["rr25"]) if (prev and rr25 is not None and prev.get("rr25") is not None) else None
+            rr_floor = (float(np.sqrt((rr_unc or 0) ** 2 + (prev.get("rr_unc") or 0) ** 2))
+                        if (prev and d_rr is not None) else None)
+
+            hist = (hist + [{"ts": now_ts, "d": d_like, "fl": floor, "drr": d_rr, "flrr": rr_floor}])[-FDMB_HIST_KEEP:]
+            b_dir, b_n = _fdmb_confirm(hist, "d", "fl")
+            r_dir, r_n = _fdmb_confirm(hist, "drr", "flrr")
+            cur.update({"prev_ts": prev.get("ts") if prev else None, "d_like": d_like, "floor": floor,
+                        "d_raw": d_raw, "n_common": n_common, "d_rr25": d_rr, "rr_floor": rr_floor,
+                        "ema_d": _fdmb_ema([h.get("d") for h in hist][-FDMB_EMA_SPAN * 2:]),
+                        "ema_drr": _fdmb_ema([h.get("drr") for h in hist][-FDMB_EMA_SPAN * 2:]),
+                        "b_dir": b_dir, "b_n": b_n, "r_dir": r_dir, "r_n": r_n})
+            # v28: joint-confirmation alert — logged ONCE when both tiles first show a confirmed
+            # move in the SAME direction (re-arms after the joint state breaks or flips).
+            today = now_ts[:10]
+            alerts = [a for a in (st_.get("alerts") or []) if str(a.get("ts", ""))[:10] == today]
+            prev_joint = st_.get("joint") if str(st_.get("joint_day", "")) == today else None
+            joint = b_dir if (b_dir and b_dir == r_dir and b_n >= FDMB_CONFIRM_N and r_n >= FDMB_CONFIRM_N) else None
+            if joint and joint != prev_joint:
+                a_new = {"ts": now_ts, "dir": joint, "spot": float(spot), "expiry": str(expiry),
+                         "bias": float(bias), "d_like": d_like, "rr25": rr25, "d_rr25": d_rr,
+                         "b_n": b_n, "r_n": r_n}
+                alerts = (alerts + [a_new])[-FDMB_ALERT_KEEP:]
+                try:                                         # permanent daily archive
+                    os.makedirs(FDMB_ALERT_DIR, exist_ok=True)
+                    with open(os.path.join(FDMB_ALERT_DIR, f"{today}.jsonl"), "a") as _af:
+                        _af.write(json.dumps(_v27_json_clean(a_new), allow_nan=False) + "\n")
+                except Exception as _ae:
+                    print(f"[FDM-bias] alert archive skipped: {_ae}", flush=True)
+            cur.update({"joint": joint, "alerts": list(reversed(alerts))})
+            tmp = FDMB_STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(_v27_json_clean({"last": {k: v for k, v in cur.items() if k != "alerts"}, "hist": hist,
+                                           "alerts": alerts, "joint": joint, "joint_day": today}),
+                          f, allow_nan=False)
+            os.replace(tmp, FDMB_STATE_FILE)
+        return _v27_json_clean(cur)
+    except Exception as _e:
+        try:
+            print(f"[FDM-bias] skipped: {_e}", flush=True)
+        except Exception:
+            pass
+        return None
+
+
+def _fdmb_html(fb):
+    """Synthetic-forward bias tile + 25Δ RR tile + strike ladder, as one HTML string."""
+    if not fb:
+        return ('<div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;padding:10px 14px;'
+                'margin-top:12px;font-size:12px;color:#6B7280;">Synthetic-forward bias &amp; 25Δ RR — waiting for '
+                'the first option-chain snapshot with clean two-sided quotes.</div>')
+    G, R_, M, A = "#059669", "#DC2626", "#6B7280", "#D97706"
+    f = lambda v, fmt: "—" if v is None else fmt.format(v)
+    prev_hm = str(fb.get("prev_ts") or "")[11:16]
+
+    def _status(d, floor, dirn, n, up_txt, dn_txt):
+        """(colour, headline, detail) from the like-for-like change, its noise floor and confirmation."""
+        if d is None:
+            return M, "No previous snapshot yet", "direction appears from the second snapshot"
+        fl = floor or 0.0
+        if dirn and n >= FDMB_CONFIRM_N:
+            col, word = (G, "RISING") if dirn == "up" else (R_, "FALLING")
+            return col, f"{'▲' if dirn == 'up' else '▼'} {word} · confirmed ({n} snapshots)", \
+                up_txt if dirn == "up" else dn_txt
+        if abs(d) <= fl:
+            return M, "≈ within quote noise", f"Δ {d:+.2f} vs noise ±{fl:.2f}"
+        k = n if dirn else 1
+        return A, f"{'▲' if d > 0 else '▼'} {'rising' if d > 0 else 'falling'} — awaiting confirmation ({k}/{FDMB_CONFIRM_N})", \
+            up_txt if d > 0 else dn_txt
+
+    bc, bh, bd = _status(fb.get("d_like"), fb.get("floor"), fb.get("b_dir"), fb.get("b_n", 0),
+                         "call buyers / put sellers gaining (bullish)", "put buyers / call sellers gaining (bearish)")
+    rc, rh, rd = _status(fb.get("d_rr25"), fb.get("rr_floor"), fb.get("r_dir"), fb.get("r_n", 0),
+                         "put skew easing / calls bid (bullish)", "put skew steepening (bearish)")
+    lab = "font-size:10.5px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.04em;"
+    small = f"font-size:11px;color:{M};margin-top:3px;"
+    tile = ("flex:1 1 300px;background:#fff;border:1px solid #E5E7EB;border-top:4px solid {c};"
+            "border-radius:10px;padding:10px 14px;")
+    t1 = (f'<div style="{tile.format(c=bc)}"><div style="{lab}">Synthetic forward − spot · OI-weighted median</div>'
+          f'<div style="font-size:22px;font-weight:800;color:#111;font-family:monospace;">{f(fb.get("bias"), "{:+.2f}")} pts'
+          f'<span style="font-size:12px;color:{M};font-weight:600;"> ±{f(fb.get("level_unc"), "{:.2f}")}</span></div>'
+          f'<div style="font-size:13px;font-weight:800;color:{bc};">{bh}</div>'
+          f'<div style="font-size:12px;font-weight:600;color:{bc};">{bd}</div>'
+          f'<div style="{small}">Like-for-like Δ {f(fb.get("d_like"), "{:+.2f}")} (noise ±{f(fb.get("floor"), "{:.2f}")}, '
+          f'{fb.get("n_common", 0)} common strikes) · 3-snap EMA Δ {f(fb.get("ema_d"), "{:+.2f}")} · '
+          f'raw Δ {f(fb.get("d_raw"), "{:+.2f}")} vs {prev_hm or "—"}</div>'
+          f'<div style="{small}">Synthetic F {f(fb.get("synth_f"), "{:,.1f}")} · spot {f(fb.get("spot"), "{:,.1f}")} · '
+          f'fair carry ≈ {f(fb.get("fair_carry"), "{:+.1f}")} pts · {fb.get("n_used")}/{fb.get("n_total")} strikes clean'
+          + ("" if fb.get("weighted") else " · <b>unweighted</b> (no OI change yet)") + '</div>'
+          + (f'<div style="{small}">Day-average tilt (call vs avg − put vs avg, OI-weighted): '
+             f'<b>{fb["avg_tilt"]:+.1%}</b> · context only — mostly reflects spot\'s move since the open</div>'
+             if fb.get("avg_tilt") is not None else "") + '</div>')
+    t2 = (f'<div style="{tile.format(c=rc)}"><div style="{lab}">25Δ risk reversal skew · from mid prices</div>'
+          f'<div style="font-size:22px;font-weight:800;color:#111;font-family:monospace;">{f(fb.get("rr25"), "{:+.2f}")} vol</div>'
+          f'<div style="font-size:13px;font-weight:800;color:{rc};">{rh}</div>'
+          f'<div style="font-size:12px;font-weight:600;color:{rc};">{rd}</div>'
+          f'<div style="{small}">Δ {f(fb.get("d_rr25"), "{:+.2f}")} (noise ±{f(fb.get("rr_floor"), "{:.2f}")}) · '
+          f'3-snap EMA Δ {f(fb.get("ema_drr"), "{:+.2f}")}</div>'
+          f'<div style="{small}">25Δ call IV {f(fb.get("ivc25"), "{:.2f}")}% · 25Δ put IV {f(fb.get("ivp25"), "{:.2f}")}% · '
+          f'negative = puts dearer</div></div>')
+
+    th = 'style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;padding:4px 6px;text-align:right;"'
+    hdr = "".join(f"<th {th}>{h}</th>" for h in ("Strike", "Synthetic F", "F − spot", "± quote", "Δ vs prev",
+                                                  "Call ΔOI×Δ", "Put ΔOI×Δ", "Weight",
+                                                  "LTP vs day avg C / P", "Status"))
+
+    def _avgc(v):                                       # v29
+        if v is None:
+            return '<span style="color:#9CA3AF;">—</span>'
+        c = G if v > 0.02 else R_ if v < -0.02 else M
+        return f'<span style="color:{c};">{v:+.1%}</span>'
+
+    spot = fb.get("spot") or 0
+    body = []
+    for rr in fb.get("rows", []):
+        near = abs(rr["K"] - spot) <= 25
+        bg = "background:#EEF2FF;" if near else ""
+        d, u = rr.get("d_prem"), rr.get("unc")
+        dc = M if (d is None or (u is not None and abs(d) <= u)) else (G if d > 0 else R_)
+        stt = "used" if rr.get("used") else (rr.get("why") or "excluded")
+        sc = M if rr.get("used") else A
+        op = "" if rr.get("used") else "opacity:.6;"
+        body.append(
+            f'<tr style="{bg}{op}"><td style="font-weight:800;">{rr["K"]:,.0f}</td>'
+            f'<td>{f(rr.get("F"), "{:,.1f}")}</td><td>{f(rr.get("prem"), "{:+.1f}")}</td><td>{f(u, "{:.1f}")}</td>'
+            f'<td style="color:{dc};font-weight:700;">{f(d, "{:+.2f}")}</td>'
+            f'<td>{rr["c_w"]:,.0f}</td><td>{rr["p_w"]:,.0f}</td>'
+            f'<td>{f(rr.get("wpct"), "{:.0%}")}</td>'
+            f'<td>{_avgc(rr.get("c_vs_avg"))} / {_avgc(rr.get("p_vs_avg"))}</td>'
+            f'<td style="color:{sc};">{stt}</td></tr>')
+    table = ('<div style="overflow-x:auto;margin-top:8px;"><table style="width:100%;border-collapse:collapse;'
+             'font-size:12px;font-family:monospace;text-align:right;background:#fff;" cellpadding="3">'
+             f'<tr>{hdr}</tr>' + "".join(body) + '</table></div>')
+    # v28: joint-confirmation alert log (both tiles confirmed in the same direction)
+    alerts = fb.get("alerts") or []
+    jt = fb.get("joint")
+    j_txt = ("▲ BOTH CONFIRMED UP — active" if jt == "up" else "▼ BOTH CONFIRMED DOWN — active" if jt == "down"
+             else "no joint confirmation right now")
+    j_col = G if jt == "up" else R_ if jt == "down" else M
+    lth = 'style="font-size:10px;color:#6B7280;font-weight:700;text-transform:uppercase;padding:4px 6px;text-align:right;"'
+    lhdr = "".join(f"<th {lth}>{h}</th>" for h in ("Time (IST)", "Signal", "NIFTY spot", "Spot now vs alert",
+                                                   "F − spot", "Bias Δ", "25Δ RR", "RR Δ"))
+    lrows = []
+    for a in alerts:
+        up = a.get("dir") == "up"
+        ac = G if up else R_
+        mv = (spot - a["spot"]) if (spot and a.get("spot")) else None
+        mc = M if mv is None else (G if (mv > 0) == up and mv != 0 else R_ if mv != 0 else M)
+        lrows.append(
+            f'<tr><td style="font-weight:800;">{str(a.get("ts", ""))[11:19]}</td>'
+            f'<td style="color:{ac};font-weight:800;">{"▲ BULLISH" if up else "▼ BEARISH"}</td>'
+            f'<td style="font-weight:700;">{f(a.get("spot"), "{:,.2f}")}</td>'
+            f'<td style="color:{mc};font-weight:700;">{f(mv, "{:+.1f}")}</td>'
+            f'<td>{f(a.get("bias"), "{:+.2f}")}</td><td>{f(a.get("d_like"), "{:+.2f}")}</td>'
+            f'<td>{f(a.get("rr25"), "{:+.2f}")}</td><td>{f(a.get("d_rr25"), "{:+.2f}")}</td></tr>')
+    if not lrows:
+        lrows.append(f'<tr><td colspan="8" style="text-align:left;color:{M};font-family:sans-serif;">'
+                     'No joint confirmation yet today — an entry appears when BOTH tiles show a confirmed '
+                     'move in the same direction.</td></tr>')
+    alert_log = ('<div style="margin-top:10px;background:#fff;border:1px solid #E5E7EB;border-radius:10px;padding:8px 10px;">'
+                 '<div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:6px;align-items:baseline;">'
+                 '<div style="font-size:12px;font-weight:700;color:#5C35CC;">🔔 ALERT LOG · both tiles confirmed, same '
+                 'direction (today, newest first)</div>'
+                 f'<div style="font-size:11.5px;font-weight:800;color:{j_col};">{j_txt}</div></div>'
+                 '<div style="overflow-x:auto;max-height:260px;overflow-y:auto;margin-top:4px;">'
+                 '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:monospace;'
+                 f'text-align:right;" cellpadding="3"><tr>{lhdr}</tr>' + "".join(lrows) + '</table></div>'
+                 '<div style="font-size:10.5px;color:#6B7280;margin-top:4px;">One entry per new joint signal: '
+                 'logged when the bias AND the 25Δ RR are both confirmed (3 snapshots beyond noise) in the same '
+                 'direction; it re-arms only after that joint state breaks or flips. Shared by all visitors, '
+                 'cleared at the start of each day, archived to fdm_alert_archive/YYYY-MM-DD.jsonl.</div></div>')
+    note = ('<div style="font-size:10.5px;color:#6B7280;margin-top:5px;">'
+            'Synthetic F = K + (call mid − put mid)·e<sup>rT</sup> · weight = |call ΔOI × Δ| + |put ΔOI × Δ| (OI change vs previous day) · '
+            'Bias = weighted MEDIAN of (F − spot) over clean strikes (both legs two-sided, spread ≤ 5% of mid; '
+            '&gt; 3 MAD from the median F dropped as stale) · Direction: like-for-like change over strikes present in both snapshots '
+            'with the same weights, compared with a noise floor built from the bid-ask spreads; confirmed after 3 consecutive '
+            'snapshots beyond the floor · Δ cells are grey when inside that strike\'s own quote noise · '
+            'LTP vs day avg = last price ÷ Dhan average_price − 1 (green/red beyond ±2%): calls above and puts below '
+            'their averages largely mirror spot rising since the open — treat as context, not a signal.</div>')
+    return ('<div style="margin-top:12px;">'
+            '<div style="font-size:12px;font-weight:700;color:#5C35CC;margin-bottom:6px;">'
+            'SYNTHETIC-FORWARD BIAS LADDER · 25Δ RR SKEW (ATM ±5) · noise-filtered</div>'
+            f'<div style="display:flex;flex-wrap:wrap;gap:10px;">{t1}{t2}</div>' + table + alert_log + note + '</div>')
+# ══ END v27 synthetic-forward bias ════════════════════════════════════════════
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v27 — ONE SHARED HISTORY (independent of number / frequency of visitors)
+#   • A history tick is recorded ONCE per real Dhan fetch, server-side, keyed by
+#     the fetch id (_fetch_ts).  Visitor reruns call the same idempotent function,
+#     so N visitors (or zero visitors) → exactly one tick per fetch.
+#   • Rolling file nifty_history.json keeps the last 500 ticks exactly as before
+#     (engines see the same window), and every tick is ALSO appended to a
+#     permanent daily archive:  nifty_history_archive/YYYY-MM-DD.jsonl
+# ═══════════════════════════════════════════════════════════════════════════════
+_V27_ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_history_archive")
+
+
+def _v27_record_history_tick(payload, fetch_ts):
+    """Append one history tick for this fetch id (idempotent, never raises)."""
+    try:
+        if not payload or not fetch_ts:
+            return
+        m = payload["metrics"]
+        _recs = payload.get("df_band") or []
+        _cot = sum(r.get("call_oi", 0) for r in _recs)      # same formula as the visitor path
+        _pot = sum(r.get("put_oi", 0) for r in _recs)
+        entry = build_history_entry(
+            m, payload["spot"], _cot, _pot, payload["expiry"],
+            synth_excess=payload.get("synth_excess"),
+            basis_gap=payload.get("basis_gap"),
+            traded_basis=payload.get("traded_basis"),
+        )
+        entry["_fetch_ts"] = fetch_ts
+        with _V27_HIST_LOCK:
+            hist = _load_history()
+            if any(h.get("_fetch_ts") == fetch_ts for h in hist[-20:]):
+                return                      # already recorded by another caller
+            hist.append(entry)
+            _save_history(hist[-500:])
+            try:
+                os.makedirs(_V27_ARCHIVE_DIR, exist_ok=True)
+                _day = str(entry.get("ts", ""))[:10] or date.today().isoformat()
+                with open(os.path.join(_V27_ARCHIVE_DIR, f"{_day}.jsonl"), "a") as _af:
+                    _af.write(json.dumps(_v27_json_clean(entry), allow_nan=False) + "\n")
+            except Exception as _ae:
+                print(f"[v27] archive write skipped: {_ae}", flush=True)
+    except Exception as _e:
+        print(f"[v27] history tick skipped: {_e}", flush=True)
+
+
+_V27_SKEW_ANCHOR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_skew_anchor.json")
+
+
+def _v27_daily_skew_anchor(current_value):
+    """v27: S4 opening skew anchor fixed ONCE PER TRADING DAY for every visitor
+    (was per browser session, so a visitor joining at 11:00 anchored at 11:00)."""
+    today = date.today().isoformat()
+    with _SH["skew_lock"]:
+        try:
+            with open(_V27_SKEW_ANCHOR_FILE, "r") as _f:
+                _a = json.load(_f)
+            if _a.get("date") == today and isinstance(_a.get("value"), (int, float)):
+                return float(_a["value"])
+        except Exception:
+            pass
+        try:
+            _atomic_json_write(_V27_SKEW_ANCHOR_FILE, {"date": today, "value": float(current_value)})
+        except Exception:
+            pass
+        return float(current_value)
+
+
+@st.cache_resource(show_spinner=False)
+def _v27_start_background_fetcher():
+    """v27: one daemon thread per server process (same design as the Dash edition).
+    During market hours it keeps the shared cache — and therefore the shared
+    history — ticking even when nobody has the dashboard open."""
+    import logging as _lg
+    for _ln in ("streamlit.runtime.scriptrunner_utils.script_run_context",
+                "streamlit.runtime.scriptrunner.script_run_context",
+                "streamlit.runtime.caching.cache_data_api"):
+        _lg.getLogger(_ln).setLevel(_lg.ERROR)
+
+    def _loop():
+        print("[v27 BgFetch] background fetcher started (30s interval, market hours).", flush=True)
+        while True:
+            try:
+                if is_market_hours():
+                    _sel = _load_owner_settings().get("selected_expiry")
+                    get_server_data(_sel, _from_bg=True)
+            except Exception as _bfe:
+                print(f"[v27 BgFetch] error: {_bfe}", flush=True)
+            time.sleep(30)
+
+    _t = threading.Thread(target=_loop, daemon=True, name="v27-BgFetcher")
+    _t.start()
+    return _t
+
+
+_v27_start_background_fetcher()
+
+
+# ── Session state initialisation (loads server-side data for every new visitor) ─
+# v27: always read the single shared history from disk (was: seeded once per session)
+st.session_state.history = _load_history()
+
+if "bias_history" not in st.session_state:
+    _bh_disk = _load_bias_history()
+    st.session_state.bias_history = _bh_disk
+    # Set last_ts so we don't immediately duplicate the last entry; fall back to 0 if empty
+    st.session_state.bias_history_last_ts = (
+        float(_bh_disk[-1].get("_ts_unix", 0)) if _bh_disk else 0.0
+    )
+
+# v27: always read the shared smile history from disk
+st.session_state.iv_smile_history = _load_smile_history()
+
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = 0.0
+
+# Fix 7: Regime persistence — track consecutive-tick count per regime tag
+if "gex_regime_state" not in st.session_state:
+    st.session_state.gex_regime_state = {"tag": "", "count": 0}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* Base */
+[data-testid="stAppViewContainer"] { background: #F5F6FA; }
+[data-testid="stHeader"] { background: transparent; }
+div[data-testid="stMetric"] { background:#fff; border-radius:10px; padding:10px 14px;
+    border:1px solid #E5E7EB; box-shadow:0 1px 4px rgba(0,0,0,0.06); }
+.section-header { background:#EEF2FF; border-left:4px solid #5C35CC; border-radius:8px;
+    padding:8px 16px; font-weight:700; font-size:13px; color:#5C35CC;
+    margin-bottom:12px; letter-spacing:0.3px; }
+.card { background:#fff; border-radius:10px; padding:14px 16px; border:1px solid #E5E7EB;
+    box-shadow:0 1px 4px rgba(0,0,0,0.06); margin-bottom:8px; }
+.badge { border-radius:6px; padding:2px 9px; font-size:12px; font-weight:700;
+    display:inline-block; white-space:nowrap; }
+.alert-danger { background:#FEF2F2; border:1px solid #DC2626; border-radius:10px;
+    padding:12px 16px; margin-bottom:12px; }
+.alert-watch  { background:#FFFBEB; border:1px solid #D97706; border-radius:10px;
+    padding:12px 16px; margin-bottom:12px; }
+.alert-none   { background:#ECFDF5; border:1px solid #059669; border-radius:10px;
+    padding:12px 16px; margin-bottom:12px; }
+.data-live  { color:#059669; font-weight:700; font-size:12px; }
+.data-demo  { color:#D97706; font-weight:700; font-size:12px; }
+
+/* ── Mobile & iPad Responsive ─────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .section-header { font-size:12px; padding:7px 12px; }
+  .card { padding:10px 12px; }
+  div[data-testid="stMetric"] { padding:8px 10px; }
+}
+@media (max-width: 600px) {
+  .section-header { font-size:11px; padding:6px 10px; letter-spacing:0; }
+  .card { padding:8px 10px; border-radius:8px; }
+  div[data-testid="stMetric"] { padding:6px 8px; border-radius:8px; }
+  .badge { font-size:10px; padding:2px 7px; }
+  .js-plotly-plot .plotly .gtitle { font-size:10px !important; }
+  /* H22 fix: GRF + Combined Decision grids had no media query — 3-column / 2-column
+     layouts were squishing to ~120px each on 360px phones. Force single column. */
+  .grf-grid-3, .grf-grid-2 { grid-template-columns: 1fr !important; }
+  /* Inline div-based grids (style attribute) can't be targeted via CSS, but
+     st.columns-based layouts already collapse to single column automatically. */
+}
+[data-testid="stAppViewContainer"],
+[data-testid="block-container"] {
+  max-width: 100% !important;
+  overflow-x: hidden !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────────────────────────────────────
+col_h1, col_h2 = st.columns([3, 1])
+with col_h1:
+    st.markdown(f"""
+    <div style="background:#5C35CC;border-radius:12px;padding:14px 22px;margin-bottom:12px;">
+      <div style="color:#fff;font-size:22px;font-weight:800;margin:0;">
+         Shantanu's Options Analysis Dashboard
+      </div>
+      <div style="color:rgba(255,255,255,0.75);font-size:11px;margin-top:3px;">
+        NIFTY 50 · NIFTY Futures · Live F&O Intelligence · Bias Engine · Strategy Engine
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col_h2:
+    mh = is_market_hours()
+    data_status = " LIVE DATA (Dhan API)" if (USE_DHAN and mh) else (" DEMO MODE" if USE_DEMO_MODE else " After-Hours (Dhan Connected)")
+    st.markdown(f"""
+    <div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;padding:10px 14px;text-align:right;margin-top:4px;">
+      <div style="font-size:12px;font-weight:700;color:{'#059669' if USE_DHAN and mh else '#D97706'};">{data_status}</div>
+      <div style="font-size:11px;color:#6B7280;margin-top:2px;">{ist_str()}</div>
+      <div style="font-size:11px;color:#6B7280;">Auto-refresh: {_effective_refresh}s</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA STATUS BANNER
+# ─────────────────────────────────────────────────────────────────────────────
+def _data_status_banner(use_dhan, market_open, use_demo, refresh_secs, data_source=None):
+    """Colour-coded full-width banner showing exactly what data state the app is in.
+
+    CI #10 fix: added `data_source` param so the banner can distinguish a real
+    API ERROR (live mode that failed and fell back to demo) from a genuine
+    demo-mode (no credentials). Previously both showed the same DEMO banner,
+    masking transient API failures.
+    """
+    _now = ist_str("%H:%M:%S IST  |  %a %d %b %Y")
+
+    # CI #10 fix: detect API-error fallback (live mode that failed over to demo)
+    _is_api_error = bool(data_source and "API ERROR" in data_source)
+
+    if _is_api_error:
+        # ── RED — live mode but API call failed; serving stale demo data ──────
+        bg, border = "#FEF2F2", "#DC2626"
+        dot = ""
+        headline = "API ERROR — showing fallback demo data"
+        detail   = ("Dhan API call failed (timeout, rate-limit, or auth issue) · "
+                    "Values shown are <strong>simulated</strong>, not real market data · "
+                    "Will auto-retry on next refresh")
+        if time.time() - _V36.get("auth_fail_ts", 0.0) < 600:      # v37: say exactly what's wrong
+            headline = "DHAN TOKEN REJECTED — showing fallback demo data"
+            detail   = ("Dhan says the <strong>Client ID or Access Token is invalid / expired</strong> (HTTP 401 · code 808). "
+                        "Paste a fresh <code>DHAN_ACCESS_TOKEN</code> into this app's Secrets and reboot · "
+                        "Values shown are <strong>simulated</strong>")
+        label_bg, label_fg = "#DC2626", "#ffffff"
+        label_text = "● API ERROR"
+
+    elif use_dhan and market_open:
+        # ── GREEN — live, everything working ──────────────────────────────────
+        bg, border, dot_color = "#ECFDF5", "#059669", "#059669"
+        dot = ""
+        headline = "LIVE DATA — Calculations are LIVE"
+        detail   = (f"Sourced from <strong>Dhan API</strong> in real time · "
+                    f"Auto-refresh every <strong>{refresh_secs}s</strong> · "
+                    f"Market hours: MonFri 09:1515:30 IST")
+        label_bg, label_fg = "#059669", "#ffffff"
+        label_text = "● LIVE"
+
+    elif use_dhan and not market_open:
+        # ── AMBER — Dhan connected but market closed; data is stale ──────────
+        n = now_ist()
+        is_weekend = n.weekday() >= 5
+        reason = "Weekend" if is_weekend else "Market closed (09:1515:30 IST)"
+        bg, border = "#FFFBEB", "#D97706"
+        dot = ""
+        headline = f"STALE DATA — {reason}"
+        detail   = (f"Last snapshot from <strong>Dhan API</strong> — no new ticks until market reopens · "
+                    f"Auto-refresh every <strong>{refresh_secs}s</strong> to keep app alive")
+        label_bg, label_fg = "#D97706", "#ffffff"
+        label_text = "● STALE"
+
+    else:
+        # ── YELLOW — demo / no credentials ────────────────────────────────────
+        bg, border = "#FEFCE8", "#CA8A04"
+        dot = ""
+        headline = "DEMO MODE — Synthetic data only"
+        detail   = ("No Dhan API credentials configured · All values are <strong>simulated</strong> · "
+                    "Add <code>DHAN_CLIENT_ID</code> and <code>DHAN_ACCESS_TOKEN</code> to Streamlit secrets for live data")
+        label_bg, label_fg = "#CA8A04", "#ffffff"
+        label_text = "● DEMO"
+
+    st.markdown(f"""
+    <div style="
+        background:{bg};
+        border:1.5px solid {border};
+        border-radius:10px;
+        padding:10px 18px;
+        margin-bottom:14px;
+        display:flex;
+        align-items:center;
+        gap:14px;
+        flex-wrap:wrap;
+    ">
+      <span style="
+          background:{label_bg};color:{label_fg};
+          font-size:11px;font-weight:800;letter-spacing:0.8px;
+          border-radius:5px;padding:3px 10px;white-space:nowrap;
+      ">{label_text}</span>
+      <span style="font-size:13px;font-weight:800;color:#1A1A2E;white-space:nowrap;">
+        {dot} {headline}
+      </span>
+      <span style="font-size:11px;color:#374151;flex:1;min-width:180px;">
+        {detail}
+      </span>
+      <span style="font-size:11px;color:#6B7280;white-space:nowrap;margin-left:auto;">
+         {_now}
+      </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+# CI #10 fix: the banner used to be rendered here, BEFORE `payload` was fetched.
+# That meant on the very first run (no payload yet) the API-ERROR branch could
+# never fire. The banner has been MOVED to after the fetch (L~4520) so it can
+# inspect `data_source` from the just-fetched payload.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OWNER SIDEBAR + CONTROLS
+# ─────────────────────────────────────────────────────────────────────────────
+# Fetch expiry list first so sidebar can show it
+_expiry_list = fetch_dhan_expiry_list() if USE_DHAN else []
+sel_expiry, _manual_refresh = _render_owner_sidebar(_expiry_list)
+
+# If owner selected an expiry use it; otherwise auto (nearest)
+if not sel_expiry and _expiry_list:
+    sel_expiry = _expiry_list[0]
+
+# Handle manual refresh triggered from owner sidebar only
+if _manual_refresh:
+    _force_server_refresh()   # expire server cache; next get_server_data() re-fetches from Dhan
+    st.rerun()
+
+# Show a compact read-only expiry label on the main page for all visitors
+with st.container():
+    ctrl_col1, ctrl_col2 = st.columns([3, 1])
+    with ctrl_col1:
+        st.markdown("**Instrument:** NIFTY 50 &nbsp;·&nbsp; "
+                    f"**Expiry:** {sel_expiry if sel_expiry else 'Auto (nearest)'}")
+        st.caption("Read-only live view · Open ⚙️ sidebar to change expiry, refresh rate, or force reload.")
+    with ctrl_col2:
+        st.markdown(f"<div style='text-align:right;font-size:11px;color:#6B7280;padding-top:6px;'>"
+                    f" Auto-refresh: <strong>{_effective_refresh}s</strong></div>",
+                    unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FETCH DATA
+# ─────────────────────────────────────────────────────────────────────────────
+# H24 fix: previously `st.spinner(...)` wrapped get_server_data unconditionally,
+# causing a visible flicker every 60s even when the server cache was fresh
+# (returning in <1ms). Pre-check cache age first; only show spinner when a real
+# network fetch is about to happen.
+_settings_h24  = _load_owner_settings()
+_interval_h24  = _settings_h24.get("refresh_interval", REFRESH_SECONDS)
+_cache_age_h24 = time.time() - _srv_cache.get("last_fetch_ts", 0.0)
+_needs_fetch_h24 = (_cache_age_h24 >= _interval_h24) or (_srv_cache.get("payload") is None)
+
+if _needs_fetch_h24:
+    with st.spinner("Fetching NIFTY option chain"):
+        payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
+else:
+    payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
+
+# CI #10 fix: render the data-status banner HERE (after fetch) so it can inspect
+# `data_source` and distinguish a real API ERROR from genuine DEMO MODE.
+# v27 fix: on a cold start another thread (background fetcher or another visitor) may
+# already be fetching — wait for its result instead of failing immediately.
+if payload is None:
+    with st.spinner("Waiting for the first NIFTY option-chain fetch…"):
+        for _v27_w in range(80):          # up to ~40 s
+            time.sleep(0.5)
+            payload, data_source, _payload_fetch_ts = get_server_data(sel_expiry)
+            if payload is not None:
+                break
+_data_status_banner(USE_DHAN, mh, USE_DEMO_MODE, _effective_refresh, data_source=data_source)
+# v27: the payload object is now shared by all visitors — work on a private copy so
+# no rerun can mutate the shared cache.
+if payload is not None:
+    payload = _v27_copy.deepcopy(payload)
+
+if payload is None:
+    st.error("❌ Could not fetch option chain data. Please check your API credentials or try again.")
+    st.stop()
+
+m        = payload["metrics"]
+spot     = payload["spot"]
+expiry   = payload["expiry"]
+# CHANGE 1 (audit fix): legacy bias is retained ONLY for its regime / vol_regime /
+# near_flip fields (which `strategy_recommendation` consumes for the FLIP / RANGE
+# / PINNED branches). Direction + confidence now come from the Combined Decision
+# panel (writer-positioning convention) — see the adapter below, set after
+# `_combined_decision` is computed.
+bias     = compute_nifty_bias(m, st.session_state.history)
+history  = st.session_state.history
+
+# Append history entry
+df_band_records = payload["df_band"]
+call_oi_total = sum(r.get("call_oi", 0) for r in df_band_records)
+put_oi_total  = sum(r.get("put_oi", 0)  for r in df_band_records)
+hist_entry    = build_history_entry(
+    m, spot, call_oi_total, put_oi_total, expiry,
+    synth_excess=payload.get("synth_excess"),
+    basis_gap=payload.get("basis_gap"),
+    traded_basis=payload.get("traded_basis"),
+)
+# Tag with server fetch timestamp for dedup.
+# Multiple visitors refreshing against the same cached server snapshot must
+# produce exactly ONE history entry — not one per visitor per refresh.
+hist_entry["_fetch_ts"] = _payload_fetch_ts
+# Only append if this is a genuinely new Dhan data fetch (fetch_ts changed)
+# v27: ONE shared history — idempotent server-side recorder (dedup on fetch id),
+# then re-read the shared file so every visitor sees the identical history.
+_v27_record_history_tick(payload, _payload_fetch_ts)
+history = _load_history()
+history = history[-500:]
+st.session_state.history = history
+
+# ── Fix #2: today-only history for session-sensitive intraday functions ───────
+# Full `history` (up to 500 ticks, multi-day) is kept for compute_temporal_iv_rank
+# which needs cross-day context to compute a meaningful IV percentile.
+# All session-bucketed functions (DW flow, raw OI, sentiments, Section 5 baseline)
+# only make sense within the current trading day — yesterday's 09:30 bucket must
+# not merge with today's 09:30.
+_today_str    = date.today().isoformat()                           # e.g. "2026-06-27"
+today_history = [h for h in history if h.get("ts", "").startswith(_today_str)]
+# ── end Fix #2 setup ──────────────────────────────────────────────────────────
+
+# ── Fix #4: Adaptive NORMAL_SKEW_BASELINE ─────────────────────────────────────
+# Compute a trailing median of norm_skew over recent neutral-regime sessions
+# (|s34_score| < 20) from persisted bias history, rather than using the hardcoded
+# value of 30.0.  Requires norm_skew to be stored in bias_history entries
+# (added below in the bias-history append block).  Falls back to 30.0 until
+# ≥5 neutral-session data points accumulate.
+_bh_for_baseline = _load_bias_history()   # mtime-cached — cheap second call
+_neutral_skews = [
+    float(x["norm_skew"])
+    for x in _bh_for_baseline
+    if abs(safe_num(x.get("score", 999))) < 20   # neutral session
+    and isinstance(x.get("norm_skew"), (int, float))
+]
+if len(_neutral_skews) >= 5:
+    _adaptive_skew_baseline = round(
+        float(sorted(_neutral_skews)[len(_neutral_skews) // 2]), 1   # median
+    )
+else:
+    _adaptive_skew_baseline = 30.0   # not enough history yet — use default
+# ── end Fix #4 setup ──────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MARKET BIAS SUMMARY (top-level)
+# NOTE (CHANGE 2 audit fix): `bs`/`regime` here come from the legacy
+# `compute_nifty_bias` engine, which uses SIGNED delta × OI (net_delta). That
+# measures dealer hedge-flow pressure, NOT writer positioning. The number is
+# still useful as a hedge-flow read, but should not be interpreted as the
+# authoritative directional bias — that role belongs to the S3/4 engine below.
+# ─────────────────────────────────────────────────────────────────────────────
+bs              = bias["bias_score"]
+bc              = GREEN if bs > 15 else (RED if bs < -15 else AMBER)
+direction_label = bias["direction"]
+regime          = bias["regime"]
+# ── Section 3 & 4 bias (5-signal engine) — recorded every 5 minutes ──────────
+# Step 0: Roll detection — fetch back-expiry full OI band to assess whether
+# near-ATM OI changes are mechanical roll vs genuine directional activity.
+# This runs BEFORE S34 bias so the roll_discount reaches S2 at score time.
+_roll_back_exp     = _expiry_list[1] if len(_expiry_list) > 1 else None
+_back_oi_band_df   = fetch_back_expiry_oi_band(_roll_back_exp) if _roll_back_exp else None
+_front_df_for_roll = pd.DataFrame(payload["df_band"]) if payload.get("df_band") else None
+_roll_data         = detect_roll_activity(_front_df_for_roll, _back_oi_band_df, spot)
+_s34_bias = compute_section34_bias(
+    payload["df_band"], m, spot,
+    roll_discount=_roll_data["momentum_discount"],
+    front_expiry=_expiry_list[0] if _expiry_list else None,   # Fix #3: dynamic roll weekday
+    skew_baseline=_adaptive_skew_baseline,                     # Fix #4: adaptive S4 baseline
+)
+_s34_score = _s34_bias["bias_score"]
+_s34_breakdown = _s34_bias.get("signal_breakdown", {})
+
+# ── v4.1 S4 FIX: Option 2 — Intraday Skew Momentum Anchor (±3 pts) ──────────
+# The ATM-normalised skew (Option 1, inside compute_section34_bias) removes the
+# chronic bearish baseline. This block adds the intraday DIRECTIONAL component:
+# has fear been building or easing SINCE THE SESSION OPEN?
+#
+# session_state.opening_norm_skew is set on the first refresh each session and
+# held fixed. Each subsequent refresh measures the change from that anchor.
+# A rising norm_skew intraday = fear building = bearish contribution (up to −3 pts).
+# A falling norm_skew intraday = fear easing  = bullish contribution (up to +3 pts).
+#
+# This naturally resets at the start of each new session (Streamlit restarts) and
+# requires zero stored history beyond the current session.
+_current_norm_skew = _s34_bias.get("norm_skew", 30.0)
+# v27: anchor fixed once per trading day for all visitors (was once per browser session)
+st.session_state.opening_norm_skew = _v27_daily_skew_anchor(_current_norm_skew)
+_delta_skew = _current_norm_skew - st.session_state.opening_norm_skew
+# 15 pct-point intraday change → full ±3 pts; sign: rising skew = bearish (negative)
+_s4_intra = max(-3.0, min(3.0, -(_delta_skew / 15.0) * 3.0))
+# Merge into bias score and breakdown (S4 now reflects level + intraday momentum)
+_s34_bias["bias_score"] = max(-100.0, min(100.0, _s34_bias["bias_score"] + _s4_intra))
+_s34_bias["signal_breakdown"]["S4 IV Skew"] = round(
+    _s34_bias["signal_breakdown"].get("S4 IV Skew", 0.0) + _s4_intra, 1
+)
+# Refresh local aliases so all downstream code sees the updated values
+_s34_score     = _s34_bias["bias_score"]
+_s34_breakdown = _s34_bias.get("signal_breakdown", {})
+# ── end S4 intraday anchor ────────────────────────────────────────────────────
+
+# ── Early IV smile call for the Combined Bias panel (Chapter 17 & 18) ────
+# Uses df_band already loaded above; relies on smile session history if available.
+_early_smile_hist = st.session_state.get("iv_smile_history", [])
+_early_df_band    = pd.DataFrame(payload["df_band"]) if payload.get("df_band") else None
+_early_smile      = classify_iv_smile_scenario(
+    _early_df_band, m, spot, _early_smile_hist
+) if _early_df_band is not None else None
+# ── end early IV smile call ───────────────────────────────────────────────
+
+# ── Enhanced Price Confirmation Layer  (v7 — surgical addition) ──────────────
+# Module A: VWAP + Opening Range
+_intraday_candles  = fetch_nifty_intraday_candles()
+_vwap_or_data      = compute_vwap_opening_range(_intraday_candles)
+
+# Module B: Term Structure (front vs back expiry ATM IV)
+_back_expiry       = _expiry_list[1] if len(_expiry_list) > 1 else None
+_back_atm_iv       = fetch_back_expiry_atm_iv(_back_expiry) if _back_expiry else None
+_ts_data           = compute_term_structure_signal(
+    safe_num(m.get("atm_iv", 0)), _back_atm_iv,
+    front_expiry=_expiry_list[0] if _expiry_list else None,   # v4.1: dynamic expiry-day suppression
+)
+
+# ── v4.1 S5 REPLACEMENT: IV Term Structure Injection (±8 pts) ────────────────
+# compute_section34_bias() leaves s5 = 0.0 (placeholder). We inject the real
+# value here because _ts_data is not available inside that function.
+#
+# DTE confidence weight: the term structure comparison becomes noise-dominated
+# when the front expiry has very few days left (IV collapses erratically).
+# Weight tapers from 1.0 (≥4 days, Monday) → 0.75 (3 days) → 0.50 (2 days, Wed)
+# → 0.0 (1 day). Expiry day itself is already suppressed to ts_score=0
+# inside compute_term_structure_signal() itself — no additional guard needed.
+#
+# This replaces PCR Contrarian (S5) which was correlated with S1 (both use
+# put_OI / call_OI). IV term structure uses a completely different data source.
+from datetime import date as _dte_date_cls
+try:
+    _dte_front = max(1, (_dte_date_cls.fromisoformat(_expiry_list[0]) - _dte_date_cls.today()).days) \
+                 if _expiry_list else 4
+except Exception:
+    _dte_front = 4   # safe fallback: assume normal Monday-like DTE
+
+if   _dte_front >= 4: _s5_dte_weight = 1.00   # Mon / any day with ≥4 days left
+elif _dte_front == 3: _s5_dte_weight = 0.75   # Tuesday — mild suppression
+elif _dte_front == 2: _s5_dte_weight = 0.50   # Wednesday — moderate suppression
+else:                 _s5_dte_weight = 0.00   # 1 day left: fully suppress
+
+_s5_ts = round(_ts_data.get("ts_score", 0.0) * _s5_dte_weight, 1)
+# Inject into the running bias score and breakdown
+_s34_bias["bias_score"] = max(-100.0, min(100.0, _s34_bias["bias_score"] + _s5_ts))
+_s34_bias["signal_breakdown"]["S5 Term Str"] = _s5_ts
+_s34_score     = _s34_bias["bias_score"]
+_s34_breakdown = _s34_bias.get("signal_breakdown", {})
+# ── end S5 term structure injection ──────────────────────────────────────────
+
+# Module C: India VIX
+_vix_raw           = fetch_india_vix_ltp()
+# Maintain a lightweight intraday VIX history in session_state for spike detection
+# v27: one VIX history shared by all visitors of this server process
+_v27_vix = _SH["vix_history"]
+if _vix_raw > 0:
+    with _SH["vix_lock"]:
+        if not _v27_vix or _v27_vix[-1] != _vix_raw:
+            _v27_vix.append(_vix_raw)
+            del _v27_vix[:-30]
+st.session_state.vix_history = list(_v27_vix)
+_vix_data          = classify_vix_signal(_vix_raw, st.session_state.vix_history)
+
+# Aggregate into Enhanced Price Bias
+_enhanced_bias     = compute_enhanced_price_bias(
+    _vwap_or_data, _ts_data, _vix_data, _s34_score, spot
+)
+# ── end Enhanced Price Confirmation Layer ─────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════
+# v4 IMPROVEMENTS — All new computations inserted here
+# ═══════════════════════════════════════════════════════════════════
+
+# ── v4 #5: Feed Enhanced Price Layer into Combined Decision ──────────
+_combined_decision = generate_combined_decision(_s34_bias, _early_smile, m, _enhanced_bias)
+
+# ── v4 #1: Bias Velocity (Signal 6) — computed here where bias_history is available ──
+_bias_hist = st.session_state.get("bias_history", [])
+if len(_bias_hist) >= 3:
+    _recent_scores = [safe_num(x.get("score", 0)) for x in _bias_hist[-4:]]
+    _recent_scores.append(float(_s34_score))
+    _velocity = _recent_scores[-1] - _recent_scores[-2]
+    _accel = (_recent_scores[-1] - _recent_scores[-2]) - (_recent_scores[-2] - _recent_scores[-3]) if len(_recent_scores) >= 3 else 0.0
+    # Scale: 20-pt change over 1 tick = full ±10 score
+    _s6 = max(-10.0, min(10.0, (_velocity / 20.0) * 10.0))
+    # Update the bias score with velocity
+    _s34_score_v4 = max(-100.0, min(100.0, _s34_score + _s6))
+    _s34_bias["bias_score"] = _s34_score_v4
+    if _s34_score_v4 >= 15: _s34_bias["direction"] = "BULLISH"
+    elif _s34_score_v4 <= -15: _s34_bias["direction"] = "BEARISH"
+    else: _s34_bias["direction"] = "NEUTRAL"
+    _s34_bias["signal_breakdown"]["S6 Velocity"] = round(_s6, 1)
+else:
+    _velocity = 0.0; _accel = 0.0; _s6 = 0.0; _s34_score_v4 = _s34_score
+
+# ── CHANGE 1 (audit fix): Rewire strategy_recommendation to Combined Decision ──
+# The legacy `bias` dict (compute_nifty_bias) uses signed-delta net_delta as a
+# directional signal — that's a hedge-flow metric, not a writer-positioning
+# metric. The Combined Decision panel's `_s34_bias["direction"]` is the correct
+# writer-positioning read (|Δ|-weighted, put-writing = bullish convention).
+#
+# We preserve `regime / vol_regime / near_flip` from the legacy bias because
+# `strategy_recommendation` consumes them for the FLIP / RANGE / PINNED
+# branches (and those regime classifications come from `classify_gamma_regime`,
+# which is conceptually independent of the directional convention).
+#
+# We also preserve the legacy `confidence` (not `enhanced_conf`) because the
+# WAIT threshold `BIAS_WEIGHTS["confidence_min_strategy"]=35` was tuned against
+# the legacy ~73-max scale. Switching to enhanced_conf (0-100) would shift the
+# effective threshold — leave that for a follow-up calibration pass.
+_strat_bias = {
+    "direction":  _s34_bias.get("direction", "NEUTRAL"),
+    "confidence": bias.get("confidence", 0),
+    "regime":     bias.get("regime", "TRANSITION"),
+    "vol_regime": bias.get("vol_regime", "MID_VOL"),
+    "near_flip":  bias.get("near_flip", False),
+}
+strat = strategy_recommendation(_strat_bias, m, st.session_state.history)
+
+# ── v4 #4: Divergence Proximity Score (0-100) ─────────────────────────
+def _compute_divergence_proximity(s34_score, scenario_id, pcr, iv_rank):
+    """How close are we to triggering any of the 5 divergence types?
+    Returns 0-100. >= 60 triggers an APPROACHING DIVERGENCE alert."""
+    scores = []
+    # Type 1 proximity: S3/4 approaching strong bear AND smile approaching crash fear
+    t1_s34 = max(0, min(100, (abs(s34_score) - 40) / 11 * 100)) if s34_score < -40 else 0
+    t1_smile = max(0, min(100, (iv_rank - 50) / 15 * 100)) if iv_rank > 50 else 0
+    if scenario_id in (1, 2, 3): t1_smile = max(t1_smile, 60)
+    scores.append((t1_s34 + t1_smile) / 2)
+    # Type 2 proximity: S3/4 approaching strong bull AND smile has any put skew
+    t2_s34 = max(0, min(100, (s34_score - 40) / 11 * 100)) if s34_score > 40 else 0
+    t2_smile = 70 if scenario_id in (1, 3) else (30 if scenario_id in (2, 9) else 0)
+    scores.append((t2_s34 + t2_smile) / 2)
+    # Type 3 proximity: S3/4 narrowing to neutral AND IV rank compressing
+    t3_neutral = max(0, min(100, (15 - abs(s34_score)) / 15 * 100)) if abs(s34_score) < 15 else 0
+    t3_compress = max(0, min(100, (25 - iv_rank) / 5 * 100)) if iv_rank < 25 else 0
+    scores.append((t3_neutral + t3_compress) / 2)
+    # Type 5 proximity: PCR approaching extreme AND S3/4 moderately biased
+    t5_pcr = 0
+    if pcr < 0.70: t5_pcr = max(0, min(100, (0.70 - pcr) / 0.20 * 100))
+    elif pcr > 1.55: t5_pcr = max(0, min(100, (pcr - 1.55) / 0.25 * 100))
+    t5_s34 = max(0, min(100, (abs(s34_score) - 15) / 15 * 100)) if abs(s34_score) > 15 else 0
+    scores.append((t5_pcr + t5_s34) / 2)
+    return round(max(scores), 1) if scores else 0.0
+
+_div_proximity = _compute_divergence_proximity(
+    _s34_score, _early_smile.get("scenario_id", 0) if _early_smile else 0,
+    m.get("pcr", 1.0), m.get("iv_rank", 50)
+)
+
+# ── v4 #8: Gamma Flip Proximity ──────────────────────────────────────
+_gamma_flip_val = m.get("gamma_flip")
+_gamma_flip_proximity = None
+if _gamma_flip_val and _gamma_flip_val > 0 and spot > 0:
+    _flip_dist = abs(spot - _gamma_flip_val)
+    _wall_w = safe_num(m.get("wall_width", 400))
+    _step = max(_wall_w / 20, 50)
+    _proximity_threshold = max(2.0 * _step, 100)
+    _gamma_flip_proximity = {
+        "flip_strike": round(_gamma_flip_val, 0),
+        "distance_pts": round(_flip_dist, 1),
+        "threshold_pts": round(_proximity_threshold, 1),
+        "pct_of_threshold": round(_flip_dist / _proximity_threshold * 100, 1) if _proximity_threshold > 0 else 0,
+        "side": "ABOVE" if spot > _gamma_flip_val else "BELOW",
+        "zone": "FLIP_ZONE" if _flip_dist < _proximity_threshold else "SAFE",
+        "regime_risk": "HIGH" if _flip_dist < _step else ("ELEVATED" if _flip_dist < _proximity_threshold else "LOW"),
+    }
+
+# ── v4 #7: OI Momentum Exhaustion ────────────────────────────────────
+_oi_exhaustion = None
+if len(_bias_hist) >= 5:
+    _mom_hist = [safe_num(x.get("s2", 0)) for x in _bias_hist[-6:]]
+    _mom_hist.append(_s34_bias["signal_breakdown"].get("S2 Momentum", 0))
+    if len(_mom_hist) >= 5:
+        _sign = 1 if _mom_hist[-1] > 0 else (-1 if _mom_hist[-1] < 0 else 0)
+        if _sign != 0:
+            _signed = [v * _sign for v in _mom_hist]
+            _all_positive = all(v > 0 for v in _signed)
+            if _all_positive:
+                _magnitudes = [abs(v) for v in _mom_hist]
+                _recent_mag = np.mean(_magnitudes[-2:])
+                _earlier_mag = np.mean(_magnitudes[:3]) if len(_magnitudes) >= 3 else _recent_mag
+                _exhaust_ratio = _recent_mag / _earlier_mag if _earlier_mag > 0.5 else 1.0
+                _oi_exhaustion = {
+                    "direction": "BULL" if _sign > 0 else "BEAR",
+                    "exhaust_ratio": round(_exhaust_ratio, 2),
+                    "exhausting": _exhaust_ratio < 0.50,
+                    "label": ("EXHAUSTING" if _exhaust_ratio < 0.50 else
+                             "FADING" if _exhaust_ratio < 0.75 else "STRONG"),
+                    "color": ("#DC2626" if _exhaust_ratio < 0.50 else
+                             "#F59E0B" if _exhaust_ratio < 0.75 else "#059669"),
+                }
+
+# ── v4 #6: Inter-Expiry OI Flow / Roll Signal ─────────────────────────
+_inter_expiry_signal = None
+if len(_expiry_list) > 1 and USE_DHAN:
+    try:
+        _back_exp = _expiry_list[1]
+        # CI #8 fix: use the cached wrapper so concurrent visitors don't each
+        # fire a fresh Dhan POST for the back expiry (was violating ~1-req/3s
+        # rate limit). 5-min TTL on the cached wrapper is sufficient because
+        # roll detection doesn't need per-minute granularity.
+        _back_chain, _, _ = fetch_dhan_option_chain_cached(_back_exp)
+        if not _back_chain.empty:
+            _back_m = compute_metrics(_back_chain, spot, _back_exp)
+            if _back_m:
+                _front_pcr = m.get("pcr", 1.0)
+                _back_pcr = _back_m.get("pcr", 1.0)
+                _pcr_diff = _front_pcr - _back_pcr
+                _front_mom = safe_num(m.get("momentum", 0))
+                _back_mom = safe_num(_back_m.get("momentum", 0))
+                # Roll detection: front momentum fading while back building
+                _roll_signal = None
+                if abs(_front_mom) < abs(_back_mom) * 0.3 and abs(_back_mom) > 500:
+                    _roll_dir = "BEAR" if _back_mom < 0 else "BULL"
+                    _roll_signal = f"Rolling {_roll_dir} to next expiry"
+                _inter_expiry_signal = {
+                    "front_pcr": round(_front_pcr, 2),
+                    "back_pcr": round(_back_pcr, 2),
+                    "pcr_diff": round(_pcr_diff, 2),
+                    "front_momentum": round(_front_mom, 0),
+                    "back_momentum": round(_back_mom, 0),
+                    "roll_signal": _roll_signal,
+                    "available": True,
+                }
+    except Exception:
+        pass
+
+# ── v4 #3: Smart Money OI Quality Filter (applied to history entry) ────
+# Store smart money filtered metrics for next tick's use
+if "_smart_money_stats" not in st.session_state:
+    st.session_state._smart_money_stats = {}
+
+
+_now_bias = time.time()
+# Dedup on server fetch timestamp, not wall-clock time.
+# Reading from disk catches entries written by OTHER visitor sessions, preventing
+# duplicate bias points from multiple simultaneous visitors.
+# v27: read-dedup-append-write is atomic across visitors
+with _SH["bias_lock"]:
+    _bh_disk_cur = _load_bias_history()
+    _last_bh_fetch_ts = float(_bh_disk_cur[-1].get("_fetch_ts", 0)) if _bh_disk_cur else 0.0
+
+    if _payload_fetch_ts != _last_bh_fetch_ts:
+        # Start from the freshest disk state so no visitor session goes out of sync
+        _bh_tmp = _bh_disk_cur
+        _bh_tmp.append({
+            "ts":        datetime.fromtimestamp(_payload_fetch_ts, tz=IST).strftime("%H:%M"),
+            "_ts_unix":  _payload_fetch_ts,
+            "_fetch_ts": _payload_fetch_ts,   # server fetch id — used for cross-session dedup
+            "spot":      spot,
+            "score":     float(_s34_score),
+            "direction": _s34_bias["direction"],
+            "s1":        _s34_breakdown.get("S1 Net OI",     0.0),
+            "s2":        _s34_breakdown.get("S2 Momentum",   0.0),
+            "s3":        _s34_breakdown.get("S3 Key Levels", 0.0),
+            "s4":        _s34_breakdown.get("S4 IV Skew",    0.0),
+            "s5":        _s34_breakdown.get("S5 Term Str",   0.0),
+            "s6":        _s34_breakdown.get("S6 Velocity",   0.0),
+            # Fix #4: store norm_skew so adaptive NORMAL_SKEW_BASELINE can self-calibrate
+            "norm_skew": float(_s34_bias.get("norm_skew", 30.0)),
+        })
+        st.session_state.bias_history = _bh_tmp[-60:]   # ~5 hrs at data-refresh cadence
+        st.session_state.bias_history_last_ts = _now_bias
+        _save_bias_history(st.session_state.bias_history)   # persist for mid-session joiners
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GREEK RISK FRAMEWORK — Intraday Bias & Confidence Score           (v1.0)
+# Derived from live metrics already computed above:
+#   Net Delta · OI Momentum · GEX · Gamma Walls · PCR · Max Pain · IV Rank
+# Scoring: Gamma (0-3) + Delta (0-3) + Momentum (0-4) = 0-10
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _compute_grf(m_dict, spot_px):
+    """Greek Risk Framework scorer — all inputs from compute_metrics() dict."""
+    nd      = safe_num(m_dict.get("net_delta",           0))
+    mom     = safe_num(m_dict.get("momentum",            0))
+    gex     = safe_num(m_dict.get("gex",                 0))
+    d_res   = safe_num(m_dict.get("dist_to_resistance",  0))   # resistance - spot  (>0 = spot below wall)
+    d_sup   = safe_num(m_dict.get("dist_to_support",     0))   # spot - support      (>0 = spot above wall)
+    mp_val  = safe_num(m_dict.get("max_pain",       spot_px))
+    pcr     = safe_num(m_dict.get("pcr",                1.0))
+    iv_r    = safe_num(m_dict.get("iv_rank",             50))
+    gflip   = m_dict.get("gamma_flip")
+    sup_w   = safe_num(m_dict.get("support",             0))
+    res_w   = safe_num(m_dict.get("resistance",          0))
+    fac     = []
+
+    # BUG 3 FIX — adaptive noise floor: scale thresholds to actual OI size.
+    # Quiet days have low absolute net_delta; active days have high values.
+    # Using 0.1% / 0.05% of total wide-band OI as the meaningful-signal floor.
+    _oi_scale = max(1.0, safe_num(m_dict.get("call_oi_total", 0)) + safe_num(m_dict.get("put_oi_total", 0)))
+    nd_sig    = abs(nd)  > max(100, _oi_scale * 0.001)
+    mom_sig   = abs(mom) > max(50,  _oi_scale * 0.0005)
+
+    # 1. Gamma Score (0-3): range quality from GEX + wall distances ──────────
+    g = 0
+    # BUG 1 FIX — only award buffer points when spot is INSIDE the S/R band.
+    # When d_res ≤ 0 spot has broken above resistance; when d_sup ≤ 0 spot has
+    # broken below support. Using abs() on a negative distance made a breakout
+    # falsely look like a safe buffer. Instead: breakout = 0 gamma score.
+    inside_band = (d_res > 0) and (d_sup > 0)
+    if inside_band:
+        min_buf = (min(d_res, d_sup) / spot_px * 100) if spot_px > 0 else 0
+        if   min_buf > 1.0: g += 2; fac.append(f"Walls {min_buf:.1f}% from spot — safe sell range")
+        elif min_buf > 0.5: g += 1; fac.append(f"Moderate wall buffer ({min_buf:.1f}%)")
+        else:                        fac.append(f"Walls very close ({min_buf:.1f}%) — elevated gamma risk")
+        if gex > 0: g += 1
+    else:
+        broke_dir = "above resistance" if d_res <= 0 else "below support"
+        fac.append(f"⚠ Spot {broke_dir} — gamma range breached, avoid selling")
+    g = min(g, 3)
+
+    # 2. Delta Score (0-3): net delta direction + confirming anchors ──────────
+    d = 0
+    nd_bull = nd > 0
+    if nd_sig:
+        d += 1
+        fac.append(f"Net delta {'bullish' if nd_bull else 'bearish'} ({nd:+,.0f})")
+    if nd_sig and mp_val > 0 and spot_px > 0:
+        mp_bull = mp_val > spot_px
+        if nd_bull == mp_bull and abs(mp_val - spot_px) > 20:
+            d += 1
+            fac.append(f"Max pain ({int(mp_val)}) confirms {'upside' if mp_bull else 'downside'} pull")
+    if nd_sig and gflip is not None:
+        gf = safe_num(gflip)
+        if gf > 0 and (spot_px > gf) == nd_bull:
+            d += 1
+            fac.append(f"Spot {'above' if spot_px > gf else 'below'} gamma flip ({int(gf)}) — regime aligned")
+    d = min(d, 3)
+
+    # 3. Momentum Score (0-4): OI flow direction + PCR + IV rank ─────────────
+    ms       = 0
+    mom_bull = mom > 0
+    if not mom_sig:
+        ms = 1   # flat/negligible flow — neutral
+    elif nd_sig and mom_bull == nd_bull:
+        ms = 3
+        fac.append(f"OI momentum confirms {'bullish' if mom_bull else 'bearish'} flow ({mom:+,.0f})")
+    elif nd_sig and mom_bull != nd_bull:
+        ms = 0
+        fac.append(f"⚠ Momentum contradicts net delta — divergence, cut size")
+    else:
+        ms = 2
+    if nd_sig:
+        if nd_bull and pcr >= 1.2:
+            ms = min(ms + 1, 4); fac.append(f"PCR {pcr:.2f} confirms bullish support")
+        elif not nd_bull and pcr <= 0.8:
+            ms = min(ms + 1, 4); fac.append(f"PCR {pcr:.2f} confirms bearish pressure")
+    if   iv_r <= 35: ms = min(ms + 1, 4)   # calm IV = ideal sell environment
+    elif iv_r >= 70: ms = max(ms - 1, 0)   # high IV = elevated risk
+    ms = min(ms, 4)
+
+    total = g + d + ms
+
+    # BUG 2 FIX — exhaustive label logic so momentum-only signals surface correctly.
+    # Original had mom<=0 / mom>=0 in the mixed branches, swallowing the flat-momentum
+    # and momentum-only cases into a silent "NEUTRAL" that hid real directional flow.
+    if   nd > 0 and mom > 0:   bias_s = "BULLISH"
+    elif nd < 0 and mom < 0:   bias_s = "BEARISH"
+    elif nd > 0 and mom < 0:   bias_s = "MIXED — delta bull / momentum fading"
+    elif nd < 0 and mom > 0:   bias_s = "MIXED — delta bear / momentum recovering"
+    elif nd > 0:               bias_s = "BULLISH (flat momentum)"
+    elif nd < 0:               bias_s = "BEARISH (flat momentum)"
+    elif mom > 0:              bias_s = "NEUTRAL — flow tilting bullish"
+    elif mom < 0:              bias_s = "NEUTRAL — flow tilting bearish"
+    else:                      bias_s = "NEUTRAL"
+
+    # Conviction label + recommendation
+    if   total >= 8: conv, cc, sl, rtxt = "HIGH CONVICTION", "#059669", "Full size",  "All Greeks aligned. Deploy full planned size within the gamma range."
+    elif total >= 6: conv, cc, sl, rtxt = "GOOD SETUP",      "#10B981", "Standard",   "Most signals confirm. Trade standard size; monitor the weakest Greek."
+    elif total >= 4: conv, cc, sl, rtxt = "MODERATE",        "#D97706", "Half size",  "Mixed signals. Half size only, or wait 30–60 min for clarity."
+    elif total >= 2: conv, cc, sl, rtxt = "LOW",             "#F59E0B", "Avoid",      "Greeks not aligned. Watch only — do not deploy capital now."
+    else:            conv, cc, sl, rtxt = "NO TRADE",        "#DC2626", "Stay out",   "Conflicting signals. Protect capital and wait for a cleaner setup."
+
+    iv_env = "Low IV — ideal" if iv_r <= 35 else ("High IV — caution" if iv_r >= 70 else "Mid IV — ok")
+    return dict(
+        total=total, g=g, d=d, ms=ms,
+        bias_s=bias_s, conv=conv, cc=cc, sl=sl, rtxt=rtxt,
+        fac=fac[:4],
+        gamma_range=f"{int(sup_w)}–{int(res_w)}" if sup_w and res_w else "—",
+        iv_env=iv_env, iv_r=iv_r,
+    )
+
+_grf        = _compute_grf(m, spot)
+_grf_dc     = GREEN if _grf["bias_s"] == "BULLISH" else (RED if _grf["bias_s"] == "BEARISH" else AMBER)
+_grf_fac_html = "".join(
+    f'<div style="font-size:11px;color:#374151;padding:2px 0;line-height:1.4;">&#9656; {f}</div>'
+    for f in _grf["fac"]
+) or '<div style="font-size:11px;color:#9CA3AF;">Collecting signals…</div>'
+
+def _gbar(v, mx, clr):
+    pct = int(v / mx * 100)
+    return (f'<div style="background:#F3F4F6;border-radius:4px;height:7px;margin-top:4px;">'
+            f'<div style="width:{pct}%;background:{clr};height:7px;border-radius:4px;"></div></div>')
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ⚡ ENHANCED BIAS PANEL — TOP OF DASHBOARD  (v7 addition)
+# Combines existing S3/4 options flow with three new live layers:
+#   VWAP + Opening Range · Term Structure (front/back IV) · India VIX
+# Renders BEFORE all other sections. No existing code touched below this block.
+# ═════════════════════════════════════════════════════════════════════════════
+def _render_enhanced_bias_panel(eb, vwap_or, ts, vix, cd, spot_px, metrics):
+    """
+    Top-of-dashboard panel surfacing the four-layer Enhanced Price Bias.
+    All arguments are pre-computed above; this function is purely presentational.
+    """
+    esc   = eb["enhanced_score"]
+    ecol  = eb["color"]
+    edir  = eb["direction"]
+    econf = eb["enhanced_conf"]
+    eagr  = eb["agreement_pct"]
+    nsig  = eb["new_signals_available"]
+
+    # ── Helper: small info chip ───────────────────────────────────────────────
+    def _chip(label, value, color, bg=None):
+        bg = bg or f"{color}18"
+        return (f'<span style="background:{bg};color:{color};border:1px solid {color};'
+                f'border-radius:5px;padding:2px 9px;font-size:11px;font-weight:700;'
+                f'white-space:nowrap;">{label}: {value}</span>')
+
+    # ── Row 1: main badge + score bar ─────────────────────────────────────────
+    bar_pct = int(abs(esc))
+    bar_color = ecol
+    score_bar = (
+        f'<div style="background:#F3F4F6;border-radius:4px;height:8px;margin:6px 0 4px 0;">'
+        f'<div style="width:{bar_pct}%;background:{bar_color};height:8px;border-radius:4px;'
+        f'transition:width 0.4s;"></div></div>'
+    )
+
+    # ── Row 2: four signal chips ──────────────────────────────────────────────
+    s34_col  = "#059669" if eb["s34_score"] > 10 else ("#DC2626" if eb["s34_score"] < -10 else "#6B7280")
+    chips_html = " ".join([
+        _chip("S3/4", f"{eb['s34_score']:+.0f}", s34_col),
+        _chip("VWAP/OR",
+              f"{eb['price_score']:+.0f}" if vwap_or else "—",
+              vwap_or["price_color"] if vwap_or else "#6B7280"),
+        _chip("Term Struct",
+              ts["regime"].replace("_"," ") if ts and ts["available"] else "—",
+              ts["ts_color"] if ts and ts["available"] else "#6B7280"),
+        _chip("VIX",
+              f"{vix['vix']:.1f}" if vix and vix["available"] else "—",
+              vix["vix_color"] if vix and vix["available"] else "#6B7280"),
+    ])
+
+    # ── Row 3: detail lines for each new signal ───────────────────────────────
+    detail_lines = []
+    if vwap_or and vwap_or.get("n_candles", 0) > 5:
+        detail_lines.append(
+            f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+            f'<strong>VWAP</strong> {vwap_or["vwap"]:,.1f} &nbsp;·&nbsp; '
+            f'OR {vwap_or["or_low"]:,.0f}–{vwap_or["or_high"]:,.0f} &nbsp;·&nbsp; '
+            f'<span style="color:{vwap_or["price_color"]};font-weight:700;">{vwap_or["price_label"]}</span>'
+            f'</div>'
+        )
+    elif not USE_DHAN:
+        detail_lines.append(
+            '<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+            '&#9642; VWAP/OR: unavailable in demo mode</div>'
+        )
+    else:
+        detail_lines.append(
+            '<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+            '&#9642; VWAP/OR: building (need 5+ candles — session starting)</div>'
+        )
+
+    if ts and ts["available"]:
+        detail_lines.append(
+            f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+            f'<strong>Term Structure</strong> — <span style="color:{ts["ts_color"]};font-weight:700;">'
+            f'{ts["ts_label"]}</span></div>'
+        )
+    else:
+        detail_lines.append(
+            '<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+            '&#9642; Term Structure: single expiry only (back-month data unavailable)</div>'
+        )
+
+    if vix and vix["available"]:
+        chg_str = (f' &nbsp;·&nbsp; Δ {vix["vix_change"]:+.2f} pts this tick'
+                   if vix["vix_change"] is not None else "")
+        detail_lines.append(
+            f'<div style="font-size:11px;color:#374151;padding:2px 0;">&#9642; '
+            f'<strong>India VIX</strong> — <span style="color:{vix["vix_color"]};font-weight:700;">'
+            f'{vix["vix_label"]}</span>{chg_str}</div>'
+        )
+    else:
+        detail_lines.append(
+            '<div style="font-size:11px;color:#9CA3AF;padding:2px 0;">'
+            '&#9642; India VIX: not available via Dhan API on this account</div>'
+        )
+
+    details_html = "\n".join(detail_lines)
+
+    # ── Agreement indicator ───────────────────────────────────────────────────
+    agr_color = "#059669" if eagr >= 75 else ("#F59E0B" if eagr >= 50 else "#DC2626")
+    agr_label = "High agreement" if eagr >= 75 else ("Partial agreement" if eagr >= 50 else "Mixed signals")
+
+    # ── Confidence bar ────────────────────────────────────────────────────────
+    conf_bar = (
+        f'<div style="background:#F3F4F6;border-radius:4px;height:5px;margin-top:4px;">'
+        f'<div style="width:{int(econf)}%;background:{ecol};height:5px;border-radius:4px;"></div></div>'
+    )
+
+    st.markdown(
+        '<div class="section-header">⚡ Enhanced Market Bias &mdash; '
+        'Options Flow + Price Confirmation + Term Structure + VIX</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"""
+<div style="
+    background:#fff;
+    border:2px solid {ecol};
+    border-radius:12px;
+    padding:14px 20px 12px 24px;
+    margin-bottom:14px;
+    position:relative;
+    box-shadow:0 2px 8px rgba(0,0,0,0.07);
+">
+  <!-- left accent bar -->
+  <div style="position:absolute;left:0;top:0;bottom:0;width:6px;
+       background:{ecol};border-radius:12px 0 0 12px;"></div>
+
+  <!-- Row 1: Direction badge + score + confidence chips -->
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+    <span style="font-size:16px;font-weight:900;color:#1A1A2E;">⚡ Enhanced Bias</span>
+    <span style="background:{ecol};color:#fff;border-radius:6px;
+          padding:4px 14px;font-size:14px;font-weight:800;letter-spacing:0.5px;">
+      {edir}
+    </span>
+    <span style="background:{ecol}22;color:{ecol};border:1px solid {ecol};
+          border-radius:6px;padding:2px 10px;font-size:13px;font-weight:800;">
+      {esc:+.0f} / 100
+    </span>
+    <span style="background:{agr_color}22;color:{agr_color};border:1px solid {agr_color};
+          border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700;">
+      {agr_label} ({int(eagr)}%)
+    </span>
+    <span style="margin-left:auto;font-size:10px;color:#9CA3AF;">
+      {nsig}/3 new signals live
+    </span>
+  </div>
+
+  <!-- Score bar -->
+  {score_bar}
+
+  <!-- Row 2: signal chips -->
+  <div style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 10px 0;">
+    {chips_html}
+  </div>
+
+  <!-- Row 3: confidence sub-bar -->
+  <div style="font-size:10px;color:#9CA3AF;margin-bottom:2px;">
+    Composite confidence: {econf:.0f}%
+  </div>
+  {conf_bar}
+
+  <!-- Row 4: detail lines -->
+  <div style="margin-top:10px;padding-top:10px;border-top:1px solid #F3F4F6;">
+    {details_html}
+  </div>
+
+  <!-- Footer note -->
+  <div style="font-size:10px;color:#9CA3AF;margin-top:8px;">
+    Weight: S3/4 flow 70% · VWAP+OR 10% · Term structure 10% · India VIX 10%
+    &nbsp;·&nbsp; v7 enhanced layer · existing engines unchanged
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# v8: TOP-OF-DASHBOARD DISPLAY SLOTS
+# The five st.container() slots below pin the DISPLAY order of the key panels
+# to the very top of the dashboard:
+#   Section 3 → Section 4 → Section 2 → Gamma & Vega Live Interpretation → Section 10
+# WITHOUT moving any code: every section still computes exactly where it always
+# did — it just renders into its reserved slot. Zero calculation changes.
+# ═══════════════════════════════════════════════════════════════════════════════
+_v27_grm_for_bottom = None   # v27: set by the Final Decision Matrix; 9-state grid renders at the bottom
+_slot_summary = st.container()   # Shantanu's Final Decision Matrix — very top of dashboard
+_slot_sv    = st.container()   # v10: Shantanu's View — renders at the very top of the dashboard
+_slot_s3    = st.container()   # Section 3 — Key Price Levels
+_slot_s4    = st.container()   # Section 4 — Strike-wise Charts (4 rows × 2)
+_slot_s2    = st.container()   # Section 2 — Bias Engine · Strategy · Key Metrics
+_slot_gamma = st.empty()      # Gamma & Vega Live Interpretation — v20: visuals hidden, calculations preserved
+_slot_s10   = st.container()   # Section 10 — Basis Triangulation
+
+# v14 (ported from Dash v15): module-level default so Shantanu's View can
+# safely reference the GEX/Vega key-levels snapshot even if the Gamma & Vega
+# section above hasn't run yet (e.g. _gd_src unavailable this tick). Set for
+# real inside the "with _slot_gamma:" block below.
+_gv_levels_snapshot = None
+
+
+# ── Render the Enhanced Bias Panel at the top of the dashboard ───────────────
+_ph_hidden_eb = st.empty()   # v20: Enhanced Market Bias visuals hidden — calculations preserved
+with _ph_hidden_eb.container():
+    _render_enhanced_bias_panel(
+        _enhanced_bias, _vwap_or_data, _ts_data, _vix_data, _combined_decision, spot, m
+    )
+_ph_hidden_eb.empty()        # v20: Enhanced Market Bias visual output suppressed
+# ══ END ENHANCED BIAS PANEL ═══════════════════════════════════════════════════
+
+_ph_hidden_grf = st.empty()   # v20: Greek Risk Framework visuals hidden — calculations preserved
+with _ph_hidden_grf.container():
+    st.markdown(
+        '<div class="section-header">&#128300; Greek Risk Framework &mdash; Hedge-Flow Pressure &amp; Confidence</div>',
+        unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style="background:#fff;border:1.5px solid {_grf['cc']};border-radius:10px;
+         padding:14px 18px 12px 22px;margin-bottom:14px;position:relative;">
+      <div style="position:absolute;left:0;top:0;bottom:0;width:5px;
+           background:{_grf['cc']};border-radius:10px 0 0 10px;"></div>
+
+      <!-- Row 1: bias badge + conviction + range/size -->
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+        <span style="background:{_grf_dc}22;color:{_grf_dc};border:1px solid {_grf_dc};
+              border-radius:6px;padding:3px 12px;font-size:13px;font-weight:800;">
+          {_grf['bias_s']}
+        </span>
+        <span style="background:{_grf['cc']}22;color:{_grf['cc']};border:1px solid {_grf['cc']};
+              border-radius:6px;padding:2px 10px;font-size:12px;font-weight:700;">
+          {_grf['conv']} &nbsp;·&nbsp; {_grf['total']}/10
+        </span>
+        <span style="font-size:11px;color:#6B7280;margin-left:auto;">
+          Gamma range: <strong>{_grf['gamma_range']}</strong>
+          &nbsp;·&nbsp; Position size: <strong style="color:{_grf['cc']};">{_grf['sl']}</strong>
+        </span>
+      </div>
+
+      <!-- Row 2: sub-score progress bars -->
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:10px;">
+        <div>
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">
+            Gamma · Range quality &nbsp;<strong style="color:#1A1A2E;">{_grf['g']}/3</strong>
+          </div>
+          {_gbar(_grf['g'], 3, '#5DCAA5')}
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">
+            Delta · Equilibrium &nbsp;<strong style="color:#1A1A2E;">{_grf['d']}/3</strong>
+          </div>
+          {_gbar(_grf['d'], 3, '#378ADD')}
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">
+            Momentum · Flow &nbsp;<strong style="color:#1A1A2E;">{_grf['ms']}/4</strong>
+          </div>
+          {_gbar(_grf['ms'], 4, '#7F77DD')}
+        </div>
+      </div>
+
+      <!-- Row 3: key signals + recommendation -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;
+           padding-top:10px;border-top:1px solid #F3F4F6;">
+        <div>
+          <div style="font-size:11px;font-weight:700;color:#374151;margin-bottom:4px;">Key signals</div>
+          {_grf_fac_html}
+        </div>
+        <div style="background:{_grf['cc']}22;border-radius:8px;padding:10px 12px;">
+          <div style="font-size:11px;font-weight:700;color:{_grf['cc']};margin-bottom:4px;">
+            Recommendation
+          </div>
+          <div style="font-size:12px;color:#374151;line-height:1.55;">{_grf['rtxt']}</div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:6px;">
+            {_grf['iv_env']} (IV rank {_grf['iv_r']:.0f}) &nbsp;·&nbsp;
+            Sources: net delta · OI momentum · GEX · PCR · max pain
+          </div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+_ph_hidden_grf.empty()        # v20: Greek Risk Framework visual output suppressed
+# ══ END Greek Risk Framework ══════════════════════════════════════════════════
+
+# ── SECTION 3 & 4 MARKET BIAS vs NIFTY SPOT ─────────────────────────────────
+_ph_hidden_s34badge = st.empty()   # v20: Section 3&4 Bias badge visuals hidden — calculations preserved
+with _ph_hidden_s34badge.container():
+    _bh_data = st.session_state.get("bias_history", [])
+
+    # ── Current snapshot badge (always visible, even before 2 data points) ───────
+    _s34_dir   = _s34_bias["direction"]
+    _s34_bc    = "#22C55E" if _s34_score > 15 else ("#EF4444" if _s34_score < -15 else "#F59E0B")
+    _s34_bd    = _s34_breakdown
+    _s34_parts = " | ".join(f"{k}: {v:+.0f}" for k, v in _s34_bd.items())
+    st.markdown(
+        f"""<div style="background:#fff;border:1.5px solid {_s34_bc};border-radius:10px;
+             padding:10px 16px;margin-bottom:10px;display:flex;align-items:center;
+             gap:12px;flex-wrap:wrap;">
+          <span style="font-size:13px;font-weight:800;color:#1A1A2E;">
+            &#x1F4CA; Section 3&4 Bias</span>
+          <span style="background:{_s34_bc}22;color:{_s34_bc};border:1px solid {_s34_bc};
+                border-radius:6px;padding:2px 10px;font-size:13px;font-weight:700;">
+            {_s34_dir} &nbsp; {_s34_score:+.0f}/100</span>
+          <span style="font-size:11px;color:#6B7280;">{_s34_parts}</span>
+          <span style="font-size:11px;color:#9CA3AF;margin-left:auto;">
+            5-min chart updates every 5 min · {len(_bh_data)} pts</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+_ph_hidden_s34badge.empty()        # v20: Section 3&4 Bias badge visual output suppressed
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 🎯 COMBINED MARKET BIAS DECISION  (Chapter 17 & 18)
+# Surgical addition — do not modify any code below this block
+# ═════════════════════════════════════════════════════════════════════════════
+def _render_combined_bias_panel(cd: dict) -> None:
+    """
+    Renders the top-of-dashboard Combined Bias Decision panel.
+    cd = output of generate_combined_decision()
+    """
+    q        = cd["quadrant"]
+    qcolor   = cd["quadrant_color"]
+    qbg      = cd["badge_bg"]
+    qshort   = cd["quadrant_short"]
+    action   = cd["action"]
+    conf_l   = cd["confidence_label"]
+    conf_c   = cd["confidence_color"]
+    lines    = cd["explanation_lines"]
+    div      = cd["divergence"]
+    s34_sc   = cd["s34_score"]
+    s34_dir  = cd["s34_direction"]
+    smile_sc = cd["smile_scenario"]
+    pcr_val  = cd["pcr"]
+
+    # Confidence chip colour variant
+    conf_alpha = "33"   # semi-transparent background
+
+    # Divergence section (only if active)
+    div_html = ""
+    if div:
+        _div_strength = div.get("strength", "HARD")
+        _div_icon = "⚠" if _div_strength == "HARD" else "🔮"
+        _div_border_style = "solid" if _div_strength == "HARD" else "dashed"
+        _div_opacity = "1.0" if _div_strength == "HARD" else "0.75"
+        div_html = (
+            f'<div style="background:{div["badge_bg"]};border:1.5px { _div_border_style} {div["color"]};'
+            f'border-radius:8px;padding:8px 14px;margin-top:10px;opacity:{_div_opacity};">'
+            f'<span style="font-size:12px;font-weight:800;color:{div["color"]};">'
+            f'{_div_icon} {_div_strength}: {div["type"]}</span>'
+            f'<div style="font-size:11.5px;color:#374151;margin-top:4px;">{div["warning"]}</div>'
+            f'<div style="font-size:11px;color:#6B7280;margin-top:3px;">{div["detail"]}</div>'
+            f'</div>'
+        )
+
+    # Explanation lines HTML
+    lines_html = "".join(
+        f'<div style="font-size:11.5px;color:#374151;padding:2px 0;line-height:1.5;">'
+        f'&#9656; {ln}</div>'
+        for ln in lines
+    )
+
+    # Colour bar strip at left edge (mimics the manual's colour-coded quadrant strips)
+    colour_bar = f"""<div style="
+        position:absolute;left:0;top:0;bottom:0;width:5px;
+        background:{qcolor};border-radius:10px 0 0 10px;
+    "></div>"""
+
+    # Python ≤3.11 fix: backslashes inside f-string {} expressions are a SyntaxError
+    # before PEP 701 (3.12). Extract conditional HTML snippets into plain variables first.
+    _override_badge = (
+        "<span style='background:#FEF3C7;color:#B45309;"
+        "border:1px dashed #B45309;border-radius:6px;"
+        "padding:2px 9px;font-size:10px;font-weight:700;'>"
+        "OVERRIDDEN by Price Layer</span>"
+        if cd.get("quadrant_overridden") else ""
+    )
+    _enhanced_score_html = (
+        "<span>Enhanced Score: <strong style='color:#1A1A2E;'>{:+.0f}</strong></span>".format(
+            cd.get("enhanced_score", 0)
+        ) if cd.get("enhanced_score", 0) != 0 else ""
+    )
+    st.markdown(f"""
+<div style="
+    background:{qbg};
+    border:1.5px solid {qcolor};
+    border-radius:10px;
+    padding:12px 18px 12px 22px;
+    margin-bottom:12px;
+    position:relative;
+">
+  {colour_bar}
+  <!-- Row 1: title + badges -->
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;">
+    <span style="font-size:15px;font-weight:900;color:#1A1A2E;">
+      🎯 Combined Bias Decision
+    </span>
+    <span style="
+        background:{qcolor};color:#fff;
+        border-radius:6px;padding:3px 12px;
+        font-size:13px;font-weight:800;letter-spacing:0.5px;
+    ">{qshort}</span>
+    <span style="
+        background:{conf_c}{conf_alpha};color:{conf_c};
+        border:1px solid {conf_c};
+        border-radius:6px;padding:2px 9px;
+        font-size:11px;font-weight:700;
+    ">Confidence: {conf_l}</span>
+    {_override_badge}
+  </div>
+  <!-- Row 2: action line -->
+  <div style="
+      font-size:12.5px;font-weight:700;color:{qcolor};
+      margin-bottom:8px;letter-spacing:0.2px;
+  ">{action}</div>
+  <!-- Row 3: explanation lines -->
+  {lines_html}
+  <!-- Row 4: mini metrics strip -->
+  <div style="
+      display:flex;gap:18px;flex-wrap:wrap;
+      margin-top:8px;padding-top:8px;
+      border-top:1px solid #E5E7EB;
+      font-size:11px;color:#6B7280;
+  ">
+    <span>S3/4 Score: <strong style="color:{qcolor};">{s34_sc:+.0f}</strong> ({s34_dir})</span>
+    <span>IV Smile: <strong style="color:#374151;">{smile_sc}</strong></span>
+    <span>PCR: <strong style="color:#374151;">{pcr_val:.2f}</strong></span>
+    {_enhanced_score_html}
+    <span style="margin-left:auto;font-size:10px;color:#9CA3AF;">
+      Chapters 17 &amp; 18 · Combined Bias Engine (v4 inline)
+    </span>
+  </div>
+  {div_html}
+</div>
+""", unsafe_allow_html=True)
+
+# ── Call the panel ────────────────────────────────────────────────────────────
+_ph_hidden_cd = st.empty()   # v20.1: Combined Decision panel visuals hidden — calculations preserved
+with _ph_hidden_cd.container():
+    _render_combined_bias_panel(_combined_decision)
+_ph_hidden_cd.empty()        # v20.1: Combined Decision panel visual output suppressed
+# ═════════════════════════════════════════════════════════════════════════════
+# END COMBINED MARKET BIAS DECISION PANEL
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ph_hidden_s34chart = st.empty()   # v20: Section 3&4 Bias chart visuals hidden — calculations preserved
+with _ph_hidden_s34chart.container():
+    if len(_bh_data) >= 2:
+        import plotly.graph_objs as _go2
+        _B_GREEN = "#22C55E"; _B_RED = "#EF4444"; _B_CYAN = "#22D3EE"
+        _B_ZONE  = "#F3F4F6"  # neutral zone fill
+
+        _bh_ts    = [r["ts"]    for r in _bh_data]
+        _bh_spot  = [r["spot"]  for r in _bh_data]
+        _bh_score = [r["score"] for r in _bh_data]
+
+        # Build custom hover for each point (signal breakdown if available)
+        _bh_hover = []
+        for r in _bh_data:
+            _hlines = [
+                f"<b>{r['ts']}</b>",
+                f"Bias: <b>{r['score']:+.0f}</b> ({r.get('direction','—')})",
+                f"Spot: {r['spot']:,.0f}",
+            ]
+            for _sk in ("s1","s2","s3","s4","s5","s6"):
+                if _sk in r:
+                    _label = {"s1":"S1 Net OI","s2":"S2 Mom","s3":"S3 Levels",
+                              "s4":"S4 Skew","s5":"S5 TS","s6":"S6 Vel"}.get(_sk, _sk)
+                    _hlines.append(f"{_label}: {r[_sk]:+.0f}")
+            _bh_hover.append("<br>".join(_hlines))
+
+        _bf = _go2.Figure()
+
+        # ── Zone bands ────────────────────────────────────────────────────────────
+        # Strong bullish zone (40–100): light green tint
+        _bf.add_hrect(y0=40,  y1=100, fillcolor="#DCFCE7", opacity=0.25, layer="below", line_width=0)
+        # Neutral zone (±15): grey
+        _bf.add_hrect(y0=-15, y1=15,  fillcolor="#E5E7EB", opacity=0.35, layer="below", line_width=0)
+        # Strong bearish zone (-40 to -100): light red tint
+        _bf.add_hrect(y0=-100, y1=-40, fillcolor="#FEE2E2", opacity=0.25, layer="below", line_width=0)
+
+        # ── Reference lines ───────────────────────────────────────────────────────
+        for _rl, _rd, _rc in [
+            (0,   "dot",   "#9CA3AF"),   # zero line
+            (40,  "dash",  "#86EFAC"),   # bull conviction
+            (-40, "dash",  "#FCA5A5"),   # bear conviction
+            (15,  "dot",   "#D1D5DB"),   # neutral upper edge
+            (-15, "dot",   "#D1D5DB"),   # neutral lower edge
+        ]:
+            _bf.add_hline(y=_rl, line_width=1.2, line_dash=_rd, line_color=_rc)
+
+        # ── Nifty Spot on right axis (cyan) ───────────────────────────────────────
+        _bf.add_trace(_go2.Scatter(
+            x=_bh_ts, y=_bh_spot, name="Nifty Spot",
+            mode="lines+markers",
+            line=dict(color=_B_CYAN, width=2.2),
+            marker=dict(size=4, color=_B_CYAN),
+            yaxis="y2",
+            hovertemplate="%{x}<br>Spot: %{y:,.0f}<extra>Spot</extra>",
+        ))
+
+        # ── Bias line: colour-coded segments (green above 0, red below) ───────────
+        for _bi in range(len(_bh_score)):
+            _bc = _B_GREEN if _bh_score[_bi] >= 0 else _B_RED
+            if _bi < len(_bh_score) - 1:
+                # Colour each segment by the current point's sign
+                _bf.add_trace(_go2.Scatter(
+                    x=[_bh_ts[_bi], _bh_ts[_bi + 1]],
+                    y=[_bh_score[_bi], _bh_score[_bi + 1]],
+                    mode="lines",
+                    line=dict(color=_bc, width=2.8),
+                    showlegend=False,
+                    yaxis="y1",
+                    hoverinfo="skip",
+                ))
+            # Marker with full breakdown tooltip
+            _bf.add_trace(_go2.Scatter(
+                x=[_bh_ts[_bi]], y=[_bh_score[_bi]],
+                mode="markers",
+                marker=dict(
+                    color=_bc, size=8,
+                    line=dict(color="#fff", width=1.5),
+                    symbol="circle",
+                ),
+                name="S3/4 Bias" if _bi == 0 else None,
+                showlegend=(_bi == 0),
+                customdata=[_bh_hover[_bi]],
+                hovertemplate="%{customdata}<extra></extra>",
+                yaxis="y1",
+            ))
+
+        # ── Layout ────────────────────────────────────────────────────────────────
+        _spot_vals  = [v for v in _bh_spot if v > 0]
+        _spot_pad   = (max(_spot_vals) - min(_spot_vals)) * 0.15 if len(_spot_vals) > 1 else 50
+        _spot_range = [min(_spot_vals) - _spot_pad, max(_spot_vals) + _spot_pad] if _spot_vals else None
+
+        _bf.update_layout(
+            title=dict(
+                text=(
+                    f"S3/4 Market Bias vs Nifty Spot — "
+                    f"<span style='color:{_s34_bc}'>{_s34_dir} {_s34_score:+.0f}</span>"
+                    f"  <span style='font-size:11px;color:#9CA3AF'>· 5-min snapshots</span>"
+                ),
+                font=dict(size=13, color="#1A1A2E"),
+            ),
+            height=270,
+            paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=52, r=66, t=44, b=30),
+            font=dict(color="#1A1A2E", size=11),
+            legend=dict(orientation="h", y=1.14, x=0, font=dict(size=10)),
+            hovermode="closest",
+            yaxis=dict(
+                title=dict(text="Bias Score", font=dict(size=10, color="#1A1A2E")),
+                range=[-105, 105],
+                zeroline=False,
+                gridcolor="#F3F4F6",
+                tickvals=[-100, -60, -40, -15, 0, 15, 40, 60, 100],
+                tickfont=dict(size=9),
+            ),
+            yaxis2=dict(
+                title=dict(text="Nifty Spot", font=dict(size=10, color=_B_CYAN)),
+                overlaying="y", side="right",
+                showgrid=False, zeroline=False,
+                range=_spot_range,
+                tickfont=dict(size=9, color=_B_CYAN),
+            ),
+        )
+        st.plotly_chart(_bf, width='stretch', config={"displayModeBar": False})  # H23 fix: was use_container_width=True
+    elif len(_bh_data) == 1:
+        st.caption("⏳ Chart will appear after the second 5-minute snapshot is recorded.")
+_ph_hidden_s34chart.empty()        # v20: Section 3&4 Bias chart visual output suppressed
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GAMMA DATA SECTION — Option C: OI×Gamma Directional Balance
+# All data sourced from the already-loaded option chain (_early_df_band).
+# No new API calls. Gamma is computed during the main chain fetch (BS Greeks).
+# ═══════════════════════════════════════════════════════════════════════════════
+with _slot_gamma.container():   # v8: render into top-of-dashboard slot (display order only)
+    st.markdown(
+        '<div class="section-header">⚡ Gamma &amp; Vega Live Interpretation — OI×Gamma Balance · Net Vega Exposure per Strike</div>',
+        unsafe_allow_html=True,
+    )
+
+    _gd_src = _early_df_band.copy() if _early_df_band is not None and not _early_df_band.empty else None
+
+    if _gd_src is not None:
+        # ── Coerce numeric columns ────────────────────────────────────────────────
+        for _gc in ["strike", "call_oi", "put_oi", "call_gamma", "put_gamma"]:
+            if _gc in _gd_src.columns:
+                _gd_src[_gc] = pd.to_numeric(_gd_src[_gc], errors="coerce").fillna(0.0)
+
+        _gd_src = _gd_src.sort_values("strike").reset_index(drop=True)
+
+        # ── Core Option C columns ────────────────────────────────────────────────
+        # Standard GEX (industry formula): OI × Gamma × LotSize × Spot² × 0.01
+        # Matches Perfiliev / SpotGamma / StockMojo convention.
+        # Calls → +ve GEX (dealers buy spot to hedge → dampening/pinning force)
+        # Puts  → subtracted (dealers sell spot → amplifying force)
+        _spot2 = spot ** 2
+        _gd_src["call_gex"] = _gd_src["call_oi"] * _gd_src["call_gamma"] * NIFTY_LOT_SIZE * _spot2 * 0.01
+        _gd_src["put_gex"]  = _gd_src["put_oi"]  * _gd_src["put_gamma"]  * NIFTY_LOT_SIZE * _spot2 * 0.01
+        _gd_src["net_gex"]  = _gd_src["call_gex"] - _gd_src["put_gex"]   # +ve = net long gamma (pinning), -ve = net short gamma (trending)
+
+        # Chart-level gamma flip: reconciled to use the same corrected, price-domain
+        # zero-gamma metric (m["gamma_flip"], from compute_gamma_flip_true) that the
+        # rest of the app (Combined Decision, bias engine, headline tiles) reads,
+        # instead of an independent strike-domain cumsum recompute off this chart's
+        # own bars. That local recompute is the same STRIKE-domain proxy flagged as
+        # non-standard in compute_true_gex's docstring, and could silently disagree
+        # with the corrected flip shown everywhere else in the app.
+        _chart_gamma_flip = m.get("gamma_flip")
+
+        _gd_atm_band = spot * 0.003
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # CHART 1 — Option C: Standard GEX per Strike
+        # Formula: GEX = OI × Gamma × Spot² × 0.01  (notional-scaled, matches compute_true_gex)
+        # Red bars   = Call GEX (dealers long gamma → buy dips/sell rallies → PINNING)
+        # Green bars = Put GEX shown as negative (dealers short gamma → amplify moves → TRENDING)
+        # Purple line = Net GEX: +ve = long-gamma/pinning regime, -ve = short-gamma/trending
+        # Gamma Flip level = m["gamma_flip"], the price-domain zero-gamma level from
+        # compute_gamma_flip_true (not a zero-crossing of this chart's own bars).
+        # ─────────────────────────────────────────────────────────────────────────
+        # ── Net Vega per Strike ───────────────────────────────────────────────────
+        # Net Vega = (Call OI × Call Vega) - (Put OI × Put Vega)
+        # +ve = net long vega at that strike (buyers dominate → IV expansion expected)
+        # -ve = net short vega (sellers dominate → IV suppressed / gravity well)
+        for _vc in ["call_vega", "put_vega"]:
+            if _vc in _gd_src.columns:
+                _gd_src[_vc] = pd.to_numeric(_gd_src[_vc], errors="coerce").fillna(0.0)
+        _gd_src["call_vega_exp"] = _gd_src["call_oi"] * _gd_src["call_vega"]   # call vega exposure
+        _gd_src["put_vega_exp"]  = _gd_src["put_oi"]  * _gd_src["put_vega"]    # put vega exposure
+        _gd_src["net_vega"]      = _gd_src["call_vega_exp"] - _gd_src["put_vega_exp"]  # +ve = net long vega
+
+        # ── 2-column layout: GEX chart | Net Vega chart ──────────────────────────
+        _gc_col1, _gc_col2 = st.columns(2)
+
+        with _gc_col1:
+            _gc1_fig = go.Figure()
+            _gc1_fig.add_trace(go.Bar(
+                x=_gd_src["strike"],
+                y=_gd_src["call_gex"],
+                name="Call GEX (Dealer Buy — Pinning)",
+                marker_color="#EF4444",
+                opacity=0.75,
+                hovertemplate="Strike %{x:,.0f}<br>Call GEX: %{y:,.2f}<extra>Dealer Buy / Pinning</extra>",
+            ))
+            _gc1_fig.add_trace(go.Bar(
+                x=_gd_src["strike"],
+                y=-_gd_src["put_gex"],
+                name="Put GEX (Dealer Sell — Amplifying)",
+                marker_color="#22C55E",
+                opacity=0.75,
+                hovertemplate="Strike %{x:,.0f}<br>Put GEX: %{y:,.2f}<extra>Dealer Sell / Amplifying</extra>",
+            ))
+            _gc1_fig.add_trace(go.Scatter(
+                x=_gd_src["strike"],
+                y=_gd_src["net_gex"],
+                name="Net GEX",
+                mode="lines+markers",
+                line=dict(color="#7C3AED", width=2.2),
+                marker=dict(size=5, color="#7C3AED"),
+                hovertemplate="Strike %{x:,.0f}<br>Net GEX: %{y:,.2f}<extra>Net GEX</extra>",
+            ))
+            _gc1_fig.add_vline(
+                x=spot, line_dash="dash", line_color="#F59E0B", line_width=2,
+                annotation_text=f"Spot {spot:,.0f}",
+                annotation_font=dict(size=10, color="#F59E0B"),
+                annotation_position="top right",
+            )
+            # Gamma flip annotation — reconciled to the app-wide corrected metric
+            # (m["gamma_flip"]); see comment where _chart_gamma_flip is set above.
+            if _chart_gamma_flip is not None:
+                _gc1_fig.add_vline(
+                    x=_chart_gamma_flip, line_dash="dot", line_color="#10B981", line_width=1.8,
+                    annotation_text=f"Flip {int(_chart_gamma_flip):,}",
+                    annotation_font=dict(size=9, color="#10B981"),
+                    annotation_position="top left",
+                )
+            _gc1_fig.update_layout(
+                title=dict(
+                    text="Option C — Standard GEX per Strike  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Red=Call GEX (Pinning) · Green=Put GEX (Amplifying) · Purple=Net GEX · "
+                         "Green dot=Gamma Flip</span>",
+                    font=dict(size=13),
+                ),
+                barmode="overlay",
+                height=310,
+                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=55, r=20, t=50, b=30),
+                legend=dict(orientation="h", y=1.18, font=dict(size=10)),
+                yaxis=dict(
+                    title="GEX  (OI × Γ × LotSize × Spot² × 0.01)",
+                    gridcolor="#F3F4F6",
+                    zeroline=True, zerolinecolor="#9CA3AF", zerolinewidth=1.2,
+                    tickfont=dict(size=9),
+                ),
+                xaxis=dict(title="Strike", tickfont=dict(size=9)),
+                font=dict(color="#1A1A2E", size=11),
+            )
+            st.plotly_chart(_gc1_fig, width='stretch', config={"displayModeBar": False})
+
+        with _gc_col2:
+            # ─────────────────────────────────────────────────────────────────────
+            # Net Vega per Strike chart
+            # Call bars = Call OI × Call Vega  (call-side vega exposure)
+            # Put bars  = Put OI × Put Vega shown negative (put-side vega exposure)
+            # OI includes both buyers and sellers, so these bars show NET notional
+            # vega exposure per side — not strictly "long/short" positional data.
+            # Orange line = Net Vega: +ve = call-side dominant, -ve = put-side dominant
+            # Gravity wells (large -ve net vega) = IV suppression / ceiling zones
+            # Large +ve net vega strikes = IV expansion / breakout kindling zones
+            # ─────────────────────────────────────────────────────────────────────
+            _gv_fig = go.Figure()
+            _gv_fig.add_trace(go.Bar(
+                x=_gd_src["strike"],
+                y=_gd_src["call_vega_exp"],
+                name="Call Vega Exposure (ΣOI×Vega)",
+                marker_color="#2563EB",
+                opacity=0.70,
+                hovertemplate="Strike %{x:,.0f}<br>Call Vega Exp: %{y:,.2f}<extra>Call-side Vega Exposure</extra>",
+            ))
+            _gv_fig.add_trace(go.Bar(
+                x=_gd_src["strike"],
+                y=-_gd_src["put_vega_exp"],
+                name="Put Vega Exposure (ΣOI×Vega)",
+                marker_color="#D97706",
+                opacity=0.70,
+                hovertemplate="Strike %{x:,.0f}<br>Put Vega Exp: %{y:,.2f}<extra>Put-side Vega Exposure</extra>",
+            ))
+            _gv_fig.add_trace(go.Scatter(
+                x=_gd_src["strike"],
+                y=_gd_src["net_vega"],
+                name="Net Vega",
+                mode="lines+markers",
+                line=dict(color="#F97316", width=2.2),
+                marker=dict(size=5, color="#F97316"),
+                hovertemplate="Strike %{x:,.0f}<br>Net Vega: %{y:,.2f}<extra>Net Vega</extra>",
+            ))
+            _gv_fig.add_vline(
+                x=spot, line_dash="dash", line_color="#F59E0B", line_width=2,
+                annotation_text=f"Spot {spot:,.0f}",
+                annotation_font=dict(size=10, color="#F59E0B"),
+                annotation_position="top right",
+            )
+            _gv_fig.update_layout(
+                title=dict(
+                    text="Net Vega Exposure per Strike  "
+                         "<span style='font-size:11px;color:#6B7280'>"
+                         "Blue=Call Vega Exp (ΣOI×Vega) · Amber=Put Vega Exp · Orange=Net · "
+                         "+ve=Call-side dominant · −ve=Put-side dominant</span>",
+                    font=dict(size=13),
+                ),
+                barmode="overlay",
+                height=310,
+                paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=55, r=20, t=50, b=30),
+                legend=dict(orientation="h", y=1.18, font=dict(size=10)),
+                yaxis=dict(
+                    title="Vega Exposure  (ΣOI × Vega per Strike)",
+                    gridcolor="#F3F4F6",
+                    zeroline=True, zerolinecolor="#9CA3AF", zerolinewidth=1.2,
+                    tickfont=dict(size=9),
+                ),
+                xaxis=dict(title="Strike", tickfont=dict(size=9)),
+                font=dict(color="#1A1A2E", size=11),
+            )
+            st.plotly_chart(_gv_fig, width='stretch', config={"displayModeBar": False})
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ATM BAND VEGA EXPOSURE DIFF vs SPOT — dual-axis time-series
+        # X-axis : time ticks (today_history)
+        # Left Y : Nifty Spot (amber line)
+        # Right Y: ΣCall(OI×Vega) − ΣPut(OI×Vega) across ATM ± N strikes (purple)
+        #          N is set by owner (default ±2 = ±100 pts)
+        # +ve diff = call-side vega exposure > put-side = call buyers building near ATM
+        # −ve diff = put-side dominant = downside hedge demand / protective buying
+        # Zero-cross = vega exposure parity = transitional / balanced IV regime
+        # Smoother than single-strike: ATM can drift ±N strikes before any jump occurs
+        # ─────────────────────────────────────────────────────────────────────────
+        # H7 fix: infer the band width from the MOST RECENT history entry, not the
+        # first. This label is shared by all 4 Z-Score chart titles (Vega Ratio +
+        # EV Ratio, raw & OI-wtd). Reading the first entry meant that changing the
+        # "ATM Vega band width" owner setting mid-session left every chart title
+        # permanently stuck on whatever band was active at the start of the day
+        # (e.g. still showing "±2 strikes" long after switching to ±5) — even
+        # though newer ticks were correctly computed with the new band. Walking
+        # backwards picks up the CURRENT effective setting instead.
+        _vd_band_n = 3   # default display label (matches the new selector default)
+        for _hh in reversed(today_history):
+            if _hh.get("vega_band_strikes") is not None:
+                _vd_band_n = int(_hh["vega_band_strikes"])
+                break
+        # Build time-series arrays — one for raw ratio, one for OI-weighted ratio
+        _vd_times, _vd_spot, _vd_atm_k = [], [], []
+        _vd_raw_ratio, _vd_oiw_ratio   = [], []
+        _vd_ts_full = []
+        for _h in today_history:
+            _cv_raw = _h.get("atm_call_vega_raw")
+            _pv_raw = _h.get("atm_put_vega_raw")
+            _cv_oiw = _h.get("atm_call_vega")
+            _pv_oiw = _h.get("atm_put_vega")
+            if (
+                _cv_raw is not None and _pv_raw is not None and float(_pv_raw) != 0 and
+                _cv_oiw is not None and _pv_oiw is not None and float(_pv_oiw) != 0 and
+                _h.get("spot")
+            ):
+                _vd_ts_full.append(_h["ts"])
+                _vd_times.append(_h["ts"][11:19])
+                _vd_spot.append(float(_h["spot"]))
+                _vd_raw_ratio.append(round(float(_cv_raw) / float(_pv_raw), 4))
+                _vd_oiw_ratio.append(round(float(_cv_oiw) / float(_pv_oiw), 4))
+                _vd_atm_k.append(int(_h.get("atm", 0)))
+
+        # ── Z-Score engine: owner-configurable TF (time bucket) + look-back period ──
+        # Ticks are resampled into TF-minute bars (last value per bar — the
+        # in-progress bar therefore updates live every rerun and freezes once the
+        # next bar begins), then the Z-score uses an N-bar rolling window
+        # (N × TF minutes lookback). Both TF and look-back are set together in the
+        # owner sidebar and govern all 4 Z-Score charts (Raw & OI-Wtd Vega Ratio,
+        # Raw & OI-Wtd CE/PE EV Ratio).
+        # NOTE: this only changes how the charts are PLOTTED — today_history and
+        # the underlying tick collection/storage are untouched.
+        _zs_settings         = _load_owner_settings()
+        _ZS_BUCKET_MIN       = int(_zs_settings.get("zscore_tf_minutes", 15))       # bar width (minutes)
+        _ZS_BUCKET_LOOKBACK  = int(_zs_settings.get("zscore_lookback_buckets", 6))  # rolling window in # of bars
+
+        def _make_tf_buckets(ts_list, cols, freq_min=_ZS_BUCKET_MIN):
+            """Floor ticks into `freq_min`-min bars, keep the LAST value per bar.
+            The most recent (in-progress) bar reflects the latest tick and updates
+            every rerun; once a new bar starts, the prior one is frozen for good."""
+            _idx = pd.to_datetime(ts_list)
+            _df = pd.DataFrame(cols)
+            _df["bucket"] = _idx.floor(f"{freq_min}min")
+            return _df.groupby("bucket", as_index=True).last().sort_index()
+
+        def _bucket_zscore(series, window_buckets=_ZS_BUCKET_LOOKBACK):
+            """Z-score on an already-bucketed series using an N-bar rolling window."""
+            _roll = series.rolling(window_buckets, min_periods=2)
+            _mean = _roll.mean()
+            _std  = _roll.std(ddof=0)
+            _z = (series - _mean) / _std.replace(0, np.nan)
+            return _z.fillna(0.0).round(3)
+
+        if len(_vd_ts_full) >= 2:
+            _vd_bkt = _make_tf_buckets(
+                _vd_ts_full,
+                {"spot": _vd_spot, "atm": _vd_atm_k, "raw_ratio": _vd_raw_ratio, "oiw_ratio": _vd_oiw_ratio},
+            )
+            _vd_times     = _vd_bkt.index.strftime("%H:%M").tolist()
+            _vd_spot      = _vd_bkt["spot"].tolist()
+            _vd_atm_k     = _vd_bkt["atm"].astype(int).tolist()
+            _vd_raw_ratio = _vd_bkt["raw_ratio"].tolist()
+            _vd_oiw_ratio = _vd_bkt["oiw_ratio"].tolist()
+            _vd_raw_z     = _bucket_zscore(_vd_bkt["raw_ratio"]).tolist()
+            _vd_oiw_z     = _bucket_zscore(_vd_bkt["oiw_ratio"]).tolist()
+        _vd_lookback_label = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
+
+        def _add_atm_change_annotations(fig, times, atm_ks):
+            """Helper: draw grey dashed vlines + ATM-shift labels (avoids _mean() crash on string x-axis)."""
+            _prev = None
+            for _ti, _ak in zip(times, atm_ks):
+                if _ak and _ak != _prev and _prev is not None:
+                    fig.add_vline(x=_ti, line_dash="dash", line_color="#6B7280",
+                                  line_width=1, opacity=0.5)
+                    fig.add_annotation(x=_ti, y=0.95, xref="x", yref="paper",
+                                       text=f"ATM→{_ak:,}", font=dict(size=8, color="#6B7280"),
+                                       showarrow=False, xanchor="left")
+                _prev = _ak
+
+        if len(_vd_times) >= 2:
+            _vd_col1, _vd_col2 = st.columns(2)
+
+            # ── Chart A: Raw Vega Ratio  (Σcall_vega / Σput_vega, no OI weighting) ──
+            with _vd_col1:
+                _vr_fig = go.Figure()
+                _vr_fig.add_trace(go.Scatter(
+                    x=_vd_times, y=_vd_spot,
+                    name="Nifty Spot",
+                    mode="lines",
+                    line=dict(color="#F59E0B", width=2.5),
+                    yaxis="y1",
+                    hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+                ))
+                _vr_fig.add_trace(go.Scatter(
+                    x=_vd_times, y=_vd_raw_z,
+                    name=f"Raw Vega Ratio Z-Score ({_vd_lookback_label}, ±{_vd_band_n} strikes)",
+                    mode="lines+markers",
+                    line=dict(color="#7C3AED", width=2.0),
+                    marker=dict(size=4, color="#7C3AED"),
+                    yaxis="y2",
+                    customdata=_vd_raw_ratio,
+                    hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Raw Ratio: %{customdata:.4f}"
+                                  "<extra>Σcall_vega / Σput_vega</extra>",
+                ))
+                # Mean (0σ) line + ±1σ / ±2σ level markers
+                _vr_fig.add_hline(y=0, yref="y2", line_dash="dot",
+                                   line_color="#C4B5FD", line_width=1.5)
+                _vr_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                                       text="Mean (0σ)", font=dict(size=9, color="#7C3AED"),
+                                       showarrow=False, xanchor="left")
+                for _zlvl, _zcol, _zdash in [(1, "#A78BFA", "dash"), (-1, "#A78BFA", "dash"),
+                                              (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+                    _vr_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                                       line_color=_zcol, line_width=1)
+                    _vr_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                           text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                           showarrow=False, xanchor="left")
+                _add_atm_change_annotations(_vr_fig, _vd_times, _vd_atm_k)
+                _vr_fig.update_layout(
+                    title=dict(
+                        text=f"Raw Vega Ratio Z-Score — {_vd_lookback_label}  (±{_vd_band_n} strikes)  "
+                             "<span style='font-size:11px;color:#6B7280'>"
+                             "Amber=Spot (left) · Purple=Z-Score (right) · "
+                             "&gt;+1σ/+2σ = Call vega dominant · &lt;−1σ/−2σ = Put vega dominant · "
+                             "Grey dash=ATM shift</span>",
+                        font=dict(size=13),
+                    ),
+                    height=270,
+                    paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                    margin=dict(l=65, r=65, t=55, b=30),
+                    legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                    yaxis=dict(
+                        title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                        tickfont=dict(color="#F59E0B", size=9),
+                        gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                    ),
+                    yaxis2=dict(
+                        title=dict(text=f"Raw Vega Ratio Z-Score ({_vd_lookback_label})", font=dict(color="#7C3AED")),
+                        tickfont=dict(color="#7C3AED", size=9),
+                        overlaying="y", side="right",
+                        zeroline=False, autorange=True, showgrid=False,
+                    ),
+                    xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                               showgrid=True, gridcolor="#F3F4F6"),
+                    hovermode="x unified",
+                    font=dict(color="#1A1A2E", size=11),
+                )
+                st.plotly_chart(_vr_fig, width='stretch',
+                                config={"displayModeBar": False})
+
+            # ── Chart B: OI-Weighted Vega Ratio  (ΣOI×call_vega / ΣOI×put_vega) ────
+            with _vd_col2:
+                _vo_fig = go.Figure()
+                _vo_fig.add_trace(go.Scatter(
+                    x=_vd_times, y=_vd_spot,
+                    name="Nifty Spot",
+                    mode="lines",
+                    line=dict(color="#F59E0B", width=2.5),
+                    yaxis="y1",
+                    hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+                ))
+                _vo_fig.add_trace(go.Scatter(
+                    x=_vd_times, y=_vd_oiw_z,
+                    name=f"OI-Wtd Vega Ratio Z-Score ({_vd_lookback_label}, ±{_vd_band_n} strikes)",
+                    mode="lines+markers",
+                    line=dict(color="#0891B2", width=2.0),
+                    marker=dict(size=4, color="#0891B2"),
+                    yaxis="y2",
+                    customdata=_vd_oiw_ratio,
+                    hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>OI-Wtd Ratio: %{customdata:.4f}"
+                                  "<extra>ΣOI×call_vega / ΣOI×put_vega</extra>",
+                ))
+                # Mean (0σ) line + ±1σ / ±2σ level markers
+                _vo_fig.add_hline(y=0, yref="y2", line_dash="dot",
+                                   line_color="#A5F3FC", line_width=1.5)
+                _vo_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                                       text="Mean (0σ)", font=dict(size=9, color="#0891B2"),
+                                       showarrow=False, xanchor="left")
+                for _zlvl, _zcol, _zdash in [(1, "#67E8F9", "dash"), (-1, "#67E8F9", "dash"),
+                                              (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+                    _vo_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                                       line_color=_zcol, line_width=1)
+                    _vo_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                           text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                           showarrow=False, xanchor="left")
+                _add_atm_change_annotations(_vo_fig, _vd_times, _vd_atm_k)
+                _vo_fig.update_layout(
+                    title=dict(
+                        text=f"OI-Weighted Vega Ratio Z-Score — {_vd_lookback_label}  (±{_vd_band_n} strikes)  "
+                             "<span style='font-size:11px;color:#6B7280'>"
+                             "Amber=Spot (left) · Cyan=Z-Score (right) · "
+                             "&gt;+1σ/+2σ = Call exposure dominant · &lt;−1σ/−2σ = Put / hedge demand · "
+                             "Grey dash=ATM shift</span>",
+                        font=dict(size=13),
+                    ),
+                    height=270,
+                    paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                    margin=dict(l=65, r=65, t=55, b=30),
+                    legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                    yaxis=dict(
+                        title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                        tickfont=dict(color="#F59E0B", size=9),
+                        gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                    ),
+                    yaxis2=dict(
+                        title=dict(text=f"OI-Wtd Vega Ratio Z-Score ({_vd_lookback_label})", font=dict(color="#0891B2")),
+                        tickfont=dict(color="#0891B2", size=9),
+                        overlaying="y", side="right",
+                        zeroline=False, autorange=True, showgrid=False,
+                    ),
+                    xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                               showgrid=True, gridcolor="#F3F4F6"),
+                    hovermode="x unified",
+                    font=dict(color="#1A1A2E", size=11),
+                )
+                st.plotly_chart(_vo_fig, width='stretch',
+                                config={"displayModeBar": False})
+        else:
+            st.info("⏳ ATM Band Vega Ratio charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ATM ±N STRIKE-WISE CE/PE EXTRINSIC-VALUE RATIO — Z-SCORE (raw + OI-wtd)
+        # Uses ev_ratio_avg_strikewise / ev_ratio_oiw_avg_strikewise saved in
+        # history: per tick, these are the strike-by-strike average of
+        # (call_ev / put_ev) — raw — and (call_ev×call_oi / put_ev×put_oi) — OI-
+        # weighted — across the SAME owner-configurable ATM band width as the
+        # Vega Ratio charts (vega_band_strikes / "ATM Vega band width" setting —
+        # one control now governs the strike width for all 4 Z-Score charts).
+        # Distinct from the "EV Ratio" headline metric, which is a
+        # ratio-of-pooled-sums (Σev_c / Σev_p) over the fixed ATM±SIGNAL_BAND
+        # rather than an average of per-strike ratios. Same owner-configurable
+        # TF + look-back Z-score engine as the Vega Ratio charts above.
+        # ─────────────────────────────────────────────────────────────────────────
+        _evz_ts_full, _evz_times, _evz_spot, _evz_atm_k = [], [], [], []
+        _evz_raw_ratio, _evz_oiw_ratio = [], []
+        for _h in today_history:
+            _evr     = _h.get("ev_ratio_avg_strikewise")
+            _evr_oiw = _h.get("ev_ratio_oiw_avg_strikewise")
+            if _evr is not None and _evr_oiw is not None and _h.get("spot"):
+                _evz_ts_full.append(_h["ts"])
+                _evz_times.append(_h["ts"][11:19])
+                _evz_spot.append(float(_h["spot"]))
+                _evz_raw_ratio.append(float(_evr))
+                _evz_oiw_ratio.append(float(_evr_oiw))
+                _evz_atm_k.append(int(_h.get("atm", 0)))
+
+        # Same owner-configurable TF + look-back Z-Score engine as the Vega Ratio charts above.
+        if len(_evz_ts_full) >= 2:
+            _evz_bkt = _make_tf_buckets(
+                _evz_ts_full,
+                {"spot": _evz_spot, "atm": _evz_atm_k, "raw_ratio": _evz_raw_ratio, "oiw_ratio": _evz_oiw_ratio},
+            )
+            _evz_times     = _evz_bkt.index.strftime("%H:%M").tolist()
+            _evz_spot      = _evz_bkt["spot"].tolist()
+            _evz_atm_k     = _evz_bkt["atm"].astype(int).tolist()
+            _evz_raw_ratio = _evz_bkt["raw_ratio"].tolist()
+            _evz_oiw_ratio = _evz_bkt["oiw_ratio"].tolist()
+            _evz_raw_z     = _bucket_zscore(_evz_bkt["raw_ratio"]).tolist()
+            _evz_oiw_z     = _bucket_zscore(_evz_bkt["oiw_ratio"]).tolist()
+        _evz_lookback_label = f"{_ZS_BUCKET_LOOKBACK}×{_ZS_BUCKET_MIN}m bars ({_ZS_BUCKET_LOOKBACK * _ZS_BUCKET_MIN}min lookback)"
+
+        if len(_evz_times) >= 2:
+            _evz_col1, _evz_col2 = st.columns(2)
+
+            # ── Chart A: Raw CE/PE EV Ratio (strike-wise avg, no OI weighting) ──
+            with _evz_col1:
+                _ev_fig = go.Figure()
+                _ev_fig.add_trace(go.Scatter(
+                    x=_evz_times, y=_evz_spot,
+                    name="Nifty Spot",
+                    mode="lines",
+                    line=dict(color="#F59E0B", width=2.5),
+                    yaxis="y1",
+                    hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+                ))
+                _ev_fig.add_trace(go.Scatter(
+                    x=_evz_times, y=_evz_raw_z,
+                    name=f"Raw Sentiment Z-Score ({_evz_lookback_label}, ±{_vd_band_n} strikes)",
+                    mode="lines+markers",
+                    line=dict(color="#059669", width=2.0),
+                    marker=dict(size=4, color="#059669"),
+                    yaxis="y2",
+                    customdata=_evz_raw_ratio,
+                    hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>Avg Sentiment: %{customdata:.4f}"
+                                  f"<extra>strike-wise avg, ±{_vd_band_n}</extra>",
+                ))
+                # Mean (0σ) line + ±1σ / ±2σ level markers
+                _ev_fig.add_hline(y=0, yref="y2", line_dash="dot",
+                                   line_color="#A7F3D0", line_width=1.5)
+                _ev_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                                       text="Mean (0σ)", font=dict(size=9, color="#059669"),
+                                       showarrow=False, xanchor="left")
+                for _zlvl, _zcol, _zdash in [(1, "#6EE7B7", "dash"), (-1, "#6EE7B7", "dash"),
+                                              (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+                    _ev_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                                       line_color=_zcol, line_width=1)
+                    _ev_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                           text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                           showarrow=False, xanchor="left")
+                _add_atm_change_annotations(_ev_fig, _evz_times, _evz_atm_k)
+                _ev_fig.update_layout(
+                    title=dict(
+                        text=f"Raw Sentiment Z-Score — {_evz_lookback_label}  (±{_vd_band_n} strikes)  "
+                             "<span style='font-size:11px;color:#6B7280'>"
+                             "Amber=Spot (left) · Green=Z-Score (right) · "
+                             "&gt;+1σ/+2σ = Call premium relatively rich · &lt;−1σ/−2σ = Put premium relatively rich · "
+                             "Grey dash=ATM shift</span>",
+                        font=dict(size=13),
+                    ),
+                    height=270,
+                    paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                    margin=dict(l=65, r=65, t=55, b=30),
+                    legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                    yaxis=dict(
+                        title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                        tickfont=dict(color="#F59E0B", size=9),
+                        gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                    ),
+                    yaxis2=dict(
+                        title=dict(text=f"Raw Sentiment Z-Score ({_evz_lookback_label})", font=dict(color="#059669")),
+                        tickfont=dict(color="#059669", size=9),
+                        overlaying="y", side="right",
+                        zeroline=False, autorange=True, showgrid=False,
+                    ),
+                    xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                               showgrid=True, gridcolor="#F3F4F6"),
+                    hovermode="x unified",
+                    font=dict(color="#1A1A2E", size=11),
+                )
+                st.plotly_chart(_ev_fig, width='stretch',
+                                config={"displayModeBar": False})
+
+            # ── Chart B: OI-Weighted CE/PE EV Ratio (Call EV×OI / Put EV×OI) ────
+            with _evz_col2:
+                _evo_fig = go.Figure()
+                _evo_fig.add_trace(go.Scatter(
+                    x=_evz_times, y=_evz_spot,
+                    name="Nifty Spot",
+                    mode="lines",
+                    line=dict(color="#F59E0B", width=2.5),
+                    yaxis="y1",
+                    hovertemplate="%{x}<br>Spot: <b>%{y:,.0f}</b><extra>Spot</extra>",
+                ))
+                _evo_fig.add_trace(go.Scatter(
+                    x=_evz_times, y=_evz_oiw_z,
+                    name=f"OI-Wtd Sentiment Z-Score ({_evz_lookback_label}, ±{_vd_band_n} strikes)",
+                    mode="lines+markers",
+                    line=dict(color="#DB2777", width=2.0),
+                    marker=dict(size=4, color="#DB2777"),
+                    yaxis="y2",
+                    customdata=_evz_oiw_ratio,
+                    hovertemplate="%{x}<br>Z-Score: <b>%{y:.2f}σ</b><br>OI-Wtd Sentiment: %{customdata:.4f}"
+                                  f"<extra>strike-wise, OI-weighted, ±{_vd_band_n}</extra>",
+                ))
+                # Mean (0σ) line + ±1σ / ±2σ level markers
+                _evo_fig.add_hline(y=0, yref="y2", line_dash="dot",
+                                   line_color="#FBCFE8", line_width=1.5)
+                _evo_fig.add_annotation(x=1, y=0, xref="paper", yref="y2",
+                                       text="Mean (0σ)", font=dict(size=9, color="#DB2777"),
+                                       showarrow=False, xanchor="left")
+                for _zlvl, _zcol, _zdash in [(1, "#F9A8D4", "dash"), (-1, "#F9A8D4", "dash"),
+                                              (2, "#DC2626", "dashdot"), (-2, "#DC2626", "dashdot")]:
+                    _evo_fig.add_hline(y=_zlvl, yref="y2", line_dash=_zdash,
+                                       line_color=_zcol, line_width=1)
+                    _evo_fig.add_annotation(x=1, y=_zlvl, xref="paper", yref="y2",
+                                           text=f"{_zlvl:+d}σ", font=dict(size=8, color=_zcol),
+                                           showarrow=False, xanchor="left")
+                _add_atm_change_annotations(_evo_fig, _evz_times, _evz_atm_k)
+                _evo_fig.update_layout(
+                    title=dict(
+                        text=f"OI-Weighted Sentiment Z-Score — {_evz_lookback_label}  (±{_vd_band_n} strikes)  "
+                             "<span style='font-size:11px;color:#6B7280'>"
+                             "Amber=Spot (left) · Pink=Z-Score (right) · "
+                             "&gt;+1σ/+2σ = Call premium×OI relatively rich · &lt;−1σ/−2σ = Put premium×OI relatively rich · "
+                             "Grey dash=ATM shift</span>",
+                        font=dict(size=13),
+                    ),
+                    height=270,
+                    paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                    margin=dict(l=65, r=65, t=55, b=30),
+                    legend=dict(orientation="h", y=1.22, font=dict(size=10)),
+                    yaxis=dict(
+                        title=dict(text="Nifty Spot", font=dict(color="#F59E0B")),
+                        tickfont=dict(color="#F59E0B", size=9),
+                        gridcolor="#F3F4F6", autorange=True, showgrid=True,
+                    ),
+                    yaxis2=dict(
+                        title=dict(text=f"OI-Wtd Sentiment Z-Score ({_evz_lookback_label})", font=dict(color="#DB2777")),
+                        tickfont=dict(color="#DB2777", size=9),
+                        overlaying="y", side="right",
+                        zeroline=False, autorange=True, showgrid=False,
+                    ),
+                    xaxis=dict(tickfont=dict(size=9), title="Time (IST)",
+                               showgrid=True, gridcolor="#F3F4F6"),
+                    hovermode="x unified",
+                    font=dict(color="#1A1A2E", size=11),
+                )
+                st.plotly_chart(_evo_fig, width='stretch',
+                                config={"displayModeBar": False})
+        else:
+            st.info("⏳ Sentiment Z-Score charts — accumulating ticks (needs ≥2 data refreshes to plot)", icon="📊")
+
+        # ═════════════════════════════════════════════════════════════════════════
+        # LIVE GEX + VEGA INTERPRETATION ENGINE  (v3 — lot-size corrected GEX,
+        # unweighted flip, magnitude-checked regime flags)
+        # Matrix 1: High+veGEX+suppressed-vega / Low−veGEX+expanding-vega /
+        #           FlipZone+VegaSpike / ATMmaxGEX+neutralVega
+        # Matrix 2: Zone-level below/above spot breakdown + confluence + extended wall
+        # "Vega" here means Net OI-weighted Vega Exposure (ΣOI×Vega), not raw unit vega.
+        # Refreshes with every data tick — no extra API calls needed.
+        # ═════════════════════════════════════════════════════════════════════════
+        # v14 (ported from Dash v15): snapshot of the already-computed GEX/Vega
+        # key levels, threaded into Shantanu's View's 15-min log below (replacing
+        # the old "Key Strikes" column). Defaults to None if this block errors.
+        _gv_levels_snapshot = None
+        try:
+            _atm_mask    = (_gd_src["strike"] - spot).abs() <= 3 * NIFTY_STEP
+            _above_mask  = _gd_src["strike"] > spot
+            _below_mask  = _gd_src["strike"] < spot
+
+            # ── Key GEX levels ────────────────────────────────────────────────────
+            _net_gex_total   = float(_gd_src["net_gex"].sum())
+            _cw_idx          = _gd_src.loc[_above_mask, "call_gex"].idxmax() if _above_mask.any() else _gd_src["call_gex"].idxmax()
+            _call_wall_k     = int(_gd_src.loc[_cw_idx, "strike"])
+            _pw_idx          = _gd_src.loc[_below_mask, "put_gex"].idxmax() if _below_mask.any() else _gd_src["put_gex"].idxmax()
+            _put_wall_k      = int(_gd_src.loc[_pw_idx, "strike"])
+            _gamma_flip_now  = m.get("gamma_flip")
+            _dist_to_call    = _call_wall_k - spot if _call_wall_k else 0
+            _dist_to_put     = spot - _put_wall_k  if _put_wall_k  else 0
+            _range_width     = _dist_to_call + _dist_to_put
+            _flip_str        = f"{int(_gamma_flip_now):,}" if _gamma_flip_now else "N/A"
+
+            # ── GAP 3: ATM-max GEX strike (for expiry magnet detection) ──────────
+            _max_net_gex_idx = _gd_src["net_gex"].idxmax()
+            _max_gex_strike  = int(_gd_src.loc[_max_net_gex_idx, "strike"])
+            _atm_strike      = int(round(spot / NIFTY_STEP) * NIFTY_STEP)
+            _max_gex_is_atm  = abs(_max_gex_strike - _atm_strike) <= NIFTY_STEP   # peak GEX at ATM?
+
+            # ── Key Vega levels ───────────────────────────────────────────────────
+            _net_vega_atm    = float(_gd_src.loc[_atm_mask, "net_vega"].sum())
+            _net_vega_total  = float(_gd_src["net_vega"].sum())
+            _vega_abs_max    = abs(_net_vega_total) if _net_vega_total != 0 else 1.0
+
+            # GAP 2: Net vega specifically AT the gamma flip strike
+            _flip_vega_atm   = 0.0
+            if _gamma_flip_now is not None:
+                _flip_mask   = (_gd_src["strike"] - _gamma_flip_now).abs() <= NIFTY_STEP
+                _flip_vega_atm = float(_gd_src.loc[_flip_mask, "net_vega"].sum())
+            _flip_vega_spiking = abs(_flip_vega_atm) > 0.15 * _vega_abs_max   # vega spike at flip strike
+
+            _max_neg_vega_k  = int(_gd_src.loc[(_below_mask | _atm_mask), "net_vega"].idxmin()
+                                   if (_below_mask | _atm_mask).any() else _gd_src["net_vega"].idxmin())
+            _max_neg_vega_k  = int(_gd_src.loc[_max_neg_vega_k, "strike"])
+            _max_pos_vega_k  = int(_gd_src.loc[(_above_mask | _atm_mask), "net_vega"].idxmax()
+                                   if (_above_mask | _atm_mask).any() else _gd_src["net_vega"].idxmax())
+            _max_pos_vega_k  = int(_gd_src.loc[_max_pos_vega_k, "strike"])
+
+            # GAP 3: Net vega at ATM-max-GEX strike (for expiry magnet: should be near-zero)
+            _atm_gex_vega_mask  = (_gd_src["strike"] - _max_gex_strike).abs() <= NIFTY_STEP
+            _atm_max_gex_vega   = float(_gd_src.loc[_atm_gex_vega_mask, "net_vega"].sum())
+            _vega_neutral_atm   = abs(_atm_max_gex_vega) < 0.08 * _vega_abs_max   # near-zero = neutral
+
+            # ── GEX regime flags ─────────────────────────────────────────────────
+            _is_pos_gex      = _net_gex_total > 0
+            # Magnitude check: net GEX must exceed 30% of the largest single-strike GEX
+            # magnitude to qualify as "high". Replaces the previous tautological check
+            # (_net_gex_total > 0.3 * abs(_net_gex_total)) which was always True when positive.
+            _gex_peak        = float(_gd_src["net_gex"].abs().max()) if not _gd_src.empty else 1.0
+            _is_high_pos_gex = _is_pos_gex and (_net_gex_total > 0.3 * max(_gex_peak, 1.0))
+            _above_flip      = (_gamma_flip_now is not None and spot > _gamma_flip_now)
+            _near_flip       = (_gamma_flip_now is not None and abs(spot - _gamma_flip_now) <= 2 * NIFTY_STEP)
+
+            # ── Vega regime flags ─────────────────────────────────────────────────
+            _iv_suppressed   = _net_vega_atm < 0
+            _iv_expanding    = _net_vega_atm > 0
+            # GAP 1: magnitude — is long vega HIGH or just marginal?
+            _high_long_vega  = _net_vega_atm > 0.25 * _vega_abs_max
+
+            # ── GAP 4: Zone-level below/above spot GEX+Vega breakdown ────────────
+            _below_net_gex   = float(_gd_src.loc[_below_mask, "net_gex"].sum())
+            _below_net_vega  = float(_gd_src.loc[_below_mask, "net_vega"].sum())
+            _above_net_gex   = float(_gd_src.loc[_above_mask, "net_gex"].sum())
+            _above_net_vega  = float(_gd_src.loc[_above_mask, "net_vega"].sum())
+
+            # Below-spot zone classification
+            if _below_net_gex > 0 and _below_net_vega < 0:
+                _below_zone_lbl  = "🟢 Soft floor — Put writers defending, IV suppressed below spot"
+            elif _below_net_gex <= 0 and _below_net_vega < 0:
+                _below_zone_lbl  = "🟡 Weak floor — Low GEX + IV sellers; floor can break quickly"
+            elif _below_net_vega > 0:
+                _below_zone_lbl  = "🔴 No floor — IV buyers below spot = market pricing downside move"
+            else:
+                _below_zone_lbl  = "⬜ Neutral below spot"
+
+            # Above-spot zone classification
+            if _above_net_gex > 0 and _above_net_vega > 0:
+                _above_zone_lbl  = "🔴 Hard ceiling — Dealer sell wall + IV kindling; breakout triggers vol spike"
+            elif _above_net_gex > 0 and _above_net_vega <= 0:
+                _above_zone_lbl  = "🟡 Soft ceiling — GEX resistance but IV sellers above; muted breakout"
+            elif _above_net_gex <= 0 and _above_net_vega > 0:
+                _above_zone_lbl  = "🟠 No ceiling — Low GEX + IV buyers above = market pricing upside move"
+            else:
+                _above_zone_lbl  = "⬜ Neutral above spot"
+
+            # GAP 4: Confluence check — do call_gex peak & call_vega_exp peak share the same strike?
+            _cw_vega_idx     = _gd_src.loc[_above_mask, "call_vega_exp"].idxmax() if _above_mask.any() else None
+            _call_vega_wall_k = int(_gd_src.loc[_cw_vega_idx, "strike"]) if _cw_vega_idx is not None else 0
+            _confluence      = (_call_wall_k == _call_vega_wall_k)   # GEX peak == Vega peak at same strike
+
+            # GAP 4: Secondary/extended call wall — 2nd highest call_gex above primary wall
+            _ext_mask        = _gd_src["strike"] > _call_wall_k
+            _ext_call_wall_k = 0
+            _ext_call_gex    = 0.0
+            if _ext_mask.any():
+                _ext_cw_idx      = _gd_src.loc[_ext_mask, "call_gex"].idxmax()
+                _ext_call_wall_k = int(_gd_src.loc[_ext_cw_idx, "strike"])
+                _ext_call_gex    = float(_gd_src.loc[_ext_cw_idx, "call_gex"])
+                _ext_vega_here   = float(_gd_src.loc[(_gd_src["strike"] == _ext_call_wall_k), "net_vega"].sum())
+                _has_ext_wall    = _ext_call_gex > 0.25 * float(_gd_src.loc[_cw_idx, "call_gex"])
+            else:
+                _has_ext_wall    = False
+                _ext_vega_here   = 0.0
+
+            # ════════════════════════════════════════════════════════════════════
+            # REGIME CLASSIFICATION (priority order: most specific first)
+            # ════════════════════════════════════════════════════════════════════
+
+            # GAP 3: Expiry Magnet — ATM has max GEX AND vega is neutral there
+            if _max_gex_is_atm and _vega_neutral_atm and _is_pos_gex:
+                _regime_tag   = "🧲 EXPIRY MAGNET  ·  CLASSIC PINNING"
+                _regime_color = "#0891B2"
+                _regime_bg    = "#ECFEFF"
+                _regime_text  = (
+                    f"The <b>maximum GEX in the entire chain is at the ATM strike ({_max_gex_strike:,})</b> — "
+                    f"exactly where spot ({spot:,.0f}) is trading — and Net Vega there is near-zero (no strong IV bias). "
+                    f"This is the textbook <b>expiry magnet pattern</b>: dealers have maximum hedging concentration at ATM, "
+                    f"creating a gravitational pull that keeps spot pinned. "
+                    f"Expect the market to oscillate tightly around <b>{_max_gex_strike:,}</b> into expiry."
+                )
+                _action_lines = [
+                    f"✅ <b>Short ATM straddle at {_max_gex_strike:,}</b> — classic expiry magnet, theta is maximum here",
+                    f"✅ <b>Iron condor</b> with strikes at {_put_wall_k:,} / {_call_wall_k:,} — both walls defined",
+                    f"⚠️ <b>Avoid directional bets</b> — the magnet will frustrate both bulls and bears",
+                    f"⚠️ <b>Stop-loss</b> if spot moves more than {2*NIFTY_STEP:.0f} pts from {_max_gex_strike:,} and holds — magnet broken",
+                ]
+
+            # GAP 2: Flip zone WITH vega spike at flip strike = high-risk / avoid short straddle
+            elif _near_flip and _flip_vega_spiking:
+                _regime_tag   = "⚡ FLIP ZONE  ·  VEGA SPIKE  ·  HIGH RISK"
+                _regime_color = "#9333EA"
+                _regime_bg    = "#FAF5FF"
+                _flip_vega_dir = "long" if _flip_vega_atm > 0 else "short"
+                _regime_text  = (
+                    f"Spot ({spot:,.0f}) is <b>within {abs(spot - _gamma_flip_now):.0f} pts of the Gamma Flip ({_flip_str})</b> "
+                    f"AND Net Vega is <b>spiking at that exact strike</b> (IV {'buyers' if _flip_vega_atm > 0 else 'sellers'} concentrated at the flip). "
+                    f"This is the most dangerous combination: a regime change is imminent AND IV is set to "
+                    f"{'expand sharply if the flip is crossed' if _flip_vega_atm > 0 else 'compress suddenly — a trap for IV buyers'}. "
+                    f"<b>Avoid short straddles here</b> — the flip + vega spike = asymmetric risk."
+                )
+                _action_lines = [
+                    f"🚨 <b>DO NOT sell straddles or strangles</b> — flip zone + vega spike = maximum regime uncertainty",
+                    f"🚨 <b>Reduce ALL short option exposure</b> immediately until spot resolves clear of {_flip_str}",
+                    f"✅ <b>Long straddle / strangle</b> is the only structurally safe position here",
+                    f"✅ <b>Binary trigger</b>: close above {_flip_str} = buy calls/bull spreads; close below = buy puts/bear spreads",
+                ]
+
+            # Flip zone WITHOUT vega spike = straddle is ok (cheaper, no IV spike risk)
+            elif _near_flip and not _flip_vega_spiking:
+                _regime_tag   = "⚡ FLIP ZONE  ·  LOW VEGA  ·  REGIME UNSTABLE"
+                _regime_color = "#7C3AED"
+                _regime_bg    = "#F5F3FF"
+                _regime_text  = (
+                    f"Spot ({spot:,.0f}) is <b>within {abs(spot - _gamma_flip_now):.0f} pts of the Gamma Flip ({_flip_str})</b>. "
+                    f"IV at the flip strike is <b>not spiking yet</b> — options are relatively cheap here. "
+                    f"A small move can flip dealers from long gamma (pinning) to short gamma (amplifying), "
+                    f"but the lack of vega spike means the move may be slower to develop. "
+                    f"{'IV buyers active at ATM — directional move being priced in.' if _iv_expanding else 'IV sellers still present — flip may not trigger immediately.'}"
+                )
+                _action_lines = [
+                    f"⚠️ <b>Reduce position size</b> — regime change is close, direction unclear",
+                    f"⚠️ <b>No new short premium</b> until spot resolves above or below {_flip_str}",
+                    f"✅ <b>Long straddle / strangles are relatively cheap here</b> — IV not yet spiking at flip",
+                    f"✅ <b>Watch {_flip_str}</b>: close above = pinning regime; close below = trending/amplifying begins",
+                ]
+
+            # GAP 1 (enhanced): Low/negative GEX + HIGH long vega = EXPLOSIVE BREAKOUT RISK
+            elif not _is_pos_gex and _high_long_vega:
+                _regime_tag   = "🔴 EXPLOSIVE BREAKOUT RISK  ·  SHORT-GAMMA + HIGH LONG VEGA"
+                _regime_color = "#B91C1C"
+                _regime_bg    = "#FEF2F2"
+                _regime_text  = (
+                    f"<b>Explosive breakout risk is elevated.</b> "
+                    f"Spot ({spot:,.0f}) is in a short-gamma regime (Net GEX negative"
+                    + (f", below Gamma Flip at {_flip_str}" if _gamma_flip_now else "")
+                    + f") — dealers amplify every move. "
+                    f"Simultaneously, IV buyers have <b>high long vega exposure near ATM</b>, "
+                    f"meaning the market is actively pricing in a large swing. "
+                    f"Both forces point the same direction: <b>a big move is coming and it will accelerate</b>."
+                )
+                _action_lines = [
+                    f"🚨 <b>DO NOT sell naked options</b> — short-gamma + high long vega = explosive move risk",
+                    f"🚨 <b>Close any short strangles / short straddles immediately</b>",
+                    f"✅ <b>Buy directional debit spreads</b> in the direction momentum is pointing",
+                    f"✅ <b>Long straddle / strangle</b> if direction unclear — IV expansion will pay for it",
+                    f"📌 <b>IV kindling zone at {_max_pos_vega_k:,}</b> — crossing here triggers maximum vol expansion",
+                ]
+
+            # Low/negative GEX + marginal/low long vega = trending but not explosive
+            elif not _is_pos_gex and _iv_expanding:
+                _regime_tag   = "🟠 TRENDING  ·  IV EXPANDING"
+                _regime_color = "#DC2626"
+                _regime_bg    = "#FEF2F2"
+                _regime_text  = (
+                    f"Spot ({spot:,.0f}) is in a short-gamma regime (Net GEX negative"
+                    + (f", below Gamma Flip at {_flip_str}" if _gamma_flip_now else "")
+                    + f"). Dealers amplify moves — they buy rallies and sell drops. "
+                    f"IV buyers are active at ATM (positive Net Vega), though not at explosive levels yet. "
+                    f"This is a <b>directional session</b> — moves are likely to extend."
+                )
+                _action_lines = [
+                    f"🚨 <b>Do NOT sell naked options</b> — short gamma + expanding IV = compounding risk",
+                    f"✅ <b>Buy directional debit spreads</b> in the direction of the trend",
+                    f"✅ <b>Long straddle</b> near ATM if direction unclear — vega gains likely",
+                    f"📌 <b>IV gravity well at {_max_neg_vega_k:,}</b> — expect temporary IV compression if spot reaches there",
+                ]
+
+            # Positive GEX + IV suppressed = strong pinning (Matrix 1 Row 1 — fully covered)
+            elif _is_pos_gex and _above_flip and _iv_suppressed:
+                _regime_tag   = "🟢 STRONG PINNING  ·  IV SUPPRESSED"
+                _regime_color = "#059669"
+                _regime_bg    = "#ECFDF5"
+                _regime_text  = (
+                    f"<b>Strong pinning regime.</b> "
+                    f"Spot ({spot:,.0f}) is above the Gamma Flip ({_flip_str}) — dealers are net long gamma "
+                    f"(they dampen all moves). "
+                    f"IV sellers dominate at ATM (negative Net Vega), compressing premiums further. "
+                    f"The Call Wall at <b>{_call_wall_k:,}</b> ({_dist_to_call:.0f} pts away) acts as a hard ceiling "
+                    + (f"<b>with vega confluence</b> (GEX peak = Vega peak at same strike — double confirmation). " if _confluence else ". ")
+                    + f"This is a classic low-range session."
+                )
+                _action_lines = [
+                    f"✅ <b>Sell OTM strangles / short straddle</b> — IV suppressed, theta decay is maximised",
+                    f"✅ <b>Range to trade: {_put_wall_k:,} – {_call_wall_k:,}</b> ({_range_width:.0f} pts wide) — fade moves to extremes",
+                    f"⚠️ <b>Stop-loss</b> if spot closes above {_call_wall_k:,} — pinning regime breaks",
+                    f"⚠️ <b>Stop-loss</b> if spot closes below Gamma Flip ({_flip_str}) — regime shifts to trending",
+                ]
+
+            elif _is_pos_gex and _above_flip and _iv_expanding:
+                _regime_tag   = "🟡 RANGE-BOUND  ·  IV BUILDING"
+                _regime_color = "#D97706"
+                _regime_bg    = "#FFFBEB"
+                _regime_text  = (
+                    f"Spot ({spot:,.0f}) is above the Gamma Flip ({_flip_str}) — dealers still long gamma (pinning). "
+                    f"However, IV buyers are becoming active near ATM (positive Net Vega), suggesting "
+                    f"the market is <b>pricing in a potential breakout</b>. "
+                    f"The Call Wall at <b>{_call_wall_k:,}</b> is the key trigger level. "
+                    f"This is a <b>transitional state</b> — pinning may break if IV keeps building."
+                )
+                _action_lines = [
+                    f"⚠️ <b>Avoid naked short premium</b> — IV is rising, vega losses could offset theta gains",
+                    f"✅ <b>Consider debit spreads</b> toward {_call_wall_k:,} if IV momentum continues",
+                    f"✅ <b>Watch {_call_wall_k:,}</b> — a break with volume = short-gamma trending regime",
+                    f"📌 <b>Range still valid</b>: {_put_wall_k:,} – {_call_wall_k:,}, but risk is elevated",
+                ]
+
+            elif not _is_pos_gex and _iv_suppressed:
+                _regime_tag   = "🟠 TRENDING  ·  IV SUPPRESSED (CAUTION)"
+                _regime_color = "#EA580C"
+                _regime_bg    = "#FFF7ED"
+                _regime_text  = (
+                    f"Spot ({spot:,.0f}) is in a short-gamma regime (Net GEX negative) but IV sellers are still active near ATM. "
+                    f"<b>Unstable combination</b> — the directional move is underway but IV hasn't caught up yet. "
+                    f"A sudden IV spike is possible if spot approaches the IV kindling zone at <b>{_max_pos_vega_k:,}</b>."
+                )
+                _action_lines = [
+                    f"⚠️ <b>Caution with short premium</b> — short-gamma amplifies moves quickly",
+                    f"✅ <b>Tight stop losses</b> on any short options position",
+                    f"📌 <b>Watch {_max_pos_vega_k:,}</b> — if spot reaches IV kindling zone, expect vol spike",
+                    f"✅ <b>Debit spreads</b> are safer than naked options in this regime",
+                ]
+
+            else:
+                _regime_tag   = "⬜ NEUTRAL  ·  REGIME UNCLEAR"
+                _regime_color = "#6B7280"
+                _regime_bg    = "#F9FAFB"
+                _regime_text  = (
+                    f"GEX and Vega signals are mixed near spot ({spot:,.0f}). "
+                    f"Insufficient signal strength for a high-confidence regime call. Collect more ticks."
+                )
+                _action_lines = [
+                    "📌 Wait for clearer GEX/Vega alignment before entering directional or premium trades",
+                ]
+
+            # ── GAP 4: Zone-level breakdown row ──────────────────────────────────
+            _zone_html = (
+                f"<div style='display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px'>"
+                f"<div style='flex:1;min-width:200px;background:rgba(0,0,0,0.04);border-radius:8px;"
+                f"padding:8px 12px;font-size:12px'>"
+                f"<span style='font-weight:700;color:#6B7280;font-size:10px;text-transform:uppercase'>"
+                f"Below Spot Zone</span><br>{_below_zone_lbl}</div>"
+                f"<div style='flex:1;min-width:200px;background:rgba(0,0,0,0.04);border-radius:8px;"
+                f"padding:8px 12px;font-size:12px'>"
+                f"<span style='font-weight:700;color:#6B7280;font-size:10px;text-transform:uppercase'>"
+                f"Above Spot Zone</span><br>{_above_zone_lbl}</div>"
+                + (f"<div style='flex:1;min-width:200px;background:#FEF9C3;border-radius:8px;"
+                   f"padding:8px 12px;font-size:12px'>"
+                   f"<span style='font-weight:700;color:#92400E;font-size:10px;text-transform:uppercase'>"
+                   f"Extended Resistance</span><br>"
+                   f"🟡 Secondary wall at <b>{_ext_call_wall_k:,}</b> — "
+                   f"{'+ IV expansion risk on breakout past primary wall' if _ext_vega_here > 0 else 'muted vega above primary wall'}"
+                   f"</div>" if _has_ext_wall else "")
+                + (f"<div style='flex:1;min-width:200px;background:#F0FDF4;border-radius:8px;"
+                   f"padding:8px 12px;font-size:12px'>"
+                   f"<span style='font-weight:700;color:#166534;font-size:10px;text-transform:uppercase'>"
+                   f"Confluence ✅</span><br>"
+                   f"GEX peak = Vega peak at <b>{_call_wall_k:,}</b> — double-confirmed resistance"
+                   f"</div>" if _confluence else "")
+                + f"</div>"
+            )
+
+            # ── Key levels strip ──────────────────────────────────────────────────
+            _levels_html = (
+                f"<span style='color:#DC2626;font-weight:700'>Call Wall: {_call_wall_k:,}</span>"
+                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                f"<span style='color:#059669;font-weight:700'>Put Wall: {_put_wall_k:,}</span>"
+                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                f"<span style='color:#7C3AED;font-weight:700'>Gamma Flip: {_flip_str}</span>"
+                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                f"<span style='color:#F97316;font-weight:700'>IV Gravity: {_max_neg_vega_k:,}</span>"
+                f"&nbsp;&nbsp;|&nbsp;&nbsp;"
+                f"<span style='color:#2563EB;font-weight:700'>IV Kindling: {_max_pos_vega_k:,}</span>"
+                + (f"&nbsp;&nbsp;|&nbsp;&nbsp;<span style='color:#0891B2;font-weight:700'>Ext. Wall: {_ext_call_wall_k:,}</span>"
+                   if _has_ext_wall else "")
+            )
+
+            # v14 (ported from Dash v15): snapshot the already-computed GEX/Vega
+            # key levels so Shantanu's View can thread them into its 15-min log
+            # (replacing the old "Key Strikes" column).
+            _gv_levels_snapshot = {
+                "call_wall":   _call_wall_k,
+                "put_wall":    _put_wall_k,
+                "gamma_flip":  _flip_str,
+                "iv_gravity":  _max_neg_vega_k,
+                "iv_kindling": _max_pos_vega_k,
+            }
+
+            _actions_html = "".join(
+                f"<div style='margin:4px 0;font-size:13px;color:#1A1A2E'>{a}</div>" for a in _action_lines
+            )
+
+            # Fix 7: Regime persistence — track consecutive ticks in same regime
+            _rs = st.session_state.gex_regime_state
+            if _rs["tag"] == _regime_tag:
+                _rs["count"] += 1
+            else:
+                _rs["tag"]   = _regime_tag
+                _rs["count"] = 1
+            st.session_state.gex_regime_state = _rs
+            _persist_badge = (
+                f"<span style='float:right;font-size:10px;font-weight:700;padding:2px 8px;"
+                f"border-radius:10px;background:{'#D1FAE5' if _rs['count'] >= 2 else '#FEF3C7'};"
+                f"color:{'#059669' if _rs['count'] >= 2 else '#D97706'};'>"
+                f"{'✅ CONFIRMED' if _rs['count'] >= 2 else '🔄 NEW — CONFIRMING'} ({_rs['count']} tick{'s' if _rs['count']>1 else ''})"
+                f"</span>"
+            )
+
+            st.markdown(
+                f"""<div style='background:{_regime_bg};border:2px solid {_regime_color};
+                    border-radius:12px;padding:16px 20px;margin:14px 0'>
+                  <div style='font-size:11px;font-weight:700;color:#6B7280;
+                    text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px'>
+                    ⚡ GEX + Vega Live Interpretation {_persist_badge}</div>
+                  <div style='font-size:15px;font-weight:800;color:{_regime_color};
+                    margin-bottom:10px'>{_regime_tag}</div>
+                  <div style='font-size:13px;color:#374151;line-height:1.7;
+                    margin-bottom:12px'>{_regime_text}</div>
+                  {_zone_html}
+                  <div style='background:rgba(0,0,0,0.04);border-radius:8px;
+                    padding:10px 14px;margin-bottom:12px;font-size:11px;
+                    color:#6B7280;line-height:2.0'>{_levels_html}</div>
+                  <div style='font-size:11px;font-weight:700;color:#6B7280;
+                    text-transform:uppercase;margin-bottom:6px'>Actionable Guidance</div>
+                  {_actions_html}
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        except Exception as _interp_err:
+            st.caption(f"GEX+Vega interpretation unavailable: {_interp_err}")
+
+    else:
+        st.info("⏳ Gamma data unavailable — waiting for option chain.")
+_slot_gamma.empty()           # v20: Gamma & Vega Live Interpretation visual output suppressed — all calculations above preserved
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3: KEY PRICE LEVELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════
+# v4 #9: LEADING SIGNALS / EARLY WARNING PANEL
+# ═══════════════════════════════════════════════════════════════════
+st.markdown('<div class="section-header">🔮 Leading Signals / Early Warning</div>', unsafe_allow_html=True)
+
+_ls_col1, _ls_col2, _ls_col3 = st.columns(3)
+
+with _ls_col1:
+    # Divergence Proximity Gauge
+    _dp_color = "#DC2626" if _div_proximity >= 60 else ("#F59E0B" if _div_proximity >= 35 else "#059669")
+    _dp_label = "APPROACHING DIVERGENCE" if _div_proximity >= 60 else ("WATCHING" if _div_proximity >= 35 else "CLEAR")
+    st.markdown(f"""
+    <div class="card">
+      <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Divergence Proximity</div>
+      <div style="font-size:28px;font-weight:900;color:{_dp_color};margin:6px 0;">{_div_proximity:.0f} / 100</div>
+      <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+        <div style="background:{_dp_color};height:6px;border-radius:4px;width:{_div_proximity}%;"></div>
+      </div>
+      <div style="font-size:12px;font-weight:700;color:{_dp_color};">{_dp_label}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Fires at 60+ — early warning before actual divergences trigger</div>
+    </div>""", unsafe_allow_html=True)
+
+    # Bias Velocity
+    _vel_color = "#059669" if _velocity > 2 else ("#DC2626" if _velocity < -2 else "#6B7280")
+    _vel_label = "ACCELERATING BULL" if _velocity > 5 else ("ACCELERATING BEAR" if _velocity < -5 else "STEADY")
+    st.markdown(f"""
+    <div class="card">
+      <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Bias Velocity (Signal 6)</div>
+      <div style="font-size:28px;font-weight:900;color:{_vel_color};margin:6px 0;">{_velocity:+.1f} pts/tick</div>
+      <div style="font-size:12px;font-weight:700;color:{_vel_color};">{_vel_label}</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Acceleration: {_accel:+.1f} pts/tick²</div>
+    </div>""", unsafe_allow_html=True)
+
+with _ls_col2:
+    # Gamma Flip Proximity
+    if _gamma_flip_proximity:
+        _gfp = _gamma_flip_proximity
+        _gfp_color = "#DC2626" if _gfp["regime_risk"] == "HIGH" else ("#F59E0B" if _gfp["regime_risk"] == "ELEVATED" else "#059669")
+        st.markdown(f"""
+        <div class="card">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Gamma Flip Proximity</div>
+          <div style="font-size:16px;font-weight:800;color:#1A1A2E;">Flip @ {_gfp["flip_strike"]:,.0f}</div>
+          <div style="font-size:13px;color:{_gfp_color};font-weight:700;">Spot {_gfp["side"]} by {_gfp["distance_pts"]:,.0f}pts ({_gfp["pct_of_threshold"]:.0f}% of threshold)</div>
+          <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+            <div style="background:{_gfp_color};height:6px;border-radius:4px;width:{min(100, _gfp["pct_of_threshold"])}%;"></div>
+          </div>
+          <div style="font-size:12px;font-weight:700;color:{_gfp_color};">Risk: {_gfp["regime_risk"]}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="card"><div style="font-size:11px;font-weight:700;color:#6B7280;">Gamma Flip Proximity</div><div style="font-size:12px;color:#9CA3AF;margin-top:6px;">No gamma flip detected</div></div>', unsafe_allow_html=True)
+
+    # OI Momentum Exhaustion
+    if _oi_exhaustion:
+        _oe = _oi_exhaustion
+        st.markdown(f"""
+        <div class="card">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">OI Momentum Exhaustion</div>
+          <div style="font-size:16px;font-weight:800;color:{_oe["color"]};">{_oe["label"]}</div>
+          <div style="font-size:12px;color:#374151;">{_oe["direction"]} flow exhaust ratio: {_oe["exhaust_ratio"]:.2f}</div>
+          <div style="background:#E5E7EB;border-radius:4px;height:6px;margin:4px 0;">
+            <div style="background:{_oe["color"]};height:6px;border-radius:4px;width:{min(100, _oe["exhaust_ratio"] * 100)}%;"></div>
+          </div>
+          <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Ratio <0.50 = exhaustion (reversal risk)</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="card"><div style="font-size:11px;font-weight:700;color:#6B7280;">OI Momentum Exhaustion</div><div style="font-size:12px;color:#9CA3AF;margin-top:6px;">Need 5+ ticks of history</div></div>', unsafe_allow_html=True)
+
+with _ls_col3:
+    # Inter-Expiry OI Flow
+    # ── Inter-Expiry OI Flow: enhanced with roll detection output ────────────
+    _rd = _roll_data   # from detect_roll_activity() computed above
+    _roll_frac  = _rd.get("roll_fraction", 0.0)
+    _roll_det   = _rd.get("roll_detected", False)
+    _mom_disc   = _rd.get("momentum_discount", 1.0)
+    _roll_win   = _s34_bias.get("roll_window_active", False)
+    _roll_disc_applied = _s34_bias.get("roll_discount_applied", 1.0)
+    _rd_detail  = (_rd.get("details") or ["Roll detection inactive"])[0]
+    _card_color = "#DC2626" if _roll_det else ("#D97706" if _roll_win else "#059669")
+    _disc_label = f"{_mom_disc*100:.0f}% S2 strength" if _mom_disc < 1.0 else "Full S2 strength"
+    if _inter_expiry_signal and _inter_expiry_signal["available"]:
+        _ie = _inter_expiry_signal
+        st.markdown(f"""
+        <div class="card" style="border-left:4px solid {_card_color};">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Inter-Expiry OI Flow</div>
+          <div style="font-size:13px;font-weight:700;color:#1A1A2E;">Front PCR: {_ie["front_pcr"]:.2f} · Back PCR: {_ie["back_pcr"]:.2f}</div>
+          <div style="font-size:12px;color:#374151;">PCR diff (front–back): {_ie["pcr_diff"]:+.2f} · Front mom: {_ie["front_momentum"]:+,.0f}</div>
+          <div style="font-size:11px;color:{_card_color};font-weight:700;margin-top:5px;">
+            {"⚠ ROLL WINDOW ACTIVE" if _roll_win else "✓ No roll window"} · Roll fraction: {_roll_frac*100:.0f}% · {_disc_label}
+          </div>
+          <div style="font-size:11px;color:#6B7280;margin-top:3px;">{_rd_detail}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        # Even without cross-PCR data, show roll detection status
+        st.markdown(f"""
+        <div class="card" style="border-left:4px solid {_card_color};">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Inter-Expiry OI Flow</div>
+          <div style="font-size:11px;color:{_card_color};font-weight:700;margin-top:5px;">
+            {"⚠ ROLL WINDOW ACTIVE" if _roll_win else "✓ No roll window"} · Roll fraction: {_roll_frac*100:.0f}% · {_disc_label}
+          </div>
+          <div style="font-size:11px;color:#6B7280;margin-top:3px;">{_rd_detail}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # Smart Money OI Filter Stats
+    _sm_quality_count = _s34_bias.get("quality_strikes_count", 0)
+    _sm_label = "SMART MONEY" if _sm_quality_count > 5 else "MIXED"
+    _sm_color = "#059669" if _sm_quality_count > 5 else "#F59E0B"
+    st.markdown(f"""
+    <div class="card">
+      <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Smart Money OI Filter</div>
+      <div style="font-size:16px;font-weight:800;color:{_sm_color};">{_sm_label}</div>
+      <div style="font-size:12px;color:#374151;">Quality strikes passing filter</div>
+      <div style="font-size:10px;color:#9CA3AF;margin-top:4px;">Filters noise: requires significance floor + proximity to ATM</div>
+    </div>""", unsafe_allow_html=True)
+
+# ══ END LEADING SIGNALS PANEL ════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Enhanced NDM v10 — per-strike Buyer/Seller Decision Matrix
+# Combines, PER STRIKE (full ±10 structural band), the exact data of the two
+# Section-4 charts:
+#   • EVR(k) — Raw CE/PE Extrinsic-Value ratio   = ev_c / ev_p
+#              (chart: "Raw CE/PE EV Ratio per Strike")
+#   • NDM(k) — Δ-Weighted OI Change Momentum     = CallOIChg×|Δc| − PutOIChg×|Δp|
+#              (chart: "Δ-Weighted OI Change Momentum")
+#
+# Matrix (bias from EVR, momentum strength from NDM):
+#   1. EVR>1.2   & NDM>0 → Call BUYERS  stronger than Put sellers  → BULLISH · STRONG upside
+#   2. EVR>1.2   & NDM<0 → Put SELLERS  stronger than Call buyers  → BULLISH · weak upside
+#   3. EVR<0.7   & NDM<0 → Put BUYERS   stronger than Call sellers → BEARISH · STRONG downside
+#   4. EVR<0.7   & NDM>0 → Call SELLERS stronger than Put buyers   → BEARISH · weak downside
+#   • 0.7 ≤ EVR ≤ 1.2 is now a NEUTRAL zone (v17: bullish requires EVR>1.2, bearish EVR<0.7)
+#
+# Aggregation:
+#   • Overall BIAS       = average per-strike raw EVR  (>1.2 bullish, <0.7 bearish, else neutral)
+#   • MOMENTUM strength  = share of STRONG-buyer strikes (row 1 / row 3) in the
+#                          relevant OTM segment + ATM + up to 2 shallow-ITM strikes
+#   • RANGE override     = strong Put sellers below spot AND strong Call sellers
+#                          above spot → RANGE-BOUND, pinning the ATM
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ENDM_HIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "endm_verdict_history_streamlit.json")
+_ENDM_HIST_FLOCK = _SH["endm_lock"]   # v27: shared across reruns/visitors
+
+
+def _endm_hist_file_load():
+    """Load the persisted 15-min verdict log from disk (empty store on any error)."""
+    try:
+        with open(_ENDM_HIST_FILE, "r", encoding="utf-8") as _f:
+            _raw = json.load(_f)
+        _rows = []
+        for _r in _raw.get("rows", []):
+            _r = dict(_r)
+            _r["_ts"] = datetime.fromisoformat(_r["_ts"])
+            _rows.append(_r)
+        _d = date.fromisoformat(_raw["date"]) if _raw.get("date") else None
+        return {"date": _d, "rows": _rows}
+    except Exception:
+        return {"date": None, "rows": []}
+
+
+def _endm_hist_file_save(_store):
+    """Atomically persist the verdict log to disk (best-effort, temp file + rename)."""
+    try:
+        _raw = {"date": _store["date"].isoformat() if _store["date"] else None,
+                "rows": [dict({_k: _v for _k, _v in _r.items() if _k != "_ts"},
+                              _ts=_r["_ts"].isoformat()) for _r in _store["rows"]]}
+        _tmp = _ENDM_HIST_FILE + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            json.dump(_raw, _f, ensure_ascii=False, indent=1)
+        os.replace(_tmp, _ENDM_HIST_FILE)
+    except Exception:
+        pass
+
+
+def _fmt_gv_levels(gv):
+    """Format the GEX/Vega key-levels snapshot (Call Wall, Put Wall, Gamma
+    Flip, IV Gravity, IV Kindling) for the 15-min log's level column.
+
+    v14 (ported from Dash v15): this replaces the old "Key Strikes" column,
+    which used to show the strongest buyer/seller strikes from the NDM
+    matrix. Now every 15-min row stamps the already-computed GEX+Vega Live
+    Interpretation levels instead.
+    """
+    if not gv:
+        return "—"
+    def _n(v):
+        try:
+            return f"{int(v):,}"
+        except Exception:
+            return "N/A"
+    return (f"CW {_n(gv.get('call_wall'))} · PW {_n(gv.get('put_wall'))} · "
+            f"GF {gv.get('gamma_flip') or 'N/A'} · "
+            f"IVG {_n(gv.get('iv_gravity'))} · IVK {_n(gv.get('iv_kindling'))}")
+
+
+def _endm_verdict_history_append(store, verdict, bias, momentum, levels_txt):
+    """Append current final verdict to the 15-minute history log.
+
+    v10.1: the log is persisted to a JSON file next to the app script, so it
+    survives browser refreshes, is shared across every device/tab hitting the
+    same server, and survives app restarts. Auto-resets on a new trading day.
+    (The in-memory `store` argument is kept only for signature compatibility.)
+
+    v14 (ported from Dash v15): the logged column is "Key Levels
+    (CW/PW/GF/IVG/IVK)" — the GEX+Vega Call Wall / Put Wall / Gamma Flip /
+    IV Gravity / IV Kindling snapshot — replacing the old "Key Strikes"
+    (strongest buyer/seller strikes) column.
+    """
+    _now = now_ist()
+    if _now.hour == 9 and _now.minute < 30:
+        # Suppression window (matches the UI): unreliable gap-open verdicts
+        # must not enter the persistent log. Return existing rows unchanged.
+        _disk = _endm_hist_file_load()
+        if _disk.get("date") != _now.date():
+            return []
+        return [{k: v for k, v in r.items() if k != "_ts"} for r in _disk["rows"]]
+    with _ENDM_HIST_FLOCK:
+        _disk = _endm_hist_file_load()
+        if _disk.get("date") != _now.date():
+            _disk["date"] = _now.date()
+            _disk["rows"] = []
+        _rows = _disk["rows"]
+        if not _rows or (_now - _rows[-1]["_ts"]).total_seconds() >= 15 * 60:
+            _rows.append({"_ts": _now,
+                          "Time (IST)": _now.strftime("%H:%M:%S"),
+                          "Final Verdict": verdict,
+                          "Bias": bias,
+                          "Momentum": momentum,
+                          "Key Levels (CW/PW/GF/IVG/IVK)": levels_txt})
+            _endm_hist_file_save(_disk)
+    return [{k: v for k, v in r.items() if k != "_ts"} for r in _rows]
+
+
+def _compute_enhanced_ndm(df_band_records, m, spot, hist_store=None, gv_levels=None):
+    """Enhanced NDM v10 — per-strike Buyer/Seller matrix (see banner above).
+
+    v14 (ported from Dash v15): `gv_levels` is the Call Wall / Put Wall /
+    Gamma Flip / IV Gravity / IV Kindling snapshot from the GEX+Vega Live
+    Interpretation section — it is stamped into the 15-min log in place of
+    the old "Key Strikes" column.
+    """
+    _step = NIFTY_STEP
+    _atm  = round(spot / _step) * _step if spot else 0
+
+    _rows = []
+    for _r in df_band_records:
+        _strike  = float(_r.get("strike", 0) or 0)
+        _c_chg   = float(_r.get("call_oi_chg", 0) or 0)
+        _p_chg   = float(_r.get("put_oi_chg",  0) or 0)
+        _cd      = abs(float(_r.get("call_delta", 0) or 0))
+        _pdl     = abs(float(_r.get("put_delta",  0) or 0))
+        _c_ltp   = float(_r.get("call_ltp", 0) or 0)
+        _p_ltp   = float(_r.get("put_ltp",  0) or 0)
+
+        # Raw CE/PE EV ratio per strike — identical formula to the Section-4 chart
+        _ev_c = max(0.0, _c_ltp - max(0.0, spot - _strike))
+        _ev_p = max(0.0, _p_ltp - max(0.0, _strike - spot))
+        if _ev_p > 1e-9:
+            _evr = _ev_c / _ev_p
+        elif _ev_c > 1e-9:
+            _evr = float("inf")
+        else:
+            _evr = float("nan")
+
+        # Δ-weighted OI change momentum per strike — identical to Section-4 chart
+        _ndm = _c_chg * _cd - _p_chg * _pdl
+
+        # Matrix classification
+        # v17: neutral zone widened to 0.7–1.2 — bullish rows (1/2) now
+        # require EVR > 1.2, bearish rows (3/4) require EVR < 0.7; strikes
+        # in between fall through to neutral (row 0) instead.
+        if np.isnan(_evr) or abs(_evr - 1.0) < 1e-9 or (abs(_c_chg) < 1 and abs(_p_chg) < 1):
+            _row_id, _dom, _read = 0, "~ Neutral", "No dominant aggressor"
+        elif _evr > 1.2 and _ndm > 0:
+            _row_id, _dom, _read = 1, "Call buyers > Put sellers",  "BULLISH · STRONG upside"
+        elif _evr > 1.2:
+            _row_id, _dom, _read = 2, "Put sellers > Call buyers",  "BULLISH · weak upside"
+        elif _evr < 0.7 and _ndm < 0:
+            _row_id, _dom, _read = 3, "Put buyers > Call sellers",  "BEARISH · STRONG downside"
+        elif _evr < 0.7:
+            _row_id, _dom, _read = 4, "Call sellers > Put buyers",  "BEARISH · weak downside"
+        else:
+            _row_id, _dom, _read = 0, "~ Neutral", "EVR 0.7–1.2 — neutral zone, no dominant aggressor"
+
+        # Per-strike Enhanced NDM — stance decided PER STRIKE by its own EVR:
+        #   EVR>1: call buying (+) and put writing (+) are BOTH bullish hedge flows
+        #   EVR<1: put buying (−) and call writing (−) are BOTH bearish hedge flows
+        if _row_id in (1, 2):
+            _endm_v = _c_chg * _cd + _p_chg * _pdl
+        elif _row_id in (3, 4):
+            _endm_v = -(_c_chg * _cd) - (_p_chg * _pdl)
+        else:
+            _endm_v = 0.0
+
+        _rows.append(dict(strike=int(_strike), evr=_evr, ndm=_ndm, endm=_endm_v,
+                          row_id=_row_id, dom=_dom, read=_read))
+
+    if not _rows:
+        return dict(df=pd.DataFrame(), enhanced_total=0, raw_total=0,
+                    verdict="➖ NO DATA", bias="NEUTRAL", mom_lbl="—",
+                    reason=[], evr_avg=1.0, history=[], sc="#6B7280", sbg="#F9FAFB")
+
+    _mx = pd.DataFrame(_rows)
+
+    # ── Aggregate: BIAS from average per-strike raw EVR ──────────────────────
+    _evr_fin  = _mx["evr"][np.isfinite(_mx["evr"])]
+    _evr_avg  = float(_evr_fin.mean()) if len(_evr_fin) else 1.0
+    # v17: neutral 0.7-1.2 — bullish only above 1.2, bearish only below 0.7.
+    if   _evr_avg > 1.2: _bias = "BULLISH"
+    elif _evr_avg < 0.7: _bias = "BEARISH"
+    else:                _bias = "NEUTRAL"
+
+    _tot_abs = float(_mx["ndm"].abs().sum()) or 1.0
+    _fmt_ks  = lambda arr: ", ".join(f"{int(k):,}" for k in arr) if len(arr) else "—"
+    def _top_strikes(sub, n=4):
+        if sub.empty: return []
+        return list(sub.reindex(sub["ndm"].abs().sort_values(ascending=False).index)["strike"].head(n))
+
+    # ── RANGE-BOUND override: strong opposite sellers on both sides of spot ──
+    _ps_below = _mx[(_mx["strike"] < spot) & (_mx["row_id"] == 2)]   # Put sellers below spot
+    _cs_above = _mx[(_mx["strike"] > spot) & (_mx["row_id"] == 4)]   # Call sellers above spot
+    _rb_share = (float(_ps_below["ndm"].abs().sum()) + float(_cs_above["ndm"].abs().sum())) / _tot_abs
+    _rangebound = (len(_ps_below) >= 2 and len(_cs_above) >= 2 and _rb_share >= 0.5)
+
+    # ── MOMENTUM strength: strong buyers at OTM + ATM + up to 2 shallow ITM ──
+    if _bias == "BULLISH":
+        _seg = _mx[_mx["strike"] >= spot - 2 * _step]        # shallow ITM + ATM + OTM calls
+        _strong_sub, _weak_sub = _seg[_seg["row_id"] == 1], _seg[_seg["row_id"] == 2]
+    elif _bias == "BEARISH":
+        _seg = _mx[_mx["strike"] <= spot + 2 * _step]        # shallow ITM + ATM + OTM puts
+        _strong_sub, _weak_sub = _seg[_seg["row_id"] == 3], _seg[_seg["row_id"] == 4]
+    else:
+        _seg = _mx.iloc[0:0]; _strong_sub = _seg; _weak_sub = _seg
+    _seg_abs      = float(_seg["ndm"].abs().sum()) or 1.0
+    _strong_share = float(_strong_sub["ndm"].abs().sum()) / _seg_abs
+    _strong_mom   = (_strong_share >= 0.5) and (len(_strong_sub) >= 1)
+    _strong_ks    = _top_strikes(_strong_sub)
+    _weak_ks      = _top_strikes(_weak_sub)
+
+    # ── Final verdict + plain-English reason ─────────────────────────────────
+    if _rangebound:
+        _pb_ks, _ca_ks = _top_strikes(_ps_below, 3), _top_strikes(_cs_above, 3)
+        _verdict = (f"🔒 RANGE-BOUND — pinning ATM {int(_atm):,} · Put sellers below spot "
+                    f"[{_fmt_ks(_pb_ks)}] vs Call sellers above spot [{_fmt_ks(_ca_ks)}]")
+        _mom_lbl = "RANGE / ATM PIN"
+        _sc, _sbg = "#D97706", "#FFFBEB"
+        _key_ks   = _fmt_ks(_pb_ks + _ca_ks)
+        _reason = [
+            f"Avg Raw Sentiment is {_evr_avg:.2f}, but strong SELLERS sit on both sides of spot.",
+            f"Put writers defend [{_fmt_ks(_pb_ks)}] below spot and call writers cap [{_fmt_ks(_ca_ks)}] above spot.",
+            f"Both sides are pressing price toward the middle → expect the market to stay pinned near ATM {int(_atm):,}.",
+        ]
+    elif _bias == "BULLISH" and _strong_mom:
+        _verdict = f"✅ BULLISH — STRONG upside momentum · Call buyers driving [{_fmt_ks(_strong_ks)}]"
+        _mom_lbl = "STRONG upside"
+        _sc, _sbg = "#059669", "#D1FAE5"
+        _key_ks   = _fmt_ks(_strong_ks)
+        _reason = [
+            f"Call premiums are richer than puts (avg Raw Sentiment {_evr_avg:.2f} > 1.2) → call buyers + put sellers → bullish bias.",
+            f"Net Δ-weighted OI change is POSITIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — call BUYERS are stronger than put sellers.",
+            "Buyers, not sellers, are driving the move → upside momentum is STRONG.",
+        ]
+    elif _bias == "BULLISH":
+        _verdict = f"⚠️ BULLISH bias — WEAK upside momentum · Put sellers dominate [{_fmt_ks(_weak_ks)}]"
+        _mom_lbl = "Weak upside"
+        _sc, _sbg = "#65A30D", "#F7FEE7"
+        _key_ks   = _fmt_ks(_weak_ks)
+        _reason = [
+            f"Call premiums are richer than puts (avg Raw Sentiment {_evr_avg:.2f} > 1.2) → bias stays bullish.",
+            f"But net Δ-weighted OI change is NEGATIVE at key strikes [{_fmt_ks(_weak_ks)}] — put SELLERS are stronger than call buyers.",
+            "The market is supported by sellers rather than driven by buyers → upside momentum is NOT strong.",
+        ]
+    elif _bias == "BEARISH" and _strong_mom:
+        _verdict = f"✅ BEARISH — STRONG downside momentum · Put buyers driving [{_fmt_ks(_strong_ks)}]"
+        _mom_lbl = "STRONG downside"
+        _sc, _sbg = "#DC2626", "#FEE2E2"
+        _key_ks   = _fmt_ks(_strong_ks)
+        _reason = [
+            f"Put premiums are richer than calls (avg Raw Sentiment {_evr_avg:.2f} < 0.7) → put buyers + call sellers → bearish bias.",
+            f"Net Δ-weighted OI change is NEGATIVE at OTM/ATM strikes [{_fmt_ks(_strong_ks)}] — put BUYERS are stronger than call sellers.",
+            "Buyers of downside protection are driving → downside momentum is STRONG.",
+        ]
+    elif _bias == "BEARISH":
+        _verdict = f"⚠️ BEARISH bias — WEAK downside momentum · Call sellers dominate [{_fmt_ks(_weak_ks)}]"
+        _mom_lbl = "Weak downside"
+        _sc, _sbg = "#EA580C", "#FFF7ED"
+        _key_ks   = _fmt_ks(_weak_ks)
+        _reason = [
+            f"Put premiums are richer than calls (avg Raw Sentiment {_evr_avg:.2f} < 0.7) → bias stays bearish.",
+            f"But net Δ-weighted OI change is POSITIVE at key strikes [{_fmt_ks(_weak_ks)}] — call SELLERS are stronger than put buyers.",
+            "The upside is capped by sellers rather than pressed by buyers → downside momentum is NOT strong.",
+        ]
+    else:
+        _verdict = "➖ NEUTRAL — CE/PE extrinsic values balanced; no dominant aggressor side."
+        _mom_lbl = "—"
+        _sc, _sbg = "#6B7280", "#F9FAFB"
+        _key_ks   = "—"
+        _reason = [f"Avg Raw Sentiment is {_evr_avg:.2f} (neutral zone 0.7–1.2) — call and put premiums are balanced, so neither side has the edge."]
+
+    # ── 15-minute final-verdict history ──────────────────────────────────────
+    # v14 (ported from Dash v15): the log's level column is now the GEX+Vega
+    # key-levels snapshot (Call Wall / Put Wall / Gamma Flip / IV Gravity /
+    # IV Kindling), not the old NDM "Key Strikes". `_key_ks` above is still
+    # used inline in the verdict/reason text and is left untouched.
+    _levels_txt = _fmt_gv_levels(gv_levels)
+    _hist = []
+    if hist_store is not None:
+        _hist = _endm_verdict_history_append(hist_store, _verdict, _bias, _mom_lbl, _levels_txt)
+
+    # ── Display dataframe (descending strike) ────────────────────────────────
+    # Bug fix (pre-existing, surfaced by live data): this must always return a
+    # str. Previously it returned a str for non-finite values but a float
+    # otherwise, producing a mixed-type "object" column that pyarrow cannot
+    # serialize to Arrow (ArrowTypeError: "Expected bytes, got a 'float'
+    # object" on the "Raw CE/PE EVR" column) whenever any strike actually hit
+    # a non-finite EVR.
+    def _evr_fmt(v):
+        if not np.isfinite(v): return "∞" if v == float("inf") else "—"
+        return str(round(float(v), 3))
+    _disp = pd.DataFrame({
+        "Strike":       _mx["strike"],
+        "EVR":          _mx["evr"].map(_evr_fmt),
+        "NDM":          _mx["ndm"].round(0).astype(int),
+        "Enhanced NDM": _mx["endm"].round(0).astype(int),
+        "Dominant Side": _mx["dom"],
+        "Reading":      _mx["read"],
+    }).sort_values("Strike", ascending=False)
+
+    _et = int(_mx["endm"].sum())
+    _rt = int(_mx["ndm"].sum())
+
+    return dict(df=_disp, enhanced_total=_et, raw_total=_rt,
+                verdict=_verdict, bias=_bias, mom_lbl=_mom_lbl, reason=_reason,
+                evr_avg=round(_evr_avg, 4), history=_hist, sc=_sc, sbg=_sbg,
+                rangebound=_rangebound)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SHANTANU'S VIEW — ND/NDM Decision Matrix (Institutional Framework)
+# Based on: Options Hedging Pressure & Market Movement Analysis PDF
+# Data sources: Section 4 (df_band), Section 2 (momentum), Greek Risk Framework
+# ═══════════════════════════════════════════════════════════════════
+
+# v30: Shantanu's View — Buyer/Seller Matrix REMOVED (fed no other section; _slot_sv stays empty)
+
+with _slot_s3:   # v8: render into top-of-dashboard slot (display order only)
+    st.markdown('<div class="section-header"> Section 3  Key Price Levels</div>', unsafe_allow_html=True)
+
+    gex_val   = m.get("gex", 0)
+    gflip     = m.get("gamma_flip")
+    gflip_str = str(int(gflip)) if gflip else "N/A"
+    spot_vs_atm = spot - safe_num(m.get("atm", spot))
+    chg_col = GREEN if spot_vs_atm >= 0 else RED
+    # v24: dual-expiry Max Pain — no extra Dhan calls, see get_dual_max_pain().
+    _mp_cur_s3, _mp_lbl_s3, _mp_nxt_s3, _mp_nxtlbl_s3 = get_dual_max_pain(
+        m["max_pain"], payload.get("expiry"))
+    level_items = [
+        ("Spot",       f"{spot:,.2f}",             GREEN if spot_vs_atm>=0 else RED, f"vs ATM {spot_vs_atm:+.1f}"),
+        ("Max Pain · CURRENT", f"{_mp_cur_s3:,}",  PINK,
+                       f"Exp {_mp_lbl_s3} · writer equilibrium"),
+        ("Max Pain · NEXT",    (f"{_mp_nxt_s3:,}" if _mp_nxt_s3 else "N/A"), CYAN,
+                       (f"Exp {_mp_nxtlbl_s3} · next-series pull" if _mp_nxt_s3
+                        else "Next expiry unavailable")),
+        ("Support",    int(m["support"]),           GREEN,   f"Dist: {m['dist_to_support']:.0f}"),
+        ("Resistance", int(m["resistance"]),        RED,     f"Dist: {m['dist_to_resistance']:.0f}"),
+        ("ATM Strike", int(m["atm"]),               BLUE,    "Nearest strike"),
+        ("Wall Width", int(m["wall_width"]),        CYAN,    "Put→Call wall"),
+        ("Gamma Flip", gflip_str,                   RED if (gflip and spot<gflip) else GREEN,
+                       ("Short-γ zone" if gflip and spot<gflip else "Above flip")),
+        ("Net GEX",    f"{gex_val:,.0f}",           GREEN if gex_val>0 else RED,
+                       "+ve=pin / -ve=trend"),
+    ]
+    lv_cols = st.columns(9)   # v24: 8 -> 9 for the second Max Pain tile
+    for col, (label, val, color, tip) in zip(lv_cols, level_items):
+        col.markdown(f"""
+        <div class="card" style="text-align:center;border-bottom:3px solid {color};">
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">{label}</div>
+          <div style="font-size:20px;font-weight:800;color:{color};">{val}</div>
+          <div style="font-size:11px;color:#374151;margin-top:2px;">{tip}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4: STRIKE-WISE CHARTS (Structural Band ±10)
+# ─────────────────────────────────────────────────────────────────────────────
+# v18.1 (DEX wiring): module-level defaults — populated inside Section 4 when
+# band data is available; the Final Decision Matrix reads them defensively.
+_dex_map, _dexm_map = {}, {}
+
+with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
+    st.markdown('<div class="section-header"> Section 4  Strike-wise Charts (Structural Band ±10)</div>', unsafe_allow_html=True)
+
+    df_band = pd.DataFrame(payload["df_band"])
+    if not df_band.empty:
+        x = df_band["strike"]
+
+        call_delta_abs = df_band["call_delta"].abs()
+        put_delta_abs  = df_band["put_delta"].abs()
+        dv = (df_band["call_oi"] * call_delta_abs) - (df_band["put_oi"] * put_delta_abs)
+        dc = [RED if v>0 else GREEN for v in dv]
+        mv = (df_band["call_oi_chg"] * call_delta_abs) - (df_band["put_oi_chg"] * put_delta_abs)
+        mc = [RED if v>0 else GREEN for v in mv]
+
+        # v18.1 (DEX wiring): strike-wise net-delta exposure maps — dv (the
+        # STOCK of positioning) and mv (the intraday FLOW), keyed by strike.
+        # Same series as the two charts above; consumed by the Final Decision
+        # Matrix for Wall Load, alert grading, DEX tilt and sticky release.
+        _dex_map.update({int(_k): float(_v) for _k, _v in zip(x, dv)})
+        _dexm_map.update({int(_k): float(_v) for _k, _v in zip(x, mv)})
+
+        # ── v8: shared cosmetic styler — clear, colour-coded, well-positioned
+        # titles + annotated Spot line + titled axes. Cosmetic only, no calc change.
+        def _s4_style(f, title, y_title, legend_h=False):
+            f.add_vline(x=spot, line_width=2, line_dash="dash", line_color=CYAN,
+                        annotation_text=f"Spot {spot:,.0f}", annotation_position="top",
+                        annotation_font=dict(size=9, color=CYAN))
+            _lg = dict(font=dict(color="#1A1A2E", size=10))
+            if legend_h:
+                _lg.update(orientation="h", y=1.10, x=0)
+            f.update_layout(
+                title=dict(text=title, x=0.02, xanchor="left",
+                           font=dict(color="#1A1A2E", size=12)),
+                height=275, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+                margin=dict(l=45, r=18, t=52, b=42), font=dict(color="#1A1A2E", size=11),
+                hoverlabel=dict(bgcolor="#fff", font_color="#1A1A2E", font_size=11),
+                legend=_lg,
+                xaxis=dict(title=dict(text="Strike", font=dict(size=10, color="#6B7280")),
+                           tickfont=dict(size=9)),
+                yaxis=dict(title=dict(text=y_title, font=dict(size=10, color="#6B7280")),
+                           tickfont=dict(size=9)),
+            )
+            return f
+
+        # ── v11 layout: 12 charts in 6 rows × 2 columns ──────────────────────────
+        # Row 1 — Δ-Weighted Net OI | Δ-Weighted OI Change Momentum
+        _s4_r1c1, _s4_r1c2 = st.columns(2)
+        with _s4_r1c1:
+            f1 = go.Figure(go.Bar(x=x, y=dv, marker_color=dc))
+            _s4_style(f1, "★ Δ-Weighted Net OI · Red=Call side · Green=Put side", "Δ×OI (net)")
+            st.plotly_chart(f1, width='stretch', config={"displayModeBar":False})
+        with _s4_r1c2:
+            # v35: call/put split pattern chart (net ◆ == old mv bar; mv itself unchanged)
+            f2 = _oi_session_split_figure(df_band)
+            _s4_style(f2, "★ Δ-Weighted OI Change Momentum · session<br><sup>Red=Call ↑ · Green=Put ↓ · solid=build-up · hatched=unwinding · ◆=net · above 0 bearish / below 0 bullish</sup>", "Δ×ΔOI (net)")
+            _oi_session_split_finish(f2)
+            st.plotly_chart(f2, width='stretch', config={"displayModeBar":False})
+
+        # v34: rolling 15-min Δ-weighted OI change (call/put split) — full width
+        try:
+            _oi15_b, _oi15_c = _oi15_record(payload.get("ts_ist"), df_band, payload.get("expiry"))
+            _oi15_fig = _oi15_figure(df_band, spot, _oi15_b, _oi15_c)
+            st.plotly_chart(_oi15_fig, width='stretch', config={"displayModeBar":False}, key="s4_oi15")
+        except Exception as _oi15_e:
+            st.caption(f"15-min Δ-weighted OI change unavailable ({_oi15_e})")
+
+        # Row 2 — Net GEX per Strike (with Gamma Flip) | IV Smile
+        _s4_r2c1, _s4_r2c2 = st.columns(2)
+        with _s4_r2c1:
+            gv = (df_band["call_oi"]*df_band["call_gamma"] - df_band["put_oi"]*df_band["put_gamma"]) * NIFTY_LOT_SIZE * spot**2 * 0.01
+            gc2 = [RED if v>0 else GREEN for v in gv]
+            f3 = go.Figure(go.Bar(x=x, y=gv, marker_color=gc2))
+            if m.get("gamma_flip"):
+                f3.add_vline(x=m["gamma_flip"], line_width=2, line_dash="dot", line_color=RED)
+                f3.add_annotation(x=m["gamma_flip"], y=0, text=f"Flip@{int(m['gamma_flip'])}",
+                    showarrow=True, arrowhead=2, font=dict(color=RED,size=10), ax=0, ay=-30)
+            _s4_style(f3, "★ Net GEX per Strike · dotted red = Gamma Flip", "Net GEX")
+            st.plotly_chart(f3, width='stretch', config={"displayModeBar":False})
+        with _s4_r2c2:
+            f5 = go.Figure([
+                go.Scatter(x=x, y=df_band["call_iv"], mode="lines+markers", name="Call IV", line=dict(color="#38BDF8",width=2.5)),
+                go.Scatter(x=x, y=df_band["put_iv"],  mode="lines+markers", name="Put IV",  line=dict(color="#FB7185",width=2.5)),
+            ])
+            _s4_style(f5, "IV Smile · Blue=Call IV · Rose=Put IV", "IV %", legend_h=True)
+            st.plotly_chart(f5, width='stretch', config={"displayModeBar":False})
+
+        # ★ Strike-wise CE/PE Extrinsic-Value Ratio bars — Raw & OI-Weighted.
+        # Same per-strike ratios that feed the EV-Ratio Z-Score charts
+        # (compute_metrics: ev_c/ev_p and ev_c×CallOI / ev_p×PutOI), over the
+        # SAME shared ATM±vega_band_strikes band. Baseline = 1 (bars extend
+        # above/below it): >1 = Call extrinsic rich, <1 = Put extrinsic rich.
+        _ev_band_n = int(m.get("vega_band_strikes", 5))
+        _ev_atm_k  = safe_num(m.get("atm", 0))
+        _ev_bd = df_band[df_band["strike"].between(
+            _ev_atm_k - _ev_band_n * NIFTY_STEP,
+            _ev_atm_k + _ev_band_n * NIFTY_STEP)].copy()
+        _ev_bd["ev_c"] = np.maximum(0, _ev_bd["call_ltp"] - np.maximum(0, spot - _ev_bd["strike"]))
+        _ev_bd["ev_p"] = np.maximum(0, _ev_bd["put_ltp"]  - np.maximum(0, _ev_bd["strike"] - spot))
+        # ★ v12: parity correction — European put-call parity forces
+        # EV_c − EV_p = K(1 − e^(−rT)) (carry on the strike), so the NEUTRAL
+        # CE/PE EV ratio sits slightly above 1. Subtracting the offset from
+        # ev_c re-centres the baseline at exactly 1, making deviations pure
+        # demand pressure: >1 = call buyers / put sellers dominant,
+        # <1 = put buyers / call sellers dominant.
+        try:
+            _T_ev = max((datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date()
+                         - date.today()).days, 0) / 365.0
+        except Exception:
+            _T_ev = 3 / 365.0
+        _ev_bd["ev_c_adj"] = np.maximum(
+            0, _ev_bd["ev_c"] - _ev_bd["strike"] * (1 - np.exp(-RISK_FREE_RATE * _T_ev)))
+        _evr_raw_s = (_ev_bd["ev_c_adj"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
+        # ★ v17: per-strike initiation map — >1.2 call buyers/put sellers
+        # dominant (bullish), <0.7 put buyers/call sellers dominant (bearish),
+        # 0.7-1.2 neutral/sideways.
+        _s4_evmap = {int(k): float(v) for k, v in zip(_ev_bd["strike"], _evr_raw_s)}
+        _evr_oiw_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi"]) /
+                      (_ev_bd["ev_p"] * _ev_bd["put_oi"]).replace(0, np.nan)).fillna(1.0)
+
+        def _s4_evr_bar(vals, title, bear_thresh=1.0, bull_thresh=1.0):
+            # v17: bullish (green) fires only at/above `bull_thresh`, bearish
+            # (red) only below `bear_thresh`. Values in between are the
+            # neutral/sideways zone — shown SKY BLUE (light blue, was orange).
+            _cols = [GREEN if v >= bull_thresh else (RED if v < bear_thresh else SKY) for v in vals]
+            f = go.Figure(go.Bar(x=_ev_bd["strike"], y=vals - 1.0, base=1.0,
+                                 marker_color=_cols, customdata=vals,
+                                 hovertemplate="Strike %{x}<br>Sentiment: %{customdata:.3f}<extra></extra>"))
+            f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
+                        annotation_text="Baseline 1.0", annotation_position="bottom right",
+                        annotation_font=dict(size=9, color=MUTED))
+            _s4_style(f, title, "Sentiment")
+            f.update_layout(title=dict(font=dict(size=11)))
+            return f
+
+        # Row 3 — Raw CE/PE EV Ratio per Strike | Parity-Adj CE/PE EV Ratio per Strike
+        # v16 (ported from Dash v15): f4 was "Call vs Put OI" — replaced with the
+        # RAW (not parity-adjusted) strike-wise CE/PE EV ratio, using the same
+        # >1.2 green / 0.7-1.2 sky blue / <0.7 red threshold coloring as the Parity-Adj
+        # chart alongside it (via _s4_evr_bar, bear_thresh=0.7, bull_thresh=1.2).
+        _evr_true_raw_s = (_ev_bd["ev_c"] / _ev_bd["ev_p"].replace(0, np.nan)).fillna(1.0)
+        _s4_r3c1, _s4_r3c2 = st.columns(2)
+        with _s4_r3c1:
+            f4 = _s4_evr_bar(_evr_true_raw_s,
+                             f"★ Raw Sentiment per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1.2=Call buyers/Put sellers dominant · Sky Blue 0.7-1.2=Neutral/Sideways · Red<0.7=Put buyers/Call sellers dominant",
+                             bear_thresh=0.7, bull_thresh=1.2)
+            st.plotly_chart(f4, width='stretch', config={"displayModeBar":False})
+        with _s4_r3c2:
+            f6 = _s4_evr_bar(_evr_raw_s,
+                             f"★ Shantanu's Proprietary Strike-wise Sentiment (ATM±{_ev_band_n}) · Baseline=1 · Green>1.2=Call buyers/Put sellers dominant · Sky Blue 0.7-1.2=Neutral/Sideways · Red<0.7=Put buyers/Call sellers dominant",
+                             bear_thresh=0.7, bull_thresh=1.2)
+            st.plotly_chart(f6, width='stretch', config={"displayModeBar":False})
+
+        # ★ Strike-wise OI-CHANGE-Weighted CE/PE EV Ratio — per strike,
+        # (Intraday Call OI Chg × ev_c) : (Intraday Put OI Chg × ev_p), same
+        # ATM±vega_band_strikes band. Baseline = 1: >1 = Call EV×ΔOI rich,
+        # <1 (incl. negative when ΔOI signs differ) = Put EV×ΔOI rich.
+        _evr_oic_s = ((_ev_bd["ev_c"] * _ev_bd["call_oi_chg"]) /
+                      (_ev_bd["ev_p"] * _ev_bd["put_oi_chg"]).replace(0, np.nan)).fillna(1.0)
+
+        # Row 4 — OI-Wtd CE/PE EV Ratio | OI-Chg-Wtd CE/PE EV Ratio
+        _s4_r4c1, _s4_r4c2 = st.columns(2)
+        with _s4_r4c1:
+            f7 = _s4_evr_bar(_evr_oiw_s,
+                             f"★ OI-Wtd Sentiment per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×OI rich · Red<1=Put EV×OI rich")
+            st.plotly_chart(f7, width='stretch', config={"displayModeBar":False})
+        with _s4_r4c2:
+            f8 = _s4_evr_bar(_evr_oic_s,
+                             f"★ OI-Chg-Wtd Sentiment per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call EV×ΔOI rich · Red<1=Put EV×ΔOI rich")
+            st.plotly_chart(f8, width='stretch', config={"displayModeBar":False})
+
+        # ★ v12: mask-aware per-strike CE/PE ratio bar (baseline = 1).
+        # Bars failing the liquidity floor are GREYED and pinned to baseline
+        # instead of being imputed as neutral 1.0 signals.
+        _LIQ_GREY = "#D1D5DB"
+        def _s4_ratio_bar(x_vals, vals, title, y_title, liq_ok=None):
+            vals = pd.Series(vals).astype(float).reset_index(drop=True)
+            if liq_ok is None:
+                liq_ok = pd.Series([True] * len(vals))
+            else:
+                liq_ok = pd.Series(list(liq_ok)).fillna(False).reset_index(drop=True)
+            _plot = vals.where(liq_ok, 1.0)
+            _cols = [_LIQ_GREY if not ok else (GREEN if v >= 1 else RED)
+                     for v, ok in zip(_plot, liq_ok)]
+            _cd   = [f"{v:.3f}" if ok else "illiquid — masked"
+                     for v, ok in zip(vals, liq_ok)]
+            f = go.Figure(go.Bar(x=list(x_vals), y=_plot - 1.0, base=1.0,
+                                 marker_color=_cols, customdata=_cd,
+                                 hovertemplate="Strike %{x}<br>CE/PE Ratio: %{customdata}<extra></extra>"))
+            f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
+                        annotation_text="Baseline 1.0", annotation_position="bottom right",
+                        annotation_font=dict(size=9, color=MUTED))
+            _s4_style(f, title, y_title)
+            f.update_layout(title=dict(font=dict(size=11)))
+            return f
+
+        # ★ v12: four-quadrant OI-change ratio bar — colour encodes WHO is
+        # building vs unwinding, fixing the sign-ambiguity of ratio-only
+        # bars (build-vs-build and unwind-vs-unwind both print positive):
+        #   Red   = Call build + Put unwind  (bearish quadrant)
+        #   Green = Put build + Call unwind  (bullish quadrant)
+        #   Amber = both sides building      (contested — read ratio)
+        #   Slate = both sides unwinding     (de-risking — read ratio)
+        def _s4_quad_bar(x_vals, vals, doi_c, doi_p, title, y_title,
+                         liq_ok=None, ev_map=None):
+            vals  = pd.Series(vals).astype(float).reset_index(drop=True)
+            doi_c = pd.Series(doi_c).astype(float).reset_index(drop=True)
+            doi_p = pd.Series(doi_p).astype(float).reset_index(drop=True)
+            _xs   = list(x_vals)
+            if liq_ok is None:
+                liq_ok = pd.Series([True] * len(vals))
+            else:
+                liq_ok = pd.Series(list(liq_ok)).fillna(False).reset_index(drop=True)
+            def _quad(dc_, dp_):
+                if dc_ >= 0 and dp_ < 0:  return "#EF4444", "Call build + Put unwind (bearish)"
+                if dc_ < 0 and dp_ >= 0:  return "#22C55E", "Put build + Call unwind (bullish)"
+                if dc_ >= 0 and dp_ >= 0: return "#F59E0B", "Both building (contested)"
+                return "#64748B", "Both unwinding (de-risking)"
+            # ★ v13: EV initiation cross-check — parity-adjusted premium
+            # pressure decides WHO drives the flow. Conflicts (quadrant says
+            # writer-driven, premium says buyer-driven) get a black outline.
+            _plot = vals.where(liq_ok, 1.0)
+            _cols, _cd, _lcols, _lws = [], [], [], []
+            for _k, v, ok, dc_, dp_ in zip(_xs, vals, liq_ok, doi_c, doi_p):
+                if not ok:
+                    _cols.append(_LIQ_GREY); _cd.append("illiquid — masked")
+                    _lcols.append(_LIQ_GREY); _lws.append(0)
+                    continue
+                _c, _lbl = _quad(dc_, dp_)
+                _evr = (ev_map or {}).get(int(_k))
+                _conf = False
+                if _evr is None:
+                    _evt = "EV: n/a (outside ATM band)"
+                elif _evr > 1.2:
+                    _evt = f"EV {_evr:.2f}: call buyers / put sellers pressing (bullish)"
+                    _conf = (_c == "#EF4444")
+                    if _c in ("#F59E0B", "#64748B"):
+                        _evt += " → lean bullish"
+                elif _evr < 0.7:
+                    _evt = f"EV {_evr:.2f}: put buyers / call sellers pressing (bearish)"
+                    _conf = (_c == "#22C55E")
+                    if _c in ("#F59E0B", "#64748B"):
+                        _evt += " → lean bearish"
+                else:
+                    _evt = f"EV {_evr:.2f}: balanced initiation"
+                _txt = f"{_lbl} · ratio {v:.3f}<br>{_evt}"
+                if _conf:
+                    _txt += ("<br>⚠ flow/premium CONFLICT — premium says "
+                             + ("call BUYERS drive this build (bullish)" if _evr > 1.2
+                                else "put BUYERS drive this build (bearish)"))
+                _cols.append(_c); _cd.append(_txt)
+                _lcols.append("#111827" if _conf else _c)
+                _lws.append(1.8 if _conf else 0)
+            f = go.Figure(go.Bar(x=_xs, y=_plot - 1.0, base=1.0,
+                                 marker=dict(color=_cols,
+                                             line=dict(color=_lcols, width=_lws)),
+                                 customdata=_cd,
+                                 hovertemplate="Strike %{x}<br>%{customdata}<extra></extra>"))
+            f.add_hline(y=1.0, line_width=1.5, line_dash="dash", line_color=MUTED,
+                        annotation_text="Baseline 1.0", annotation_position="bottom right",
+                        annotation_font=dict(size=9, color=MUTED))
+            _s4_style(f, title, y_title)
+            f.update_layout(title=dict(font=dict(size=10)))
+            return f
+
+        # ★ v11/v12 Pair 1 — Δ-weighted CE/PE OI ratio & OI-change ratio.
+        #   (Call OI × |Call Δ|) / (Put OI × |Put Δ|)
+        #   (Call ΔOI × |Call Δ|) / (Put ΔOI × |Put Δ|)
+        # v12: f9 is normalised by the day's OPENING ratio profile — this
+        # cancels the static ITM/OTM delta gradient (below spot, ITM call
+        # deltas mechanically push the raw ratio >1 even with balanced OI).
+        # 1 = unchanged since open; >1 = call side GAINED Δ-weighted OI
+        # share intraday; <1 = put side gained. Illiquid strikes greyed.
+        _dwr_oi_s  = ((df_band["call_oi"] * call_delta_abs) /
+                      (df_band["put_oi"]  * put_delta_abs).replace(0, np.nan))
+        _dwr_chg_s = ((df_band["call_oi_chg"] * call_delta_abs) /
+                      (df_band["put_oi_chg"]  * put_delta_abs).replace(0, np.nan))
+        _oi_floor  = 0.02 * max(float(df_band["call_oi"].max()),
+                                float(df_band["put_oi"].max()), 1.0)
+        _chg_floor = 0.02 * max(float(df_band["call_oi_chg"].abs().max()),
+                                float(df_band["put_oi_chg"].abs().max()), 1.0)
+        _liq_oi  = ((df_band["call_oi"] > _oi_floor) &
+                    (df_band["put_oi"]  > _oi_floor) & _dwr_oi_s.notna())
+        _liq_chg = ((df_band["call_oi_chg"].abs() > _chg_floor) &
+                    (df_band["put_oi_chg"].abs()  > _chg_floor) & _dwr_chg_s.notna())
+
+        # v12: opening-baseline persistence (same JSON pattern as smile history)
+        _S4_BASE_FILE = os.path.join(_BASE_DIR, "nifty_s4_ratio_baseline.json")
+        _s4_key = f"{date.today().isoformat()}|{expiry}"
+        try:
+            with open(_S4_BASE_FILE) as _fh:
+                _s4_base = json.load(_fh)
+        except Exception:
+            _s4_base = {}
+        if _s4_base.get("key") != _s4_key:
+            _s4_base = {"key": _s4_key,
+                        "ratios": {str(int(k)): (float(v) if np.isfinite(v) else None)
+                                   for k, v in zip(x, _dwr_oi_s)}}
+            try:
+                _atomic_json_write(_S4_BASE_FILE, _s4_base)
+            except Exception:
+                pass
+        _s4_bmap  = _s4_base.get("ratios", {})
+        _dwr_base = pd.Series([_s4_bmap.get(str(int(k))) for k in x],
+                              index=_dwr_oi_s.index, dtype=float)
+        _dwr_norm = _dwr_oi_s / _dwr_base.replace(0, np.nan)
+        _liq_norm = _liq_oi & _dwr_norm.notna()
+
+        # Row 5 — Δ-Wtd CE/PE OI Ratio vs Open | Δ-Wtd CE/PE OI-Chg Ratio (quad)
+        _s4_r5c1, _s4_r5c2 = st.columns(2)
+        with _s4_r5c1:
+            f9 = _s4_ratio_bar(x, _dwr_norm.fillna(1.0),
+                               "★ Δ-Wtd CE/PE OI Ratio vs OPEN Baseline · 1=unchanged since open · Green>1=Call side gaining · Red<1=Put side gaining · Grey=illiquid",
+                               "Ratio vs Open", liq_ok=_liq_norm)
+            st.plotly_chart(f9, width='stretch', config={"displayModeBar":False})
+        with _s4_r5c2:
+            f10 = _s4_quad_bar(x, _dwr_chg_s.fillna(1.0),
+                               df_band["call_oi_chg"], df_band["put_oi_chg"],
+                               "★ Δ-Wtd CE/PE OI-Chg Ratio · Red=C-build/P-unwind(bear) · Green=P-build/C-unwind(bull) · Amber=both build · Slate=both unwind · Black outline=EV conflict",
+                               "Δ×ΔOI CE/PE Ratio", liq_ok=_liq_chg, ev_map=_s4_evmap)
+            st.plotly_chart(f10, width='stretch', config={"displayModeBar":False})
+
+        # ★ v11/v12 Pair 2 — Δ- AND EV-weighted CE/PE ratios, per strike over
+        # the same ATM±vega_band_strikes band as the EV-Ratio charts:
+        #   (Call OI × |Call Δ| × ev_c) / (Put OI × |Put Δ| × ev_p)
+        #   (Call ΔOI × |Call Δ| × ev_c) / (Put ΔOI × |Put Δ| × ev_p)
+        # v12: strikes with extrinsic below ₹2 on either leg are masked
+        # (EV that small is noise); f12 uses four-quadrant colouring.
+        _cda_ev = _ev_bd["call_delta"].abs(); _pda_ev = _ev_bd["put_delta"].abs()
+        _devr_oi_s  = ((_ev_bd["call_oi"] * _cda_ev * _ev_bd["ev_c"]) /
+                       (_ev_bd["put_oi"]  * _pda_ev * _ev_bd["ev_p"]).replace(0, np.nan))
+        _devr_chg_s = ((_ev_bd["call_oi_chg"] * _cda_ev * _ev_bd["ev_c"]) /
+                       (_ev_bd["put_oi_chg"]  * _pda_ev * _ev_bd["ev_p"]).replace(0, np.nan))
+        _EV_FLOOR   = 2.0
+        _liq_ev     = (_ev_bd["ev_c"] > _EV_FLOOR) & (_ev_bd["ev_p"] > _EV_FLOOR)
+        _liq_ev_oi  = _liq_ev & _devr_oi_s.notna()
+        _liq_ev_chg = _liq_ev & _devr_chg_s.notna()
+
+        # Row 6 — Δ×EV-Wtd CE/PE OI Ratio | Δ×EV-Wtd CE/PE OI-Chg Ratio (quad)
+        _s4_r6c1, _s4_r6c2 = st.columns(2)
+        with _s4_r6c1:
+            f11 = _s4_ratio_bar(_ev_bd["strike"], _devr_oi_s.fillna(1.0),
+                                f"★ Δ×EV-Wtd CE/PE OI Ratio per Strike (ATM±{_ev_band_n}) · Baseline=1 · Green>1=Call Δ×OI×EV rich · Red<1=Put side · Grey=illiquid",
+                                "Δ×OI×EV CE/PE Ratio", liq_ok=_liq_ev_oi)
+            st.plotly_chart(f11, width='stretch', config={"displayModeBar":False})
+        with _s4_r6c2:
+            f12 = _s4_quad_bar(_ev_bd["strike"], _devr_chg_s.fillna(1.0),
+                               _ev_bd["call_oi_chg"], _ev_bd["put_oi_chg"],
+                               f"★ Δ×EV-Wtd CE/PE OI-Chg Ratio (ATM±{_ev_band_n}) · Red=C-build/P-unwind(bear) · Green=P-build/C-unwind(bull) · Amber=both build · Slate=both unwind · Black outline=EV conflict",
+                               "Δ×ΔOI×EV CE/PE Ratio", liq_ok=_liq_ev_chg, ev_map=_s4_evmap)
+            st.plotly_chart(f12, width='stretch', config={"displayModeBar":False})
+
+        # ★ v12: signal journal — one CSV row per refresh so the decision-
+        # matrix weights can be calibrated offline against forward returns.
+        # Positive score = bullish tilt. d1=structure(±1.5) d2=flow(±2)
+        # d3=parity-adj EV skew(±0.5).
+        try:
+            _atm_j = safe_num(m.get("atm", spot)); _jw = 3 * NIFTY_STEP
+            _jm  = df_band["strike"].between(_atm_j - _jw, _atm_j + _jw)
+            _d1  = round(-1.5 * float(dv[_jm].sum() / max(dv[_jm].abs().sum(), 1e-9)), 2)
+            _d2  = round(-2.0 * float(mv[_jm].sum() / max(mv[_jm].abs().sum(), 1e-9)), 2)
+            _e_mean = float(_evr_raw_s[_liq_ev].mean()) if bool(_liq_ev.any()) else 1.0
+            _d3  = 0.5 if _e_mean > 1.03 else (-0.5 if _e_mean < 0.97 else 0.0)
+            _jscore = round(_d1 + _d2 + _d3, 2)
+            _jgex = "positive" if float(gv[_jm].sum()) > 0 else "negative"
+            _J_FILE = os.path.join(_BASE_DIR, "nifty_s4_signal_journal.csv")
+            _jts  = str(payload.get("ts_ist", ""))
+            _jrow = (f"{_jts},{spot},{_d1},{_d2},{_d3},{_jscore},{_jgex},"
+                     f"{safe_num(m.get('gamma_flip', 0))}\n")
+            if not os.path.exists(_J_FILE):
+                with open(_J_FILE, "w") as _fh:
+                    _fh.write("ts,spot,d1_structure,d2_flow,d3_ev,score,gex_regime,gamma_flip\n")
+                    _fh.write(_jrow)
+            else:
+                with open(_J_FILE, "rb") as _fh:
+                    try:
+                        _fh.seek(-300, 2)
+                    except OSError:
+                        _fh.seek(0)
+                    _jlast = _fh.read().decode(errors="ignore").strip().splitlines()[-1]
+                if not (_jts and _jlast.startswith(_jts + ",")):
+                    with open(_J_FILE, "a") as _fh:
+                        _fh.write(_jrow)
+        except Exception as _je:
+            print(f"[s4-journal] {_je}", flush=True)
+
+        # v30: Combined Flow × Premium Read REMOVED (display-only; fed no other section)
+
+        # ── IV Smile Live Interpretation (full-width, powered by session history) ─
+        # Maintain intraday rolling history for trend-aware classification
+        # v27: shared smile history — always start from the file on disk
+        _iv_hist = _load_smile_history()
+        st.session_state["iv_smile_history"] = _iv_hist
+
+        # Compute OTM wing excesses for this tick and append to session state
+        _iv_atm      = safe_num(m.get("atm", spot))
+        _iv_atm_iv   = safe_num(m.get("atm_iv", 0))
+        _iv_step     = NIFTY_STEP
+        _iv_otm_p    = df_band.loc[
+            df_band["strike"].between(_iv_atm - 6*_iv_step, _iv_atm - 2*_iv_step) & (df_band["put_iv"]  > 0.5), "put_iv"
+        ]
+        _iv_otm_c    = df_band.loc[
+            df_band["strike"].between(_iv_atm + 2*_iv_step, _iv_atm + 6*_iv_step) & (df_band["call_iv"] > 0.5), "call_iv"
+        ]
+        if len(_iv_otm_p) >= 2 and len(_iv_otm_c) >= 2 and _iv_atm_iv > 0:
+            _iv_pwe  = float(_iv_otm_p.mean()) - _iv_atm_iv
+            _iv_cwe  = float(_iv_otm_c.mean()) - _iv_atm_iv
+            _iv_tick = {
+                "ts":              payload.get("ts_ist", ""),
+                "atm_iv":          _iv_atm_iv,
+                "put_wing_excess": _iv_pwe,
+                "call_wing_excess":_iv_cwe,
+                "skew_asymmetry":  _iv_pwe - _iv_cwe,
+            }
+            # Deduplicate same-timestamp reruns; keep rolling 20-tick window (~5 hrs)
+            with _SH["smile_lock"]:   # v27: atomic re-read + dedup + append across visitors
+                _iv_hist = _load_smile_history()
+                if not any(h.get("ts") == _iv_tick["ts"] for h in _iv_hist[-5:]):
+                    _iv_hist.append(_iv_tick)
+                    if len(_iv_hist) > 20:
+                        _iv_hist.pop(0)
+                    _save_smile_history(_iv_hist)   # persist for mid-session joiners
+                st.session_state["iv_smile_history"] = _iv_hist
+
+        _iv_sc = classify_iv_smile_scenario(df_band, m, spot, _iv_hist)
+        if _iv_sc:
+            _badge_map = {
+                "BEARISH":        ("#FEF2F2", "#EF4444"),
+                "MILD BEAR":      ("#FFFBEB", "#D97706"),
+                "EXTREME BEAR":   ("#FEF2F2", "#DC2626"),
+                "BULLISH":        ("#ECFDF5", "#22C55E"),
+                "EXTREME BULL":   ("#ECFDF5", "#059669"),
+                "RECOVERING":     ("#EFF6FF", "#2563EB"),
+                "NEUTRAL":        ("#F9FAFB", "#6B7280"),
+                "EVENT RISK":     ("#FFFBEB", "#D97706"),
+                "VOL COLLAPSE":   ("#F9FAFB", "#6B7280"),
+                "BREAKOUT ALERT": ("#FEF3C7", "#D97706"),
+                "ANOMALY":        ("#FEF3C7", "#F59E0B"),
+            }
+            _bg, _bc = _badge_map.get(_iv_sc["badge"], ("#F9FAFB", "#6B7280"))
+            _strat_html = " ".join(
+                '<span style="display:inline-block;background:rgba(92,53,204,0.08);'
+                'border:1px solid rgba(92,53,204,0.25);color:#5C35CC;font-size:10px;'
+                'font-family:monospace;padding:2px 8px;border-radius:4px;margin:2px 2px 0 0;">'
+                + s + '</span>'
+                for s in _iv_sc["strategies"]
+            )
+            _sig_html = "".join(
+                '<div style="font-size:11.5px;color:#374151;padding:2px 0;">&#9656; ' + sig + '</div>'
+                for sig in _iv_sc["signals"]
+            )
+            _conf     = _iv_sc["confidence"]
+            _conf_col = "#059669" if _conf >= 75 else ("#D97706" if _conf >= 50 else "#6B7280")
+            _tr       = _iv_sc.get("trend", {})
+
+            # 30-min trend bar (shown only when history has 3+ ticks)
+            _trend_html = ""
+            if _tr.get("has_trend"):
+                _td_iv   = _tr["d_atm_iv"]
+                _td_put  = _tr["d_put_wing"]
+                _td_cal  = _tr["d_call_wing"]
+                _c_iv    = "#DC2626" if _td_iv  > 0.5  else ("#22C55E" if _td_iv  < -0.5  else "#6B7280")
+                _c_put   = "#DC2626" if _td_put > 0.5  else ("#22C55E" if _td_put < -0.5  else "#6B7280")
+                _c_cal   = "#22C55E" if _td_cal > 0.5  else ("#DC2626" if _td_cal < -0.5  else "#6B7280")
+                _trend_html = (
+                    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;'
+                    'padding-top:8px;border-top:1px solid #E5E7EB;align-items:center;">'
+                    '<span style="font-size:10px;font-weight:700;color:#6B7280;">30-MIN TREND &#916;:</span>'
+                    '<span style="font-size:11px;font-weight:700;color:' + _c_iv + ';">ATM IV {:+.1f} pts</span>'.format(_td_iv) +
+                    '<span style="color:#D1D5DB;">|</span>'
+                    '<span style="font-size:11px;font-weight:700;color:' + _c_put + ';">Put Wing {:+.1f} pts</span>'.format(_td_put) +
+                    '<span style="color:#D1D5DB;">|</span>'
+                    '<span style="font-size:11px;font-weight:700;color:' + _c_cal + ';">Call Wing {:+.1f} pts</span>'.format(_td_cal) +
+                    '<span style="font-size:10px;color:#9CA3AF;margin-left:auto;">{} ticks this session</span>'.format(_tr["ticks"]) +
+                    '</div>'
+                )
+
+            _put_col  = "#DC2626" if _iv_sc["put_wing_excess"]  > 4  else ("#D97706" if _iv_sc["put_wing_excess"]  > 0 else "#22C55E")
+            _call_col = "#22C55E" if _iv_sc["call_wing_excess"] > 4  else ("#D97706" if _iv_sc["call_wing_excess"] > 0 else "#DC2626")
+            _skew_col = "#DC2626" if _iv_sc["skew_asymmetry"]   > 2  else ("#22C55E" if _iv_sc["skew_asymmetry"]  < -2 else "#D97706")
+
+            st.markdown(
+                '<div style="background:' + _bg + ';border:1.5px solid ' + _bc + ';border-radius:10px;'
+                'padding:14px 18px;margin-top:10px;margin-bottom:4px;">'
+
+                '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">'
+                '<span style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.08em;">'
+                '&#128208; IV Smile Live Interpretation'
+                '</span>'
+                '<span style="background:' + _bc + '22;color:' + _bc + ';border:1.5px solid ' + _bc + ';border-radius:6px;'
+                'padding:3px 10px;font-size:12px;font-weight:800;">'
+                '#{} &middot; {}'.format(_iv_sc["scenario_id"], _iv_sc["scenario_name"]) +
+                '</span>'
+                '<span style="background:' + _bc + ';color:#fff;border-radius:5px;'
+                'padding:2px 9px;font-size:11px;font-weight:700;">' + _iv_sc["badge"] + '</span>'
+                '</div>'
+
+                '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">'
+
+                '<div style="background:#fff;border-radius:7px;padding:8px 12px;border:1px solid #E5E7EB;flex:1;min-width:90px;text-align:center;">'
+                '<div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;">ATM IV</div>'
+                '<div style="font-size:16px;font-weight:800;color:#1A1A2E;">{:.1f}%</div>'.format(_iv_sc["atm_iv"]) +
+                '<div style="font-size:9px;color:#6B7280;">Rank {:.0f}%ile</div>'.format(_iv_sc["iv_rank"]) +
+                '</div>'
+
+                '<div style="background:#fff;border-radius:7px;padding:8px 12px;border:1px solid #E5E7EB;flex:1;min-width:90px;text-align:center;">'
+                '<div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;">Put Wing &#916;</div>'
+                '<div style="font-size:16px;font-weight:800;color:' + _put_col + ';">{:+.1f} pts</div>'.format(_iv_sc["put_wing_excess"]) +
+                '<div style="font-size:9px;color:#6B7280;">vs ATM</div>'
+                '</div>'
+
+                '<div style="background:#fff;border-radius:7px;padding:8px 12px;border:1px solid #E5E7EB;flex:1;min-width:90px;text-align:center;">'
+                '<div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;">Call Wing &#916;</div>'
+                '<div style="font-size:16px;font-weight:800;color:' + _call_col + ';">{:+.1f} pts</div>'.format(_iv_sc["call_wing_excess"]) +
+                '<div style="font-size:9px;color:#6B7280;">vs ATM</div>'
+                '</div>'
+
+                '<div style="background:#fff;border-radius:7px;padding:8px 12px;border:1px solid #E5E7EB;flex:1;min-width:90px;text-align:center;">'
+                '<div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;">Skew Asym</div>'
+                '<div style="font-size:16px;font-weight:800;color:' + _skew_col + ';">{:+.1f}</div>'.format(_iv_sc["skew_asymmetry"]) +
+                '<div style="font-size:9px;color:#6B7280;">put &#8722; call excess</div>'
+                '</div>'
+
+                '<div style="background:#fff;border-radius:7px;padding:8px 12px;border:1px solid #E5E7EB;flex:1;min-width:100px;">'
+                '<div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;margin-bottom:3px;">Confidence</div>'
+                '<div style="background:#E5E7EB;border-radius:3px;height:5px;margin-bottom:3px;">'
+                '<div style="background:' + _conf_col + ';width:{}%;height:5px;border-radius:3px;"></div>'.format(_conf) +
+                '</div>'
+                '<div style="font-size:13px;font-weight:800;color:' + _conf_col + ';">{}%</div>'.format(_conf) +
+                '</div>'
+
+                '</div>'
+
+                '<div style="display:flex;gap:14px;flex-wrap:wrap;">'
+                '<div style="flex:1;min-width:200px;">'
+                '<div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;margin-bottom:4px;">Signals</div>'
+                + _sig_html +
+                '</div>'
+                '<div style="flex:1;min-width:200px;">'
+                '<div style="font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;margin-bottom:5px;">Strategies</div>'
+                + _strat_html +
+                '<div style="font-size:11px;color:#6B7280;margin-top:7px;line-height:1.5;">' + _iv_sc["description"] + '</div>'
+                '</div>'
+                '</div>'
+                + _trend_html +
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1: MARKET SENTIMENTS
+# ─────────────────────────────────────────────────────────────────────────────
+_ph_hidden_s1 = st.empty()   # v20: Section 1 Market Sentiments visuals hidden — calculations preserved
+with _ph_hidden_s1.container():
+    st.markdown('<div class="section-header"> Section 1  Market Sentiments</div>', unsafe_allow_html=True)
+
+    s = compute_market_sentiments(today_history)  # Fix #2: intraday only
+    if s:
+        sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
+        for col, label, val, color in [
+            (sc1, "VEGA",     s["vega_label"],     s["vega_color"]),
+            (sc2, "THETA",    s["theta_label"],    s["theta_color"]),
+            (sc3, "OI",       s["oi_label"],       s["oi_color"]),
+            (sc4, "STRENGTH", s["strength_label"], s["strength_color"]),
+            (sc5, "POS",      f"{s['pos_score']:+.2f}", s["pos_dot"]),
+            (sc6, "SENTIMENT",s["overall"],        s["overall_color"]),
+        ]:
+            col.markdown(f"""
+            <div class="card" style="text-align:center;">
+              <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">{label}</div>
+              <div style="font-size:20px;font-weight:800;color:{color};">{val}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        if s.get("warming"):
+            st.warning(f"⏳ Warming up  {s['n_ticks']} tick(s). Absolute thresholds active until 5 ticks.")
+        st.caption(f"{s['pos_caption']} | Based on last {s['n_ticks']} ticks | Vega=IV z-score · Theta=GEX z-score · OI=PCR z-score · Strength=Net-Delta z-score")
+    else:
+        st.info("Collecting data need at least 3 ticks for Market Sentiments.")
+_ph_hidden_s1.empty()        # v20: Section 1 Market Sentiments visual output suppressed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHANTANU'S FINAL DECISION MATRIX  (surgical addition — renders into the reserved top
+# slot. No new calculations: Spot / Max Pain / Net GEX are the same values
+# from Section 3; Put Wall / Call Wall / Gamma Flip are the same snapshot
+# from the GEX+Vega Live Interpretation section; the chart is the same
+# Parity-Adj CE/PE EV Ratio figure (f6) — chart #6 of Section 4, reused as-is.
+# ─────────────────────────────────────────────────────────────────────────────
+with _slot_summary:
+    st.markdown('<div class="section-header">&#128204; Shantanu&#39;s Final Decision Matrix</div>', unsafe_allow_html=True)
+
+    # ── v23 HOIST: Section 10 basis triangulation, computed EARLY ──────────
+    # Previously computed at the Section 10 render site further down. Moved up
+    # verbatim so the Final Decision Matrix can read futures data. Pure MOVE:
+    #   • identical arguments — all already populated far above here;
+    #   • fetch_futures_ltp() is NOT called here, it already ran once when the
+    #     payload was built, so this adds ZERO network requests;
+    #   • Section 10 below now REUSES sf_res/sig10 instead of recomputing, so
+    #     its rendered output is identical by construction.
+    _atm_s10 = safe_num(m.get("atm", 0))
+    sf_res   = compute_synthetic_future(payload["df_band"], spot, _atm_s10, expiry)
+    sig10    = compute_basis_signals(sf_res, payload.get("traded_future"))
+
+    _sum_cw  = _gv_levels_snapshot.get("call_wall")  if _gv_levels_snapshot else None
+    _sum_pw  = _gv_levels_snapshot.get("put_wall")   if _gv_levels_snapshot else None
+    _sum_gfl = _gv_levels_snapshot.get("gamma_flip") if _gv_levels_snapshot else gflip_str
+
+    # v18.1 (Suggestion 1): Wall Load — |strike-wise net-delta exposure (dv)|
+    # at each wall strike as % of the band's max |dv|. High load = wall backed
+    # by heavy dealer positioning (defended); low = hollow wall.
+    _dex_absmax = max((abs(_v) for _v in _dex_map.values()), default=0.0)
+    def _wall_load(_k):
+        if _k is None or _dex_absmax <= 0:
+            return None
+        _v = _dex_map.get(int(_k))
+        return None if _v is None else int(round(100.0 * abs(_v) / _dex_absmax))
+    _pw_load = _wall_load(_sum_pw)
+    _cw_load = _wall_load(_sum_cw)
+
+    # v24: dual-expiry Max Pain — no extra Dhan calls, see get_dual_max_pain().
+    _mp_cur_s4, _mp_lbl_s4, _mp_nxt_s4, _mp_nxtlbl_s4 = get_dual_max_pain(
+        m["max_pain"], payload.get("expiry"))
+    _sum_items = [
+        ("Spot",       f"{spot:,.2f}",              GREEN if spot_vs_atm >= 0 else RED, f"vs ATM {spot_vs_atm:+.1f}"),
+        ("Max Pain · CURRENT", f"{_mp_cur_s4:,}",   PINK,
+                        f"Exp {_mp_lbl_s4} · writer equilibrium"),
+        ("Max Pain · NEXT",    (f"{_mp_nxt_s4:,}" if _mp_nxt_s4 else "N/A"), CYAN,
+                        (f"Exp {_mp_nxtlbl_s4} · next-series pull" if _mp_nxt_s4
+                         else "Next expiry unavailable")),
+        ("Net GEX",    f"{gex_val:,.0f}",           GREEN if gex_val > 0 else RED,      "+ve=pin / -ve=trend"),
+        ("Put Wall",   f"{_sum_pw:,}" if _sum_pw is not None else "N/A",   GREEN,
+                        "GEX support floor" + (f" · load {_pw_load}%" if _pw_load is not None else "")),
+        ("Call Wall",  f"{_sum_cw:,}" if _sum_cw is not None else "N/A",   RED,
+                        "GEX resistance ceiling" + (f" · load {_cw_load}%" if _cw_load is not None else "")),
+        ("Gamma Flip", _sum_gfl if _sum_gfl else "N/A",
+                        RED if (gflip and spot < gflip) else GREEN,
+                        ("Short-γ zone" if gflip and spot < gflip else "Above flip")),
+    ]
+    _sum_cols = st.columns(7)   # v24: 6 -> 7 for the second Max Pain tile
+    for col, (label, val, color, tip) in zip(_sum_cols, _sum_items):
+        col.markdown(f"""
+        <div class="card" style="text-align:center;border-bottom:3px solid {color};">
+          <div style="font-size:11px;font-weight:600;color:#6B7280;">{label}</div>
+          <div style="font-size:22px;font-weight:800;color:{color};">{val}</div>
+          <div style="font-size:11px;color:#374151;margin-top:2px;">{tip}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # v31: first 2 Section-4 charts mirrored here (still shown in Section 4 too)
+    if not df_band.empty:
+        _fdm_c1, _fdm_c2 = st.columns(2)
+        with _fdm_c1:
+            st.plotly_chart(f1, width='stretch', config={"displayModeBar": False}, key="fdm_s4_f1")
+        with _fdm_c2:
+            st.plotly_chart(f2, width='stretch', config={"displayModeBar": False}, key="fdm_s4_f2")
+
+    # v34: GEX × Gamma Flip Regime Matrix | last-15-min Δ-weighted OI change — same row
+    _fdm_r2c1, _fdm_r2c2 = st.columns(2)
+    with _fdm_r2c1:
+        # ── v25: GEX × Gamma Flip Regime Matrix — INDEPENDENT ADD-ON ─────────────
+        # Reads only values already on hand (spot, m, the GEX walls shown in the
+        # tiles above, persisted history, India VIX, VWAP). Writes nothing and no
+        # other panel reads it. Any failure is contained to this block.
+        try:
+            _grm_vix  = globals().get("_vix_data") or {}
+            _grm_vwap = globals().get("_vwap_or_data") or {}
+            _grm = compute_gamma_regime_matrix(
+                spot=spot, gex=m.get("gex", 0), gamma_flip=m.get("gamma_flip"),
+                call_wall=(_sum_cw if _sum_cw is not None else m.get("resistance")),
+                put_wall=(_sum_pw if _sum_pw is not None else m.get("support")),
+                history=history, momentum=m.get("momentum"),
+                vix_change=(_grm_vix.get("vix_change") if _grm_vix.get("available") else None),
+                above_vwap=_grm_vwap.get("above_vwap"), expiry=expiry, now=now_ist())
+            st.markdown(render_gamma_regime_matrix_html(_grm, part="live"), unsafe_allow_html=True)   # v27: current state only
+            _v27_grm_for_bottom = _grm                                                               # v27: grid at bottom
+        except Exception as _grm_err:
+            st.info(f"GEX × Gamma Flip Regime Matrix — collecting data ({_grm_err}).")
+
+    with _fdm_r2c2:
+        _oi15_fdm = globals().get("_oi15_fig")
+        if _oi15_fdm is not None:
+            st.plotly_chart(_oi15_fdm, width='stretch', config={"displayModeBar": False}, key="fdm_oi15")
+
+    # v39: 15-min Δ-weighted OI momentum STRENGTH vs NIFTY — full width, above Max Pain
+    try:
+        _oi15s_val, _oi15s_win, _oi15s_g = _oi15_strength(df_band, globals().get("_oi15_b"), globals().get("_oi15_c"))
+        _oi15s_ss = _oi_session_strength(df_band)
+        st.plotly_chart(_oi15s_figure(_oi15s_record(payload.get("ts_ist"), _oi15s_val, _oi15s_g,
+                                                    _oi15s_ss, spot, _oi15s_win)),
+                        width='stretch', config={"displayModeBar": False}, key="fdm_oi15_strength")
+    except Exception as _oi15s_e:
+        st.caption(f"15-min momentum strength unavailable ({_oi15s_e})")
+
+    # v32: Max Pain time series (CURRENT green / NEXT blue)
+    try:
+        st.plotly_chart(_mp_ts_figure(_mp_ts_record(payload.get("ts_ist"), _mp_cur_s4, _mp_nxt_s4,
+                                                    _mp_lbl_s4, _mp_nxtlbl_s4)),
+                        width='stretch', config={"displayModeBar": False}, key="fdm_mp_ts")
+    except Exception as _mpts_e:
+        st.caption(f"Max Pain time series unavailable ({_mpts_e})")
+
+    # v33: GEX Put Wall / Call Wall time series (same values as the tiles above)
+    try:
+        st.plotly_chart(_wall_ts_figure(_wall_ts_record(payload.get("ts_ist"), _sum_pw, _sum_cw)),
+                        width='stretch', config={"displayModeBar": False}, key="fdm_gex_walls_ts")
+    except Exception as _wts_e:
+        st.caption(f"GEX walls time series unavailable ({_wts_e})")
+
+    # ── v27: Synthetic-forward bias ladder + 25Δ RR skew (inside the Final Decision Matrix) ──
+    try:
+        st.markdown(_fdmb_html(payload.get("fdm_bias")), unsafe_allow_html=True)
+    except Exception as _fdmb_e:
+        st.caption(f"Synthetic-forward bias unavailable this tick ({_fdmb_e})")
+
+    st.markdown(
+        '<div style="font-size:12px;font-weight:700;color:#6B7280;'
+        'text-transform:uppercase;margin:14px 0 4px;">'
+        'Shantanu&#39;s Proprietary Strike-wise Sentiment (Section 4, chart 6)</div>',
+        unsafe_allow_html=True)
+    st.plotly_chart(f6, width='stretch', config={"displayModeBar": False},
+                     key="summary_parity_evr_chart")
+
+    # ── Bias Summary (v17) — plain-English verdict with sticky alert state ──────
+    # Classifies every strike between the Put Wall and Call Wall using the SAME
+    # parity-adjusted CE/PE EV ratio map as the chart above (_s4_evmap):
+    # neutral/sideways 0.7-1.2 · bullish >1.2 · bearish <0.7.
+    #   • SIDEWAYS BIAS STRONG    — ≥70% of wall-to-wall strikes in the neutral band
+    #   • SIDEWAYS BIAS WEAKENING — neutral count shrinking vs the previous reading
+    #                               on one or both sides of ATM
+    #   • BREAKDOWN ALERT (RED)   — ALL of: spot within 1 strike of the Put Wall,
+    #     ATM bearish (<0.7) plus one/both ATM±1 bearish, and the Put Wall shifted
+    #     DOWN vs the previous reading
+    #   • BREAKOUT ALERT (DEEP GREEN) — exact mirror at the Call Wall
+    #   • Alert bias is STICKY — held until ATM and BOTH ATM±1 strikes return to
+    #     the neutral band, then reverts to SIDEWAYS.
+    # v23: defaults declared up-front so the Futures Confirmation panel below
+    # can read them safely even if this block raises. _bs_ok is the sentinel —
+    # only set True once the block has completed successfully.
+    _bs_ok, _bs_bias, _dex_tilt, _tilt_weak = False, "SIDEWAYS", 0.0, False
+    _bs_pw = _bs_cw = _prev_basis_gap = None
+    try:
+        _bs_file = os.path.join(_BASE_DIR, "bias_summary_state_streamlit.json")
+        _bs_pw   = int(_sum_pw) if _sum_pw is not None else None
+        _bs_cw   = int(_sum_cw) if _sum_cw is not None else None
+        _bs_atm  = int(float(m.get("atm", 0) or 0))
+        _bs_step = int(NIFTY_STEP)
+        _bs_ts   = str(payload.get("ts_ist", ""))
+        _bs_mp   = int(float(m["max_pain"])) if m.get("max_pain") else None
+
+        def _bs_cls(_v):
+            if _v is None or not np.isfinite(_v): return None
+            return 1 if _v > 1.2 else (-1 if _v < 0.7 else 0)
+
+        _bs_map = {int(_k): _bs_cls(float(_v)) for _k, _v in _s4_evmap.items()}
+        if _bs_pw is not None and _bs_cw is not None:
+            _bs_ks = sorted(_k for _k in _bs_map if _bs_pw <= _k <= _bs_cw)
+            if not _bs_ks:                      # walls beyond the EV band — use all
+                _bs_ks = sorted(_bs_map)
+        else:
+            _bs_ks = sorted(_bs_map)
+        _bs_tot    = sum(1 for _k in _bs_ks if _bs_map[_k] is not None)
+        _bs_neu    = sum(1 for _k in _bs_ks if _bs_map[_k] == 0)
+        _bs_neu_lo = sum(1 for _k in _bs_ks if _k < _bs_atm and _bs_map[_k] == 0)
+        _bs_neu_hi = sum(1 for _k in _bs_ks if _k > _bs_atm and _bs_map[_k] == 0)
+        _bs_frac   = (_bs_neu / _bs_tot) if _bs_tot else 0.0
+        _c_atm = _bs_map.get(_bs_atm)
+        _c_up  = _bs_map.get(_bs_atm + _bs_step)
+        _c_dn  = _bs_map.get(_bs_atm - _bs_step)
+
+        _bs_today = date.today().isoformat()
+        try:
+            with open(_bs_file, "r", encoding="utf-8") as _fh:
+                _bs_prev = json.load(_fh)
+            if _bs_prev.get("date") != _bs_today: _bs_prev = {}
+        except Exception:
+            _bs_prev = {}
+        _prev_pw, _prev_cw = _bs_prev.get("put_wall"), _bs_prev.get("call_wall")
+        _prev_lo, _prev_hi = _bs_prev.get("neu_lo"),   _bs_prev.get("neu_hi")
+        _prev_bias         = _bs_prev.get("bias", "SIDEWAYS")
+        _prev_mp           = _bs_prev.get("max_pain")
+        # v23 (Layer C): previous tick's futures−synthetic gap, read from the
+        # SAME per-tick state file the wall / max-pain movement lines already
+        # use — so the "vs previous data refresh" comparison is tick-aligned
+        # with every other movement note in this panel.
+        _prev_basis_gap    = _bs_prev.get("basis_gap")
+
+        _near_pw  = _bs_pw is not None and spot <= _bs_pw + _bs_step
+        _near_cw  = _bs_cw is not None and spot >= _bs_cw - _bs_step
+        _pw_down  = _bs_pw is not None and _prev_pw is not None and _bs_pw < _prev_pw
+        _cw_up    = _bs_cw is not None and _prev_cw is not None and _bs_cw > _prev_cw
+        _atm_bear = _c_atm == -1 and (-1 in (_c_up, _c_dn))
+        _atm_bull = _c_atm == 1  and (1  in (_c_up, _c_dn))
+        _neutral_again = _c_atm == 0 and _c_up == 0 and _c_dn == 0
+
+        _fresh_dn = _near_pw and _atm_bear and _pw_down   # ALL criteria — no partial fire
+        _fresh_up = _near_cw and _atm_bull and _cw_up
+
+        # v18.1 (Suggestion 2): DEX-flow grade at the tested wall — mv (Δ-wtd
+        # OI change) AT the wall strike. Call Wall: mv < 0 = call-side OI
+        # unwinding (writers covering) → Grade A breakout; mv ≥ 0 = still
+        # building (writers reinforcing) → Grade B attempt. Mirror at Put Wall.
+        _cw_mv = _dexm_map.get(int(_bs_cw)) if _bs_cw is not None else None
+        _pw_mv = _dexm_map.get(int(_bs_pw)) if _bs_pw is not None else None
+        _up_grade = None if _cw_mv is None else ("A" if _cw_mv < 0 else "B")
+        _dn_grade = None if _pw_mv is None else ("A" if _pw_mv > 0 else "B")
+
+        # v18.1 (Suggestion 5): sticky release — if the broken wall's DEX load
+        # has rebuilt to ≥70% of the band max, treat the break as failed and
+        # release the held alert even before ATM±1 turn neutral again.
+        _rebuilt = ((_prev_bias == "BULLISH" and not _fresh_up and _cw_load is not None and _cw_load >= 70) or
+                    (_prev_bias == "BEARISH" and not _fresh_dn and _pw_load is not None and _pw_load >= 70))
+
+        if _fresh_dn:
+            _bs_bias = "BEARISH"
+        elif _fresh_up:
+            _bs_bias = "BULLISH"
+        elif _prev_bias in ("BEARISH", "BULLISH") and not _neutral_again and not _rebuilt:
+            _bs_bias = _prev_bias                          # sticky — hold the alert
+        else:
+            _bs_bias = "SIDEWAYS"
+
+        _lo_dec = _prev_lo is not None and _bs_neu_lo < _prev_lo
+        _hi_dec = _prev_hi is not None and _bs_neu_hi < _prev_hi
+        # v18.1 (Suggestion 3): DEX tilt — support-side vs resistance-side
+        # positioning weight (Σ|dv|) between the walls. Balanced tilt confirms
+        # a genuine sideways day; a lopsided tilt (|tilt| ≥ 0.40) is an early,
+        # EV-independent WEAKENING trigger.
+        _tilt_sup = sum(abs(_v) for _k, _v in _dex_map.items()
+                        if _k < spot and (_bs_pw is None or _k >= _bs_pw))
+        _tilt_res = sum(abs(_v) for _k, _v in _dex_map.items()
+                        if _k > spot and (_bs_cw is None or _k <= _bs_cw))
+        _tilt_den = _tilt_sup + _tilt_res
+        _dex_tilt = ((_tilt_sup - _tilt_res) / _tilt_den) if _tilt_den > 0 else 0.0
+        _tilt_weak = _tilt_den > 0 and abs(_dex_tilt) >= 0.40
+        _weakening = _lo_dec or _hi_dec or _tilt_weak
+        _rng_txt = (f"{_bs_pw:,} – {_bs_cw:,}"
+                    if (_bs_pw is not None and _bs_cw is not None) else "walls N/A")
+
+        if _bs_bias == "BEARISH":
+            _bs_col, _bs_bg = "#DC2626", "#FEE2E2"
+            _bs_head = "🚨 BREAKDOWN ALERT — BEARISH BIAS"
+            if _fresh_dn:
+                if _dn_grade is not None:              # v18.1 (Suggestion 2)
+                    _bs_head += f" · Grade {_dn_grade}"
+                _bs_lines = [
+                    f"Spot {spot:,.0f} is testing the Put Wall {_bs_pw:,} (within 1 strike) — the support floor is under attack.",
+                    f"ATM {_bs_atm:,} plus adjacent strike(s) show bearish EV pressure (ratio < 0.7) — put buyers / call sellers dominate right where the market sits.",
+                    f"The Put Wall has shifted DOWN vs the previous reading ({_prev_pw:,} → {_bs_pw:,}) — put writers are retreating to lower strikes.",
+                    "All three breakdown criteria are met → a downside break is in play.",
+                ]
+                if _dn_grade == "A":                   # v18.1 (Suggestion 2)
+                    _bs_lines.append(f"Grade A — Δ-weighted OI flow at the Put Wall {_bs_pw:,} shows put writers UNWINDING: high-conviction break.")
+                elif _dn_grade == "B":
+                    _bs_lines.append(f"Grade B — put-side OI is still BUILDING at the Put Wall {_bs_pw:,} (writers reinforcing): break attempt may fail.")
+            else:
+                _bs_lines = [
+                    "Breakdown conditions fired earlier today — bias is HELD at BEARISH.",
+                    f"It reverts to SIDEWAYS only when ATM {_bs_atm:,} and BOTH ATM±1 strikes return to the neutral EV band (0.7–1.2).",
+                ]
+        elif _bs_bias == "BULLISH":
+            _bs_col, _bs_bg = "#047857", "#D1FAE5"
+            _bs_head = "🚀 BREAKOUT ALERT — BULLISH BIAS"
+            if _fresh_up:
+                if _up_grade is not None:              # v18.1 (Suggestion 2)
+                    _bs_head += f" · Grade {_up_grade}"
+                _bs_lines = [
+                    f"Spot {spot:,.0f} is testing the Call Wall {_bs_cw:,} (within 1 strike) — the resistance ceiling is under attack.",
+                    f"ATM {_bs_atm:,} plus adjacent strike(s) show bullish EV pressure (ratio > 1.2) — call buyers / put sellers dominate right where the market sits.",
+                    f"The Call Wall has shifted UP vs the previous reading ({_prev_cw:,} → {_bs_cw:,}) — call writers are retreating to higher strikes.",
+                    "All three breakout criteria are met → an upside break is in play.",
+                ]
+                if _up_grade == "A":                   # v18.1 (Suggestion 2)
+                    _bs_lines.append(f"Grade A — Δ-weighted OI flow at the Call Wall {_bs_cw:,} shows call writers UNWINDING: high-conviction break.")
+                elif _up_grade == "B":
+                    _bs_lines.append(f"Grade B — call-side OI is still BUILDING at the Call Wall {_bs_cw:,} (writers reinforcing): break attempt may fail.")
+            else:
+                _bs_lines = [
+                    "Breakout conditions fired earlier today — bias is HELD at BULLISH.",
+                    f"It reverts to SIDEWAYS only when ATM {_bs_atm:,} and BOTH ATM±1 strikes return to the neutral EV band (0.7–1.2).",
+                ]
+        else:
+            _bs_col, _bs_bg = "#0EA5E9", "#E0F2FE"
+            if _weakening:
+                _bs_head = f"🔷 SIDEWAYS BIAS — WEAKENING · Range {_rng_txt}"
+                _bs_lines = []
+                if _lo_dec or _hi_dec:
+                    _bs_side = ("both sides" if (_lo_dec and _hi_dec)
+                                else ("the Put-Wall side" if _lo_dec else "the Call-Wall side"))
+                    _bs_lines += [
+                        f"Neutral strikes are reducing on {_bs_side} of ATM vs the previous reading — now {_bs_neu} of {_bs_tot} wall-to-wall strikes in the neutral EV band (0.7–1.2).",
+                        "The range is losing sponsorship — watch the walls closely; no breakout/breakdown criteria have been met yet.",
+                    ]
+                if _tilt_weak:                         # v18.1 (Suggestion 3)
+                    _tilt_side = "support (Put-Wall)" if _dex_tilt > 0 else "resistance (Call-Wall)"
+                    _bs_lines.append(
+                        f"DEX balance check: dealer positioning is lopsided toward the {_tilt_side} side "
+                        f"(tilt {_dex_tilt:+.0%}) — the range is tilting before the EV ratios show it.")
+                if not (_lo_dec or _hi_dec):
+                    _bs_lines.append("No breakout/breakdown criteria met yet — stance stays SIDEWAYS but conviction is reduced.")
+            elif _bs_frac >= 0.70:
+                _bs_head = f"🔷 SIDEWAYS BIAS — STRONG · Range {_rng_txt}"
+                _bs_lines = [
+                    f"{_bs_neu} of {_bs_tot} strikes between the Put Wall and Call Wall sit in the neutral EV band (0.7–1.2) — no side has the edge at or around ATM.",
+                    f"Option writers are defending both walls — expect price to stay range-bound between {_rng_txt}.",
+                ]
+                if _tilt_den > 0:                      # v18.1 (Suggestion 3)
+                    _bs_lines.append(
+                        f"DEX balance check: positioning weight is balanced across the range (tilt {_dex_tilt:+.0%}) — confirms the sideways structure.")
+            else:
+                _bs_head = f"🔷 SIDEWAYS BIAS · Range {_rng_txt}"
+                _bs_lines = [
+                    f"Only {_bs_neu} of {_bs_tot} wall-to-wall strikes are neutral (below the 70% 'strong' threshold), but no breakout/breakdown criteria are met either.",
+                    "Default stance stays sideways until the wall-shift + ATM±1 criteria fire.",
+                ]
+
+        # v17.1: under SIDEWAYS bias, flag wall movement vs the previous data
+        # refresh — Put Wall = SUPPORT, Call Wall = RESISTANCE.
+        if _bs_bias == "SIDEWAYS":
+            if _bs_pw is not None and _prev_pw is not None and _bs_pw != _prev_pw:
+                _bs_lines.append(f"SUPPORT (Put Wall) moving {'UP' if _bs_pw > _prev_pw else 'DOWN'} — {_prev_pw:,} → {_bs_pw:,} vs previous data refresh.")
+            if _bs_cw is not None and _prev_cw is not None and _bs_cw != _prev_cw:
+                _bs_lines.append(f"RESISTANCE (Call Wall) moving {'UP' if _bs_cw > _prev_cw else 'DOWN'} — {_prev_cw:,} → {_bs_cw:,} vs previous data refresh.")
+            # v18.1 (Suggestion 5): note when a held alert was released because
+            # the broken wall's DEX load rebuilt (failed break).
+            if _rebuilt and _prev_bias in ("BEARISH", "BULLISH"):
+                _bs_wall_txt = "Call Wall" if _prev_bias == "BULLISH" else "Put Wall"
+                _bs_lines.append(f"Held {_prev_bias} alert RELEASED — the {_bs_wall_txt}'s DEX load has rebuilt to ≥70% of band max: failed break, back to SIDEWAYS.")
+
+        # v17.2: one-line Max Pain movement note vs the previous data refresh.
+        if _bs_mp is not None and _prev_mp is not None and _bs_mp != _prev_mp:
+            _bs_lines.append(f"MAX PAIN moved {'UP' if _bs_mp > _prev_mp else 'DOWN'} — {_prev_mp:,} → {_bs_mp:,} vs previous data refresh.")
+
+        if _bs_prev.get("ts") != _bs_ts:   # persist once per data tick (not per rerender)
+            # v23: basis_gap appended so Layer C can show the futures−synthetic
+            # gap trend on the next tick. Additive key — older state files
+            # without it simply read back None and the trend line is skipped.
+            _atomic_json_write(_bs_file, {
+                "date": _bs_today, "ts": _bs_ts, "put_wall": _bs_pw, "call_wall": _bs_cw,
+                "neu_lo": _bs_neu_lo, "neu_hi": _bs_neu_hi, "neutral_count": _bs_neu,
+                "bias": _bs_bias, "max_pain": _bs_mp,
+                "basis_gap": (round(float(sig10["basis_gap"]), 2)
+                              if (sig10 and sig10.get("has_traded")
+                                  and sig10.get("basis_gap") is not None) else None)})
+        _bs_ok = True          # v23 sentinel — block completed cleanly
+        _bs_bullets = ''.join(
+            f'<div style="font-size:13px;color:#111;margin-top:3px;">• {_l}</div>'
+            for _l in _bs_lines)
+        st.markdown(f"""
+        <div style="background:{_bs_bg};border:2px solid {_bs_col};border-radius:10px;
+                    padding:12px 16px;margin-top:12px;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Bias Summary</div>
+          <div style="font-size:20px;font-weight:900;color:{_bs_col};margin:2px 0 6px;">{_bs_head}</div>
+          {_bs_bullets}
+        </div>""", unsafe_allow_html=True)
+    except Exception as _bs_err:
+        st.info(f"Bias Summary — collecting data ({_bs_err}).")
+
+    # ── Futures Confirmation (v23) — ADDITIVE ONLY ─────────────────────────
+    # Reads the hoisted Section 10 objects (sig10) plus the DEX tilt / wall
+    # values the Bias Summary above already computed. Adds NOTHING to the
+    # headline verdict: _bs_bias, the sticky-alert state machine, Grade A/B
+    # logic and the release rule are untouched (decision D1a). This panel is
+    # purely explanatory and renders nothing at all when the futures feed is
+    # absent, restoring byte-identical pre-v23 output.
+    #
+    # Three layers, all from values already computed elsewhere:
+    #   A. Futures−Fair  ×  Synth−Fair   → 3x3 agreement read (any regime)
+    #   B. DEX tilt      ×  Futures−Fair → lopsided-range read (SIDEWAYS only)
+    #   C. |basis_gap| vs previous tick  → basis tension widening/narrowing
+    #
+    # NOTE on Layer B (documented limitation): the existing _dex_tilt sums
+    # abs(dv), so it measures WHICH SIDE CARRIES MORE dealer positioning weight
+    # — it is deliberately direction-agnostic (decision D2a keeps it that way).
+    # Futures therefore supply the direction the tilt cannot. The join "the
+    # lighter-weighted side is the thinner wall" is a structural reading, NOT a
+    # backtested rule; wording below stays descriptive rather than predictive.
+    try:
+        if sig10 and sig10.get("has_traded") and _bs_ok:
+            _fc_thr   = max(spot * 0.0004, 5.0)      # same thr as compute_basis_signals
+            _fc_te    = sig10.get("traded_excess")
+            _fc_se    = sig10.get("synth_excess")
+            _fc_gap   = sig10.get("basis_gap")
+            _fc_lines = []
+
+            def _fc_cat(_v):
+                if _v is None or not np.isfinite(_v):
+                    return None
+                return "Premium" if _v > _fc_thr else ("Discount" if _v < -_fc_thr else "Neutral")
+
+            _fc_tcat, _fc_scat = _fc_cat(_fc_te), _fc_cat(_fc_se)
+
+            # ── Layer A — futures vs options agreement (all regimes) ─────────
+            _fc_A = {
+                ("Premium",  "Premium"):  ("ALIGNED BULLISH",  "#047857",
+                    "Futures and options pricing agree — both trade above fair carry."),
+                ("Premium",  "Neutral"):  ("FUTURES LEADING",  "#047857",
+                    "Futures trade above fair carry while options price at carry — futures are leading, options have not confirmed."),
+                ("Premium",  "Discount"): ("SPLIT BOOKS",      "#D97706",
+                    "Futures bid above fair carry while options price below it — the two markets disagree."),
+                ("Neutral",  "Premium"):  ("OPTIONS LEADING",  "#047857",
+                    "Options price above fair carry while futures sit at carry — options are leading, futures have not confirmed."),
+                ("Neutral",  "Neutral"):  ("CARRY-NEUTRAL",    "#0EA5E9",
+                    "Both futures and options sit at fair carry — no directional edge from the basis."),
+                ("Neutral",  "Discount"): ("OPTIONS LEADING DOWN", "#D97706",
+                    "Options price below fair carry while futures sit at carry — options are leading lower, futures have not confirmed."),
+                ("Discount", "Premium"):  ("SPLIT BOOKS",      "#D97706",
+                    "Futures trade below fair carry while options price above it — the two markets disagree."),
+                ("Discount", "Neutral"):  ("FUTURES LEADING DOWN", "#DC2626",
+                    "Futures trade below fair carry while options price at carry — futures are leading lower, options have not confirmed."),
+                ("Discount", "Discount"): ("ALIGNED BEARISH",  "#DC2626",
+                    "Futures and options pricing agree — both trade below fair carry."),
+            }
+            _fc_head, _fc_col = "FUTURES DATA INCOMPLETE", "#6B7280"
+            if _fc_tcat and _fc_scat:
+                _fc_head, _fc_col, _fc_txt = _fc_A[(_fc_tcat, _fc_scat)]
+                _fc_lines.append(_fc_txt)
+                _fc_lines.append(
+                    f"Futures − Fair {_fc_te:+.1f}pts ({_fc_tcat}) · Synthetic − Fair {_fc_se:+.1f}pts "
+                    f"({_fc_scat}) · threshold ±{_fc_thr:.1f}pts.")
+
+            # ── Layer B — lopsided walls × futures (SIDEWAYS regime only) ────
+            if _bs_bias == "SIDEWAYS":
+                _fc_pw_txt = f"{_bs_pw:,}" if _bs_pw is not None else "N/A"
+                _fc_cw_txt = f"{_bs_cw:,}" if _bs_cw is not None else "N/A"
+                if _tilt_weak and _fc_tcat:
+                    # tilt > 0 → support side carries MORE weight → the
+                    # resistance (Call Wall) side is the thinner one.
+                    _heavy = "support (Put-Wall)" if _dex_tilt > 0 else "resistance (Call-Wall)"
+                    _thin  = ("Call Wall " + _fc_cw_txt) if _dex_tilt > 0 else ("Put Wall " + _fc_pw_txt)
+                    _tilt_dir = 1 if _dex_tilt > 0 else -1        # direction the THIN wall implies
+                    _fut_dir  = 1 if _fc_tcat == "Premium" else (-1 if _fc_tcat == "Discount" else 0)
+                    if _fut_dir == 0:
+                        _fc_lines.append(
+                            f"Lopsided range check: positioning weight is concentrated on the {_heavy} side "
+                            f"(tilt {_dex_tilt:+.0%}), but futures sit at fair carry — no directional "
+                            f"confirmation from the futures side yet.")
+                    elif _fut_dir == _tilt_dir:
+                        _fc_lines.append(
+                            f"Lopsided range check: positioning weight is concentrated on the {_heavy} side "
+                            f"(tilt {_dex_tilt:+.0%}), leaving {_thin} as the thinner wall — and futures "
+                            f"{'above' if _fut_dir > 0 else 'below'} fair carry point the same way. "
+                            f"Structure and futures agree on which side is under pressure.")
+                    else:
+                        _fc_lines.append(
+                            f"Lopsided range check: positioning weight is on the {_heavy} side "
+                            f"(tilt {_dex_tilt:+.0%}, thinner wall {_thin}) but futures trade "
+                            f"{'above' if _fut_dir > 0 else 'below'} fair carry — structure and futures "
+                            f"DISAGREE; treat the lopsided range as unresolved.")
+                elif (not _tilt_weak) and _fc_gap is not None and np.isfinite(_fc_gap):
+                    if abs(_fc_gap) <= _fc_thr:
+                        _fc_lines.append(
+                            f"Balanced range check: dealer positioning is balanced (tilt {_dex_tilt:+.0%}) and "
+                            f"futures track the synthetic within {abs(_fc_gap):.1f}pts — structure and basis "
+                            f"both confirm the sideways range.")
+                    else:
+                        _fc_lines.append(
+                            f"Balanced range check: dealer positioning is balanced (tilt {_dex_tilt:+.0%}), but "
+                            f"futures and the synthetic disagree by {_fc_gap:+.1f}pts — basis tension is "
+                            f"present even though the option structure looks calm.")
+
+            # ── Layer C — basis gap trend vs previous data refresh ───────────
+            if (_fc_gap is not None and np.isfinite(_fc_gap)
+                    and _prev_basis_gap is not None):
+                try:
+                    _pg = float(_prev_basis_gap)
+                    if abs(_fc_gap) > abs(_pg):
+                        _fc_lines.append(
+                            f"FUTURES–SYNTHETIC GAP WIDENING — {_pg:+.1f}pts → {_fc_gap:+.1f}pts vs previous "
+                            f"data refresh: the two markets are pulling further apart.")
+                    elif abs(_fc_gap) < abs(_pg):
+                        _fc_lines.append(
+                            f"FUTURES–SYNTHETIC GAP NARROWING — {_pg:+.1f}pts → {_fc_gap:+.1f}pts vs previous "
+                            f"data refresh: the two markets are converging.")
+                except (TypeError, ValueError):
+                    pass
+
+            if _fc_lines:
+                _fc_bg = {"#047857": "#D1FAE5", "#DC2626": "#FEE2E2",
+                          "#D97706": "#FFFBEB", "#0EA5E9": "#E0F2FE"}.get(_fc_col, "#F9FAFB")
+                _fc_bullets = ''.join(
+                    f'<div style="font-size:13px;color:#111;margin-top:3px;">• {_l}</div>'
+                    for _l in _fc_lines)
+                st.markdown(f"""
+                <div style="background:{_fc_bg};border:2px solid {_fc_col};border-radius:10px;
+                            padding:12px 16px;margin-top:10px;">
+                  <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Futures Confirmation &middot; Section 10 basis, read against the option structure above</div>
+                  <div style="font-size:18px;font-weight:900;color:{_fc_col};margin:2px 0 6px;">&#9878; {_fc_head}</div>
+                  {_fc_bullets}
+                  <div style="font-size:11px;color:#6B7280;margin-top:7px;font-style:italic;">
+                    Explanatory only — does not alter the Bias Summary verdict above.
+                    Layer B pairs a magnitude-only DEX tilt with futures direction;
+                    structural reading, not a backtested rule.</div>
+                </div>""", unsafe_allow_html=True)
+    except Exception as _fc_err:
+        st.info(f"Futures Confirmation — collecting data ({_fc_err}).")
+
+    # v21: Section 4 Summary — standalone verdict built ONLY from Section 4's
+    # own 12 charts, independent of Section 3 / Bias Score / Bias Summary
+    # state above. Four checks, each read straight off an already-computed
+    # chart series (no new heavy calc):
+    #   Regime      — chart 3 (gv, net GEX sign) + chart 4 (_iv_sc badge)
+    #   Structure    — chart 1 (dv) agreeing in sign with chart 2 (mv)
+    #   Premium      — chart 5/6 (_s4_evmap) net tilt across the ATM band
+    #   Size confirm — charts 7/8 (_evr_oiw_s/_evr_oic_s) + charts 11/12
+    #                  (_devr_oi_s/_devr_chg_s, liquidity-masked)
+    # All three of Structure/Premium/Size agreeing → HIGH CONVICTION;
+    # none decisive → NO CLEAR SIGNAL; anything else → WEAKENING/MIXED.
+    try:
+        _s4sum_gex_dir  = -1 if float(gv.sum()) < 0 else 1
+        _s4sum_iv_badge = _iv_sc.get("badge") if _iv_sc else "NEUTRAL"
+
+        _s4sum_dv_sum = float(dv.sum()); _s4sum_mv_sum = float(mv.sum())
+        _s4sum_struct_dir = -1 if _s4sum_dv_sum > 0 else (1 if _s4sum_dv_sum < 0 else 0)
+        _s4sum_flow_dir   = -1 if _s4sum_mv_sum > 0 else (1 if _s4sum_mv_sum < 0 else 0)
+        _s4sum_sf_dir     = _s4sum_struct_dir if _s4sum_struct_dir == _s4sum_flow_dir else 0
+
+        def _s4sum_cls(_v):
+            if _v is None or not np.isfinite(_v): return None
+            return 1 if _v > 1.2 else (-1 if _v < 0.7 else 0)
+        _s4sum_prem_vals = [v for v in (_s4sum_cls(_v) for _v in _s4_evmap.values()) if v]
+        _s4sum_prem_sum  = sum(_s4sum_prem_vals)
+        _s4sum_prem_dir  = 1 if _s4sum_prem_sum > 0 else (-1 if _s4sum_prem_sum < 0 else 0)
+
+        _s4sum_conv_dirs = [1 if float(_evr_oiw_s.mean()) >= 1 else -1,
+                             1 if float(_evr_oic_s.mean()) >= 1 else -1]
+        if int(_liq_ev_oi.sum()) > 0:
+            _s4sum_conv_dirs.append(1 if float(_devr_oi_s[_liq_ev_oi].mean()) >= 1 else -1)
+        if int(_liq_ev_chg.sum()) > 0:
+            _s4sum_conv_dirs.append(1 if float(_devr_chg_s[_liq_ev_chg].mean()) >= 1 else -1)
+        _s4sum_conv_sum = sum(_s4sum_conv_dirs)
+        _s4sum_conv_dir = 1 if _s4sum_conv_sum > 0 else (-1 if _s4sum_conv_sum < 0 else 0)
+
+        _s4sum_votes = [v for v in (_s4sum_sf_dir, _s4sum_prem_dir, _s4sum_conv_dir) if v != 0]
+        if len(_s4sum_votes) == 3 and _s4sum_votes[0] == _s4sum_votes[1] == _s4sum_votes[2]:
+            _s4sum_bias = "BULLISH" if _s4sum_votes[0] > 0 else "BEARISH"
+            _s4sum_col, _s4sum_bg = ("#047857", "#D1FAE5") if _s4sum_bias == "BULLISH" else ("#DC2626", "#FEE2E2")
+            _s4sum_head = f"🎯 HIGH CONVICTION — {_s4sum_bias}"
+        elif not _s4sum_votes:
+            _s4sum_col, _s4sum_bg = "#6B7280", "#F9FAFB"
+            _s4sum_head = "◻ NO CLEAR SIGNAL"
+        else:
+            _s4sum_col, _s4sum_bg = "#D97706", "#FFFBEB"
+            _s4sum_head = "⚠ WEAKENING / MIXED SIGNALS"
+
+        _s4sum_lines = [
+            f"Regime (charts 3, 4): {'trending, negative-gamma' if _s4sum_gex_dir < 0 else 'range-bound, positive-gamma'} backdrop · IV smile reading {_s4sum_iv_badge}.",
+            "Structure &amp; flow (charts 1, 2): " + (
+                "position and today's activity agree — put side gaining strength (bullish tilt)." if _s4sum_sf_dir > 0 else
+                "position and today's activity agree — call side gaining strength (bearish tilt)." if _s4sum_sf_dir < 0 else
+                "the standing position and today's flow disagree — no lean here."),
+            "Premium pressure (charts 5, 6): " + (
+                "buyers are paying up on the call side (bullish)." if _s4sum_prem_dir > 0 else
+                "buyers are paying up on the put side (bearish)." if _s4sum_prem_dir < 0 else
+                "premium is flat across the band — no side is paying up."),
+            "Size confirmation (charts 7, 8, 11, 12): " + (
+                "backs up the premium read with real size and fresh flow." if (_s4sum_prem_dir != 0 and _s4sum_conv_dir == _s4sum_prem_dir) else
+                "does not back up the premium read — treat it with caution." if _s4sum_prem_dir != 0 else
+                "shows no decisive lean either."),
+        ]
+        _s4sum_bullets = ''.join(
+            f'<div style="font-size:13px;color:#111;margin-top:3px;">• {_l}</div>'
+            for _l in _s4sum_lines)
+        st.markdown(f"""
+        <div style="background:{_s4sum_bg};border:2px solid {_s4sum_col};border-radius:10px;
+                    padding:12px 16px;margin-top:10px;">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Section 4 Summary</div>
+          <div style="font-size:18px;font-weight:900;color:{_s4sum_col};margin:2px 0 6px;">{_s4sum_head}</div>
+          {_s4sum_bullets}
+        </div>""", unsafe_allow_html=True)
+    except Exception as _s4sum_err:
+        st.info(f"Section 4 Summary — collecting data ({_s4sum_err}).")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2: BIAS ENGINE + STRATEGY + KEY METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+with _slot_s2:   # v8: render into top-of-dashboard slot (display order only)
+    st.markdown('<div class="section-header"> Section 2  Bias Engine · Strategy · Key Metrics</div>', unsafe_allow_html=True)
+
+    # Gauge + header metrics
+    # NOTE (CHANGE 2 audit fix): the "Hedge-Flow Bias" metric below is the legacy
+    # signed-delta net_delta score. Treat it as a dealer hedge-pressure read, not
+    # the authoritative directional call — that lives in the S3/4 / Combined
+    # Decision panels further down.
+    header_cols = st.columns(8)
+    metric_defs = [
+        ("Symbol",      SYMBOL,                      ACCENT),
+        ("Spot",        f"{spot:,.2f}",              "#1A1A2E"),
+        ("Expiry",      expiry,                       MUTED),
+        ("ATM IV",      f"{m['atm_iv']:.2f}%",       CYAN),
+        ("ATM Strike",  int(m['atm']),                BLUE),
+        ("Hedge-Flow Bias", f"{bs:+.1f}",            bc),
+        ("Confidence",  f"{bias['confidence']:.0f}%", BLUE),
+        ("Regime",      regime[:12],                  AMBER),
+    ]
+    for col, (label, val, color) in zip(header_cols, metric_defs):
+        col.markdown(f"""
+        <div class="card" style="text-align:center;">
+          <div style="font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;">{label}</div>
+          <div style="font-size:16px;font-weight:800;color:{color};">{val}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Gauge chart
+    bias_col, strat_col, metrics_col = st.columns([1, 1.2, 2.2])
+
+    with bias_col:
+        gauge_fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=bs,
+            domain={"x":[0,1],"y":[0,1]},
+            title={"text":"Hedge-Flow Bias (signed Δ×OI)","font":{"color":TEXT,"size":12}},
+            number={"font":{"color":bc,"size":34}},
+            gauge={
+                "axis":{"range":[-100,100],"tickcolor":"#444"},
+                "bar":{"color":bc},
+                "bgcolor":"#fff",
+                "steps":[
+                    {"range":[-100,-40],"color":"#fde8e8"},
+                    {"range":[-40,-15],"color":"#fef3c7"},
+                    {"range":[-15,15],"color":"#f0fdf4"},
+                    {"range":[15,40],"color":"#dcfce7"},
+                    {"range":[40,100],"color":"#bbf7d0"},
+                ],
+                "threshold":{"line":{"color":bc,"width":3},"thickness":0.8,"value":bs},
+            },
+        ))
+        gauge_fig.update_layout(paper_bgcolor="#fff",plot_bgcolor="#fff",
+                                margin=dict(l=20,r=20,t=30,b=5),height=200)
+        st.plotly_chart(gauge_fig, width='stretch', config={"displayModeBar":False})
+
+    with strat_col:
+        st.markdown(f"""
+        <div class="card">
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Market Mode</div>
+          <div style="font-size:16px;font-weight:700;color:{strat['mode_color']};margin-bottom:8px;">{strat['market_mode']}</div>
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Direction</div>
+          <div style="font-size:14px;font-weight:700;color:{bc};margin-bottom:8px;">{_s34_bias["direction"]}</div>
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Strategy</div>
+          <div style="font-size:14px;font-weight:700;color:{strat['color']};margin-bottom:6px;">{strat['name']}</div>
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">Execution</div>
+          <div style="font-size:13px;font-weight:700;color:#111;margin-bottom:6px;line-height:1.5;">{strat['legs']}</div>
+          <div style="font-size:11px;color:#0891B2;font-weight:600;">{strat.get('iv_context','')}</div>
+          <div style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;margin-top:8px;">Why</div>
+          {''.join(f'<div style="font-size:12px;color:#111;font-weight:600;margin-top:3px;"> {f}</div>' for f in bias.get('factors',[]))}
+        </div>
+        """, unsafe_allow_html=True)
+
+    with metrics_col:
+        mc = st.columns(4)
+        metric_items = [
+            ("Sentiment (Raw Avg)", m.get("ev_ratio_avg_strikewise", 1.0),
+                 GREEN if m.get("ev_ratio_avg_strikewise", 1.0)>1.2 else (SKY if m.get("ev_ratio_avg_strikewise", 1.0)>=0.7 else RED)),
+            ("Sentiment (OI-Wtd Avg)", m.get("ev_ratio_oiw_avg_strikewise", 1.0),
+                 GREEN if m.get("ev_ratio_oiw_avg_strikewise", 1.0)>=1.05 else (AMBER if m.get("ev_ratio_oiw_avg_strikewise", 1.0)>=0.95 else RED)),
+            ("Net Delta", f"{int(m['net_delta']):,}", GREEN if m["net_delta"]>0 else RED),
+            ("Momentum",  f"{int(m['momentum']):,}",  GREEN if m["momentum"]>0 else RED),
+            ("GEX",       f"{m['gex']:,.0f}",          GREEN if m["gex"]>0 else RED),
+            ("Vanna",     f"{m['vanna']:.2f}",          GREEN if m["vanna"]>0 else RED),
+            ("Vega Skew", m["vega_skew"],               GREEN if m["vega_skew"]>=1.05 else RED),
+            ("PCR",       m["pcr"],                     GREEN if 0.6<=m["pcr"]<=1.2 else (BLUE if m["pcr"]>1.2 else RED)),
+            ("G/T Ratio", m["gt_ratio"],                BLUE),
+            ("ATM Pressure", f"{int(m['atm_pressure']):,}", GREEN if m["atm_pressure"]>0 else RED),
+            ("Skew Slope", m["skew_slope"],              RED if m["skew_slope"]>0 else GREEN),
+            ("Near OI %", f"{m['near_oi_concentration']*100:.1f}%", CYAN),
+            ("Near OI Chg%", f"{m['near_oichg_concentration']*100:.1f}%", CYAN),
+            ("IV Rank",   f"{m.get('iv_rank',0):.0f}",  RED if m.get("iv_rank",0)>=70 else (GREEN if m.get("iv_rank",0)<=30 else AMBER)),
+            ("Gamma Flip", int(m["gamma_flip"]) if m.get("gamma_flip") else "N/A",
+                           RED if m.get("gamma_flip") and m.get("atm",0)<m["gamma_flip"] else GREEN),
+            ("Support",   int(m["support"]),    GREEN),
+            ("Resistance",int(m["resistance"]), RED),
+        ]
+        for i, (label, val, color) in enumerate(metric_items):
+            with mc[i % 4]:
+                st.markdown(f"""
+                <div class="card" style="text-align:center;padding:8px 10px;">
+                  <div style="font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;">{label}</div>
+                  <div style="font-size:16px;font-weight:800;color:{color};">{val}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10: BASIS TRIANGULATION (NIFTY Futures)
+# ─────────────────────────────────────────────────────────────────────────────
+with _slot_s10:   # v8: render into top-of-dashboard slot (display order only)
+    st.markdown('<div class="section-header"> Section 10  Basis Triangulation · Spot · Synthetic Future · NIFTY Futures</div>', unsafe_allow_html=True)
+    st.caption("Put-call parity synthetic future vs live traded NIFTY futures vs fair carry. Futures − Synthetic (★) is the primary leading signal.")
+
+    # v23: _atm_s10 / sf_res / sig10 are now computed once in the HOIST block
+    # at the top of the Final Decision Matrix so the top panel can read them.
+    # Nothing is recomputed here — `sig` is bound to that same object, so this
+    # section renders identically to pre-v23.
+    sig = sig10
+
+    if sig:
+        b10c1, b10c2, b10c3, b10c4 = st.columns(4)
+        for col, label, val, color, sub in [
+            (b10c1, "SPOT",             sig["spot"],         "#1E40AF", "Reference price"),
+            (b10c2, "SYNTHETIC FUTURE", sig["synthetic"],    "#7C3AED", f"C-P parity @ {sig['atm']}"),
+            (b10c3, "TRADED FUTURE",    sig["traded_future"] if sig["has_traded"] else "NO FEED",
+                     GREEN if sig["has_traded"] else MUTED, "Live NIFTY Fut LTP"),
+            (b10c4, "FAIR CARRY",       sig["fair_future"],  "#9CA3AF", f"r=6.5% · {sig['T_days']:.0f}d"),
+        ]:
+            col.markdown(f"""
+            <div class="card" style="text-align:center;border:1.5px solid {color};">
+              <div style="font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;">{label}</div>
+              <div style="font-size:20px;font-weight:800;color:{color};">{'N/A' if isinstance(val, type(None)) else (f'{val:,.2f}' if isinstance(val, float) else val)}</div>
+              <div style="font-size:11px;color:#6B7280;margin-top:2px;">{sub}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Gap chips
+        gc = st.columns(5)
+        for col, label, val in [
+            (gc[0], "Synth − Spot",    sig["synth_basis"]),
+            (gc[1], "Synth − Fair",    sig["synth_excess"]),
+            (gc[2], "Futures − Fair",  sig.get("traded_excess")),
+            (gc[3], "Futures − Synth ★", sig.get("basis_gap")),
+            (gc[4], "Fair Basis",      sig["fair_basis"]),
+        ]:
+            if val is None:
+                col.metric(label, "N/A")
+            else:
+                color_str = "normal" if abs(val) <= 2 else ("inverse" if val < 0 else "normal")
+                col.metric(label, f"{val:+.1f} pts", delta=None)
+
+        sc_color = sig["summary_color"]
+        st.markdown(f"""
+        <div style="background:{sc_color}12;border:1.5px solid {sc_color};border-radius:8px;padding:8px 14px;margin:10px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <span style="font-size:11px;font-weight:700;color:#6B7280;text-transform:uppercase;">BASIS BIAS:</span>
+          <span style="font-size:15px;font-weight:800;color:{sc_color};">{sig['summary_label']}</span>
+          <span style="font-size:11px;color:#6B7280;font-style:italic;">independent of main bias engine  use as confirmation</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        for txt, color in sig["signals"]:
+            st.markdown(f'<div style="font-size:12px;color:{TEXT};margin-bottom:4px;"><span style="color:{color};font-size:13px;">● </span>{txt}</div>', unsafe_allow_html=True)
+    else:
+        st.info("⏳ Basis Triangulation  collecting data (need valid ATM call & put LTP).")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7: RAW OPTION CHAIN TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<div class="section-header"> Section 7  Raw Option Chain (ATM Band) · Delta Health Check</div>', unsafe_allow_html=True)
+
+df_band_disp = pd.DataFrame(payload["df_band"])
+if not df_band_disp.empty:
+    needed = ["strike","call_oi","call_oi_chg","call_delta","call_iv","put_iv","put_delta","put_oi_chg","put_oi"]
+    for c in needed:
+        if c not in df_band_disp.columns:
+            df_band_disp[c] = 0
+
+    df_show = df_band_disp[needed].sort_values("strike", ascending=False).copy()
+
+    # Delta health
+    raw_delta = df_show["call_delta"].abs()
+    delta_zeros = (raw_delta < 0.001).sum()
+    delta_total = len(raw_delta)
+    if delta_zeros > delta_total * 0.5:
+        st.warning(f"⚠️ {delta_zeros}/{delta_total} strikes have delta≈0  Dhan greeks may be sparse.")
+    else:
+        st.success(f"✅ Delta populated for {delta_total - delta_zeros}/{delta_total} strikes  delta-weighted flow is active.")
+
+    df_show.columns = ["Strike","C OI","C OI Chg","C Δ","C IV","P IV","P Δ","P OI Chg","P OI"]
+    st.dataframe(df_show.style.format({
+        "C OI":"{:,}","P OI":"{:,}","C OI Chg":"{:+,}","P OI Chg":"{:+,}",
+        "C Δ":"{:.3f}","P Δ":"{:.3f}","C IV":"{:.1f}%","P IV":"{:.1f}%","Strike":"{:,}"
+    }), width='stretch', hide_index=True)
+
+
+# v27: GEX × Gamma Flip 9-state reference grid — bottom of the dashboard
+if _v27_grm_for_bottom and _v27_grm_for_bottom.get("available"):
+    try:
+        st.markdown('<div class="section-header">📐 GEX × Gamma Flip Regime Matrix — 9 indicative states (reference)</div>', unsafe_allow_html=True)
+        st.markdown(render_gamma_regime_matrix_html(_v27_grm_for_bottom, part="grid"), unsafe_allow_html=True)
+    except Exception as _v27_ge:
+        st.caption(f"GEX × Gamma Flip grid unavailable ({_v27_ge})")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FOOTER + AUTO-REFRESH
+# ─────────────────────────────────────────────────────────────────────────────
+st.divider()
+st.markdown(f"""
+<div style="text-align:center;font-size:12px;color:#6B7280;padding:8px 0;">
+  <strong>Shantanu's Options Analysis  NIFTY 50 · NIFTY Futures</strong><br>
+  Structural Band ±10 · Signal Band ±5 · Bias Engine · Strategy Engine<br>
+  All timestamps in <strong>IST (Asia/Kolkata)</strong> ·
+  {' LIVE data (Dhan API, refreshed every ' + str(_effective_refresh) + 's)' if USE_DHAN and mh else ' Demo mode' if USE_DEMO_MODE else ' After-hours cached data (refresh: ' + str(_effective_refresh) + 's)'}<br>
+  Last updated: <strong>{payload['ts_ist']}</strong>
+</div>
+""", unsafe_allow_html=True)
+
+# ─── Auto-refresh note ─────────────────────────────────────────────────────────
+# CI #5 fix: st_autorefresh was previously registered here at the end of the
+# script. It has been moved to the top (right after set_page_config) so it
+# survives any st.stop() triggered by API failures. See L75 for the actual call.
+# Page always refreshes every 60 s for ALL visitors.
+# Data refresh cadence is governed by the server-side interval set in owner mode —
+# independent of this.
