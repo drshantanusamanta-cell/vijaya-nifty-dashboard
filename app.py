@@ -39,6 +39,7 @@
 ║        below Momentum Strength in the FDM · flip method saved     ║
 ║  v42.1 — outlier-tick filter, robust auto-scale, thicker lines    ║
 ║  v42.2 — demo-fallback ticks (API ERROR) never saved to history   ║
+║  v42.3 — responsive layout CSS: phone · tablet/iPad · desktop     ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -5892,6 +5893,34 @@ div[data-testid="stMetric"] { background:#fff; border-radius:10px; padding:10px 
 [data-testid="block-container"] {
   max-width: 100% !important;
   overflow-x: hidden !important;
+}
+
+/* ── v42.3: responsive layout · phone ≤ 640px · tablet/iPad 641–1199px · desktop ≥ 1200px unchanged ── */
+/* Rows with 4+ columns = tile/metric rows; rows with 1–3 columns = charts and panels.          */
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+@media (min-width: 641px) and (max-width: 1199px) {
+  [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; row-gap: 1.1rem !important; }
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(4)) > [data-testid="stColumn"],
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="column"]:nth-child(4)) > [data-testid="column"] {
+    flex: 1 1 150px !important; min-width: 150px !important; width: auto !important; }
+  [data-testid="stHorizontalBlock"]:not(:has(> [data-testid="stColumn"]:nth-child(4))):not(:has(> [data-testid="column"]:nth-child(4))) > [data-testid="stColumn"],
+  [data-testid="stHorizontalBlock"]:not(:has(> [data-testid="stColumn"]:nth-child(4))):not(:has(> [data-testid="column"]:nth-child(4))) > [data-testid="column"] {
+    flex: 1 1 420px !important; min-width: min(420px, 100%) !important; width: auto !important; }
+}
+@media (max-width: 640px) {
+  [data-testid="block-container"], [data-testid="stMainBlockContainer"], .block-container {
+    padding-left: 0.6rem !important; padding-right: 0.6rem !important; padding-top: 1rem !important; }
+  [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; column-gap: 0.5rem !important; row-gap: 1.1rem !important; }
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(4)) > [data-testid="stColumn"],
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="column"]:nth-child(4)) > [data-testid="column"] {
+    flex: 1 1 calc(50% - 0.5rem) !important; min-width: calc(50% - 0.5rem) !important;
+    width: calc(50% - 0.5rem) !important; }
+  [data-testid="stHorizontalBlock"]:not(:has(> [data-testid="stColumn"]:nth-child(4))):not(:has(> [data-testid="column"]:nth-child(4))) > [data-testid="stColumn"],
+  [data-testid="stHorizontalBlock"]:not(:has(> [data-testid="stColumn"]:nth-child(4))):not(:has(> [data-testid="column"]:nth-child(4))) > [data-testid="column"] {
+    flex: 1 1 100% !important; min-width: 100% !important; width: 100% !important; }
+  .card { overflow-wrap: anywhere; }
+  .card [style*="font-size:22px"], .card [style*="font-size:20px"] { font-size: 17px !important; }
+  .card [style*="font-size:18px"], .card [style*="font-size:16px"] { font-size: 15px !important; }
 }
 </style>
 """, unsafe_allow_html=True)
