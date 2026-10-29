@@ -34,6 +34,9 @@
 ║  v30 — 10-Oct-2026: REMOVED Shantanu's View (Buyer/Seller Matrix) ║
 ║        and Combined Flow × Premium Read — no other section used   ║
 ║        them (their helper functions remain, now unused)           ║
+║  v42 — 29-Oct-2026: Gamma Flip × Net GEX over time — full-width   ║
+║        3-panel chart (spot vs flip · spot−flip % · GEX ratio)     ║
+║        below Momentum Strength in the FDM · flip method saved     ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -2195,6 +2198,208 @@ def _oi15s_figure(pts):
     return fig
 
 
+# ─── v42 ADDITION: Gamma Flip × Net GEX over time (3 stacked auto-scaled panels) ──
+# Read-only use of values ALREADY saved in every history tick (spot, gamma_flip, gex)
+# plus the new gamma_flip_method field. No extra Dhan calls; nothing else reads it.
+#   ① NIFTY spot vs Gamma Flip (same price axis) + ±GRM_BAND_PCT near-flip band,
+#      ▲/▼ markers where spot crosses the flip, ◇ where the flip used the strike-domain fallback
+#   ② Spot − Flip as % of spot (green = above flip · red = below) with the ±band lines
+#   ③ Net GEX ÷ typical |GEX| (same ratio as the GEX × Gamma Flip matrix) with ±GRM_ZERO_MULT lines
+# Each panel is auto-scaled from today's data. Hypothesis tool — not yet validated.
+def _gfx_split(xs, ys):
+    """Insert interpolated zero crossings so the fill colour switches exactly at 0."""
+    px, py = [], []
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        if i > 0 and y is not None and ys[i - 1] is not None:
+            y0, x0 = ys[i - 1], xs[i - 1]
+            if (y0 < 0 < y) or (y0 > 0 > y):
+                px.append(x0 + (x - x0) * (y0 / (y0 - y))); py.append(0.0)
+        px.append(x); py.append(y)
+    return (px, [v if (v is not None and v >= 0) else None for v in py],
+            [v if (v is not None and v <= 0) else None for v in py])
+
+
+def _gfx_figure(today_hist, all_hist=None):
+    """Full-width 3-panel chart from today's history ticks. Never raises."""
+    from plotly.subplots import make_subplots
+    _titles = ("① NIFTY spot (navy) vs Gamma Flip (purple step) · dotted = ±{:.2f}% near-flip band"
+               .format(GRM_BAND_PCT),
+               "② Spot − Flip, % of spot · green = above flip · red = below flip",
+               "③ Net GEX ÷ typical |GEX| · blue = positive (dampening) · red = negative (amplifying)")
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.075,
+                        row_heights=[0.46, 0.24, 0.30], subplot_titles=_titles)
+    for _a in fig.layout.annotations:
+        _a.update(font=dict(size=11, color="#374151"), x=0.0, xanchor="left")
+
+    def _finish(note=None):
+        if note:
+            fig.add_annotation(text=note, xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+                               font=dict(size=13, color="#6B7280"))
+        fig.update_layout(
+            title=dict(text="★ Gamma Flip × Net GEX over time · today"
+                            "<br><sup>Flip and NIFTY share one price axis so the gap is real · "
+                            "panel ② shows that gap in % · panel ③ is the GEX × Gamma Flip matrix row variable</sup>",
+                       x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
+            height=600, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            margin=dict(l=62, r=24, t=92, b=40), font=dict(color="#1A1A2E", size=11),
+            legend=dict(orientation="h", y=-0.08, x=0, font=dict(size=10)), hovermode="x unified")
+        fig.update_xaxes(gridcolor="#F3F4F6", tickfont=dict(size=9))
+        fig.update_xaxes(tickformat="%H:%M", title=dict(text="Time (IST)", font=dict(size=10, color="#6B7280")),
+                         row=3, col=1)
+        return fig
+
+    try:
+        rows = []
+        for h in today_hist or []:
+            try:
+                t = datetime.strptime(str(h.get("ts", ""))[:19], "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                continue
+            sp = safe_num(h.get("spot"), 0.0)
+            if sp <= 0:
+                continue
+            gf = safe_num(h.get("gamma_flip"), 0.0) if h.get("gamma_flip") is not None else 0.0
+            gx = h.get("gex")
+            rows.append((t, sp, gf if gf > 0 else None,
+                         None if gx is None else safe_num(gx, 0.0), h.get("gamma_flip_method")))
+        rows.sort(key=lambda r: r[0])
+        if len(rows) < 2:
+            return _finish("Collecting Gamma Flip / Net GEX ticks… (needs at least 2 data fetches today)")
+
+        xs = [r[0] for r in rows]; sp = [r[1] for r in rows]; gf = [r[2] for r in rows]
+        gx = [r[3] for r in rows]; meth = [r[4] for r in rows]
+        bp = GRM_BAND_PCT
+
+        # typical |GEX| — same definition as compute_gamma_regime_matrix (median over history ticks)
+        _abs = [abs(safe_num(h.get("gex"), 0.0)) for h in (all_hist or today_hist or [])
+                if h.get("gex") not in (None, 0, 0.0)]
+        typical = float(np.median(_abs)) if _abs else None
+        calibrated = len(_abs) >= GRM_MIN_HIST
+        ratio = [(g / typical) if (g is not None and typical) else None for g in gx]
+        dist = [((s - f) / s * 100.0) if f else None for s, f in zip(sp, gf)]
+
+        # ── ① price panel ───────────────────────────────────────────────────
+        up_b = [f * (1 + bp / 100.0) if f else None for f in gf]
+        lo_b = [f * (1 - bp / 100.0) if f else None for f in gf]
+        for _yb, _show in ((up_b, True), (lo_b, False)):
+            fig.add_trace(go.Scatter(x=xs, y=_yb, mode="lines", connectgaps=False,
+                                     line=dict(color="#A78BFA", width=1.2, dash="dot", shape="hv"),
+                                     name=f"Near-flip band ±{bp:.2f}%", legendgroup="gfxband",
+                                     showlegend=_show, hoverinfo="skip"), row=1, col=1)
+        _ml = ["price-domain" if m_ == "price" else "strike-domain fallback" if m_ == "strike" else "method not logged"
+               for m_ in meth]
+        fig.add_trace(go.Scatter(x=xs, y=gf, mode="lines", name="Gamma Flip",
+                                 line=dict(color="#7C3AED", width=2.4, shape="hv"), connectgaps=False,
+                                 customdata=_ml,
+                                 hovertemplate="Gamma Flip %{y:,.0f}<br>%{customdata}<extra></extra>"),
+                      row=1, col=1)
+        fig.add_trace(go.Scatter(x=xs, y=sp, mode="lines", name="NIFTY spot",
+                                 line=dict(color="#1E3A8A", width=2.2),
+                                 hovertemplate="NIFTY %{y:,.2f}<extra></extra>"), row=1, col=1)
+        _fb = [(x, f) for x, f, m_ in zip(xs, gf, meth) if m_ == "strike" and f]
+        if _fb:
+            fig.add_trace(go.Scatter(x=[a for a, _ in _fb], y=[b for _, b in _fb], mode="markers",
+                                     name="Flip = strike-domain fallback",
+                                     marker=dict(symbol="diamond-open", size=8, color="#EA580C",
+                                                 line=dict(width=1.6, color="#EA580C")),
+                                     hovertemplate="Fallback flip %{y:,.0f}<extra></extra>"), row=1, col=1)
+        cu, cd = [], []
+        for i in range(1, len(rows)):
+            a, b = dist[i - 1], dist[i]
+            if a is None or b is None:
+                continue
+            if a <= 0 < b:
+                cu.append((xs[i], sp[i]))
+            elif a >= 0 > b:
+                cd.append((xs[i], sp[i]))
+        for pts_, sym, col_, lbl in ((cu, "triangle-up", "#059669", "Spot crossed ABOVE flip"),
+                                     (cd, "triangle-down", "#DC2626", "Spot crossed BELOW flip")):
+            if pts_:
+                fig.add_trace(go.Scatter(x=[a for a, _ in pts_], y=[b for _, b in pts_], mode="markers",
+                                         name=lbl, marker=dict(symbol=sym, size=12, color=col_,
+                                                               line=dict(width=1, color="#fff")),
+                                         hovertemplate=lbl + "<br>NIFTY %{y:,.1f}<extra></extra>"),
+                              row=1, col=1)
+        _pv = [v for v in sp + gf if v]
+        _pad = max((max(_pv) - min(_pv)) * 0.08, 10.0)
+        fig.update_yaxes(range=[min(_pv) - _pad, max(_pv) + _pad], tickformat=",.0f",
+                         title=dict(text="Price", font=dict(size=10, color="#1E3A8A")),
+                         tickfont=dict(size=9), gridcolor="#F3F4F6", row=1, col=1)
+
+        # ── ② distance panel ────────────────────────────────────────────────
+        px2, up2, dn2 = _gfx_split(xs, dist)
+        fig.add_trace(go.Scatter(x=px2, y=up2, mode="lines", name="Spot above flip",
+                                 line=dict(color="#059669", width=2.0), fill="tozeroy",
+                                 fillcolor="rgba(5,150,105,0.18)", connectgaps=False,
+                                 hovertemplate="Spot − Flip %{y:+.2f}%<extra></extra>"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=px2, y=dn2, mode="lines", name="Spot below flip",
+                                 line=dict(color="#DC2626", width=2.0), fill="tozeroy",
+                                 fillcolor="rgba(220,38,38,0.18)", connectgaps=False,
+                                 hovertemplate="Spot − Flip %{y:+.2f}%<extra></extra>"), row=2, col=1)
+        for yv, dash_ in ((bp, "dot"), (-bp, "dot"), (0.0, "solid")):
+            fig.add_hline(y=yv, line_width=1, line_dash=dash_,
+                          line_color="#7C3AED" if yv else "#9CA3AF", row=2, col=1)
+        _dm = max([abs(v) for v in dist if v is not None] + [bp * 1.6]) * 1.15
+        fig.update_yaxes(range=[-_dm, _dm], ticksuffix="%", zeroline=False,
+                         title=dict(text="Spot − Flip", font=dict(size=10, color="#6B7280")),
+                         tickfont=dict(size=9), gridcolor="#F3F4F6", row=2, col=1)
+
+        # ── ③ GEX ratio panel ───────────────────────────────────────────────
+        px3, up3, dn3 = _gfx_split(xs, ratio)
+        fig.add_trace(go.Scatter(x=px3, y=up3, mode="lines", name="Net GEX positive (dampening)",
+                                 line=dict(color="#2563EB", width=2.0), fill="tozeroy",
+                                 fillcolor="rgba(37,99,235,0.16)", connectgaps=False,
+                                 hovertemplate="GEX ÷ typical %{y:+.2f}×<extra></extra>"), row=3, col=1)
+        fig.add_trace(go.Scatter(x=px3, y=dn3, mode="lines", name="Net GEX negative (amplifying)",
+                                 line=dict(color="#DC2626", width=2.0), fill="tozeroy",
+                                 fillcolor="rgba(220,38,38,0.16)", connectgaps=False,
+                                 hovertemplate="GEX ÷ typical %{y:+.2f}×<extra></extra>"), row=3, col=1)
+        for yv, dash_ in ((GRM_ZERO_MULT, "dot"), (-GRM_ZERO_MULT, "dot"), (0.0, "solid")):
+            fig.add_hline(y=yv, line_width=1, line_dash=dash_, line_color="#6B7280" if yv else "#9CA3AF",
+                          row=3, col=1)
+        _rm = max([abs(v) for v in ratio if v is not None] + [GRM_ZERO_MULT * 1.6]) * 1.15
+        fig.update_yaxes(range=[-_rm, _rm], ticksuffix="×", zeroline=False,
+                         title=dict(text="GEX ÷ typical", font=dict(size=10, color="#6B7280")),
+                         tickfont=dict(size=9), gridcolor="#F3F4F6", row=3, col=1)
+
+        # ── current-value box (top-left of panel ①) ──────────────────────────
+        _s, _f, _d, _r, _m = sp[-1], gf[-1], dist[-1], ratio[-1], meth[-1]
+        if _d is None:
+            _zone, _zc = "flip unavailable", "#6B7280"
+        elif abs(_d) <= bp:
+            _zone, _zc = "NEAR flip", "#B45309"
+        elif _d > 0:
+            _zone, _zc = "ABOVE flip", "#059669"
+        else:
+            _zone, _zc = "BELOW flip", "#DC2626"
+        if _r is None:
+            _row = "GEX n/a"
+        elif _r > GRM_ZERO_MULT:
+            _row = "GEX positive"
+        elif _r < -GRM_ZERO_MULT:
+            _row = "GEX negative"
+        else:
+            _row = "GEX near zero"
+        _cal = "" if calibrated else f" · typical |GEX| calibrating ({len(_abs)}/{GRM_MIN_HIST} ticks)"
+        _txt = (f"<b style='color:{_zc}'>{_zone}</b> · NIFTY {_s:,.1f} · Flip "
+                + (f"{_f:,.0f}" if _f else "—")
+                + (f" ({'fallback' if _m == 'strike' else 'price-domain' if _m == 'price' else 'method n/a'})" if _f else "")
+                + (f"<br>Spot − Flip {_s - _f:+,.0f} pts ({_d:+.2f}%)" if _d is not None else "")
+                + (f" · GEX ÷ typical {_r:+.2f}× → {_row}" if _r is not None else f" · {_row}")
+                + f"<span style='color:#6B7280;font-size:10px'>{_cal}</span>")
+        fig.add_annotation(xref="x domain", yref="y domain", x=0.005, y=0.97, xanchor="left", yanchor="top",
+                           showarrow=False, align="left", bgcolor="rgba(255,255,255,0.93)",
+                           bordercolor=_zc, borderwidth=2, borderpad=5, text=_txt, font=dict(size=11),
+                           row=1, col=1)
+        return _finish()
+    except Exception as _e:
+        try:
+            print(f"[gfx] {_e}", flush=True)
+        except Exception:
+            pass
+        return _finish(f"Gamma Flip × Net GEX chart unavailable ({_e})")
+
+
 def compute_metrics(df, spot, expiry=None, history=None):
     if df.empty:
         return {}
@@ -2285,8 +2490,10 @@ def compute_metrics(df, spot, expiry=None, history=None):
             except ValueError:
                 continue
     gamma_flip = compute_gamma_flip_true(w, spot, _T_flip)
+    _gamma_flip_method = "price" if gamma_flip is not None else None          # v42
     if gamma_flip is None:
         gamma_flip = _gamma_flip_naive
+        _gamma_flip_method = "strike" if gamma_flip is not None else None     # v42: fallback
     iv_rank, iv_pct = compute_iv_rank(w, atm)
     gt_ratio = abs(net_gamma) / max(abs(net_theta), 1e-6)
     total_coi = float(w["call_oi"].sum())
@@ -2413,6 +2620,7 @@ def compute_metrics(df, spot, expiry=None, history=None):
         "net_theta": round(net_theta, 0),
         "gex": round(gex, 0),
         "gamma_flip": round(gamma_flip, 0) if gamma_flip is not None else None,
+        "gamma_flip_method": _gamma_flip_method,      # v42: "price" | "strike" (fallback) | None
         "iv_rank": iv_rank,
         "iv_pct": iv_pct,
         "iv_rank_is_temporal": _iv_rank_is_temporal,   # CI #2 fix
@@ -4686,6 +4894,7 @@ def build_history_entry(m, spot, call_oi_total, put_oi_total, expiry, synth_exce
         "atm_pressure": m.get("atm_pressure", 0),
         "wall_width":   m.get("wall_width", 0),
         "gamma_flip":   m.get("gamma_flip", None),
+        "gamma_flip_method": m.get("gamma_flip_method"),   # v42
         "iv_rank":      m.get("iv_rank", 50),
         "gt_ratio":     m.get("gt_ratio", 0),
         "atm":          m.get("atm", 0),
@@ -9147,6 +9356,13 @@ with _slot_summary:
                         width='stretch', config={"displayModeBar": False}, key="fdm_oi15_strength")
     except Exception as _oi15s_e:
         st.caption(f"15-min momentum strength unavailable ({_oi15s_e})")
+
+    # v42: Gamma Flip × Net GEX over time — full width, just below momentum strength
+    try:
+        st.plotly_chart(_gfx_figure(today_history, history), width='stretch',
+                        config={"displayModeBar": False}, key="fdm_gfx")
+    except Exception as _gfx_e:
+        st.caption(f"Gamma Flip × Net GEX chart unavailable ({_gfx_e})")
 
     # v32: Max Pain time series (CURRENT green / NEXT blue)
     try:
