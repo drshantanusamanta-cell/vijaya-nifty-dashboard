@@ -37,6 +37,8 @@
 ║  v42 — 29-Oct-2026: Gamma Flip × Net GEX over time — full-width   ║
 ║        3-panel chart (spot vs flip · spot−flip % · GEX ratio)     ║
 ║        below Momentum Strength in the FDM · flip method saved     ║
+║  v42.1 — outlier-tick filter, robust auto-scale, thicker lines    ║
+║  v42.2 — demo-fallback ticks (API ERROR) never saved to history   ║
 ║  All data and calculations are LIVE during market hours             ║
 ║  (Mon-Fri 09:1515:30 IST). Outside market hours: DEMO/CACHED.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -2227,7 +2229,7 @@ def _gfx_figure(today_hist, all_hist=None):
                "② Spot − Flip, % of spot · green = above flip · red = below flip",
                "③ Net GEX ÷ typical |GEX| · blue = positive (dampening) · red = negative (amplifying)")
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.075,
-                        row_heights=[0.46, 0.24, 0.30], subplot_titles=_titles)
+                        row_heights=[0.48, 0.24, 0.28], subplot_titles=_titles)
     for _a in fig.layout.annotations:
         _a.update(font=dict(size=11, color="#374151"), x=0.0, xanchor="left")
 
@@ -2240,10 +2242,13 @@ def _gfx_figure(today_hist, all_hist=None):
                             "<br><sup>Flip and NIFTY share one price axis so the gap is real · "
                             "panel ② shows that gap in % · panel ③ is the GEX × Gamma Flip matrix row variable</sup>",
                        x=0.02, xanchor="left", font=dict(size=12, color="#1A1A2E")),
-            height=600, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
+            height=820, paper_bgcolor="#fff", plot_bgcolor="#F9FAFB",
             margin=dict(l=62, r=24, t=92, b=40), font=dict(color="#1A1A2E", size=11),
             legend=dict(orientation="h", y=-0.08, x=0, font=dict(size=10)), hovermode="x unified")
-        fig.update_xaxes(gridcolor="#F3F4F6", tickfont=dict(size=9))
+        fig.update_xaxes(gridcolor="#F3F4F6", tickfont=dict(size=10))
+        fig.update_yaxes(hoverformat=",.2f", row=1, col=1)
+        fig.update_yaxes(hoverformat="+.2f", row=2, col=1)
+        fig.update_yaxes(hoverformat="+.2f", row=3, col=1)
         fig.update_xaxes(tickformat="%H:%M", title=dict(text="Time (IST)", font=dict(size=10, color="#6B7280")),
                          row=3, col=1)
         return fig
@@ -2263,6 +2268,15 @@ def _gfx_figure(today_hist, all_hist=None):
             rows.append((t, sp, gf if gf > 0 else None,
                          None if gx is None else safe_num(gx, 0.0), h.get("gamma_flip_method")))
         rows.sort(key=lambda r: r[0])
+        # v42.1: drop ticks whose spot is > 3 % from today's median (e.g. demo-fallback ticks
+        # recorded during an API error) and flips > 4 % from spot — one bad tick otherwise
+        # stretches every axis and flattens the real moves.
+        _n_raw = len(rows)
+        if rows:
+            _med = float(np.median([r[1] for r in rows]))
+            rows = [r for r in rows if abs(r[1] / _med - 1.0) <= 0.03]
+            rows = [(t, s, (f if (f and abs(f / s - 1.0) <= 0.04) else None), g, m_) for t, s, f, g, m_ in rows]
+        _n_drop = _n_raw - len(rows)
         if len(rows) < 2:
             return _finish("Collecting Gamma Flip / Net GEX ticks… (needs at least 2 data fetches today)")
 
@@ -2283,18 +2297,18 @@ def _gfx_figure(today_hist, all_hist=None):
         lo_b = [f * (1 - bp / 100.0) if f else None for f in gf]
         for _yb, _show in ((up_b, True), (lo_b, False)):
             fig.add_trace(go.Scatter(x=xs, y=_yb, mode="lines", connectgaps=False,
-                                     line=dict(color="#A78BFA", width=1.2, dash="dot", shape="hv"),
+                                     line=dict(color="#A78BFA", width=1.8, dash="dot", shape="hv"),
                                      name=f"Near-flip band ±{bp:.2f}%", legendgroup="gfxband",
                                      showlegend=_show, hoverinfo="skip"), row=1, col=1)
         _ml = ["price-domain" if m_ == "price" else "strike-domain fallback" if m_ == "strike" else "method not logged"
                for m_ in meth]
         fig.add_trace(go.Scatter(x=xs, y=gf, mode="lines", name="Gamma Flip",
-                                 line=dict(color="#7C3AED", width=2.4, shape="hv"), connectgaps=False,
+                                 line=dict(color="#7C3AED", width=3.4, shape="hv"), connectgaps=False,
                                  customdata=_ml,
                                  hovertemplate="Gamma Flip %{y:,.0f}<br>%{customdata}<extra></extra>"),
                       row=1, col=1)
         fig.add_trace(go.Scatter(x=xs, y=sp, mode="lines", name="NIFTY spot",
-                                 line=dict(color="#1E3A8A", width=2.2),
+                                 line=dict(color="#1E3A8A", width=3.2),
                                  hovertemplate="NIFTY %{y:,.2f}<extra></extra>"), row=1, col=1)
         _fb = [(x, f) for x, f, m_ in zip(xs, gf, meth) if m_ == "strike" and f]
         if _fb:
@@ -2316,12 +2330,12 @@ def _gfx_figure(today_hist, all_hist=None):
                                      (cd, "triangle-down", "#DC2626", "Spot crossed BELOW flip")):
             if pts_:
                 fig.add_trace(go.Scatter(x=[a for a, _ in pts_], y=[b for _, b in pts_], mode="markers",
-                                         name=lbl, marker=dict(symbol=sym, size=12, color=col_,
+                                         name=lbl, marker=dict(symbol=sym, size=14, color=col_,
                                                                line=dict(width=1, color="#fff")),
                                          hovertemplate=lbl + "<br>NIFTY %{y:,.1f}<extra></extra>"),
                               row=1, col=1)
         _pv = [v for v in sp + gf if v]
-        _pad = max((max(_pv) - min(_pv)) * 0.08, 10.0)
+        _pad = max((max(_pv) - min(_pv)) * 0.10, 8.0)
         fig.update_yaxes(range=[min(_pv) - _pad, max(_pv) + _pad], tickformat=",.0f",
                          title=dict(text="Price", font=dict(size=10, color="#1E3A8A")),
                          tickfont=dict(size=9), gridcolor="#F3F4F6", row=1, col=1)
@@ -2329,17 +2343,17 @@ def _gfx_figure(today_hist, all_hist=None):
         # ── ② distance panel ────────────────────────────────────────────────
         px2, up2, dn2 = _gfx_split(xs, dist)
         fig.add_trace(go.Scatter(x=px2, y=up2, mode="lines", name="Spot above flip",
-                                 line=dict(color="#059669", width=2.0), fill="tozeroy",
-                                 fillcolor="rgba(5,150,105,0.18)", connectgaps=False,
+                                 line=dict(color="#059669", width=2.8), fill="tozeroy",
+                                 fillcolor="rgba(5,150,105,0.22)", connectgaps=False,
                                  hovertemplate="Spot − Flip %{y:+.2f}%<extra></extra>"), row=2, col=1)
         fig.add_trace(go.Scatter(x=px2, y=dn2, mode="lines", name="Spot below flip",
-                                 line=dict(color="#DC2626", width=2.0), fill="tozeroy",
-                                 fillcolor="rgba(220,38,38,0.18)", connectgaps=False,
+                                 line=dict(color="#DC2626", width=2.8), fill="tozeroy",
+                                 fillcolor="rgba(220,38,38,0.22)", connectgaps=False,
                                  hovertemplate="Spot − Flip %{y:+.2f}%<extra></extra>"), row=2, col=1)
         for yv, dash_ in ((bp, "dot"), (-bp, "dot"), (0.0, "solid")):
             fig.add_hline(y=yv, line_width=1, line_dash=dash_,
                           line_color="#7C3AED" if yv else "#9CA3AF", row=2, col=1)
-        _dm = max([abs(v) for v in dist if v is not None] + [bp * 1.6]) * 1.15
+        _dm = max(float(np.percentile([abs(v) for v in dist if v is not None] or [0.0], 98)), bp * 1.6) * 1.2
         fig.update_yaxes(range=[-_dm, _dm], ticksuffix="%", zeroline=False,
                          title=dict(text="Spot − Flip", font=dict(size=10, color="#6B7280")),
                          tickfont=dict(size=9), gridcolor="#F3F4F6", row=2, col=1)
@@ -2347,17 +2361,17 @@ def _gfx_figure(today_hist, all_hist=None):
         # ── ③ GEX ratio panel ───────────────────────────────────────────────
         px3, up3, dn3 = _gfx_split(xs, ratio)
         fig.add_trace(go.Scatter(x=px3, y=up3, mode="lines", name="Net GEX positive (dampening)",
-                                 line=dict(color="#2563EB", width=2.0), fill="tozeroy",
-                                 fillcolor="rgba(37,99,235,0.16)", connectgaps=False,
+                                 line=dict(color="#2563EB", width=2.8), fill="tozeroy",
+                                 fillcolor="rgba(37,99,235,0.20)", connectgaps=False,
                                  hovertemplate="GEX ÷ typical %{y:+.2f}×<extra></extra>"), row=3, col=1)
         fig.add_trace(go.Scatter(x=px3, y=dn3, mode="lines", name="Net GEX negative (amplifying)",
-                                 line=dict(color="#DC2626", width=2.0), fill="tozeroy",
-                                 fillcolor="rgba(220,38,38,0.16)", connectgaps=False,
+                                 line=dict(color="#DC2626", width=2.8), fill="tozeroy",
+                                 fillcolor="rgba(220,38,38,0.22)", connectgaps=False,
                                  hovertemplate="GEX ÷ typical %{y:+.2f}×<extra></extra>"), row=3, col=1)
         for yv, dash_ in ((GRM_ZERO_MULT, "dot"), (-GRM_ZERO_MULT, "dot"), (0.0, "solid")):
             fig.add_hline(y=yv, line_width=1, line_dash=dash_, line_color="#6B7280" if yv else "#9CA3AF",
                           row=3, col=1)
-        _rm = max([abs(v) for v in ratio if v is not None] + [GRM_ZERO_MULT * 1.6]) * 1.15
+        _rm = max(float(np.percentile([abs(v) for v in ratio if v is not None] or [0.0], 98)), GRM_ZERO_MULT * 1.6) * 1.2
         fig.update_yaxes(range=[-_rm, _rm], ticksuffix="×", zeroline=False,
                          title=dict(text="GEX ÷ typical", font=dict(size=10, color="#6B7280")),
                          tickfont=dict(size=9), gridcolor="#F3F4F6", row=3, col=1)
@@ -2381,6 +2395,8 @@ def _gfx_figure(today_hist, all_hist=None):
         else:
             _row = "GEX near zero"
         _cal = "" if calibrated else f" · typical |GEX| calibrating ({len(_abs)}/{GRM_MIN_HIST} ticks)"
+        if _n_drop:
+            _cal += f" · {_n_drop} outlier tick(s) hidden"
         _txt = (f"<b style='color:{_zc}'>{_zone}</b> · NIFTY {_s:,.1f} · Flip "
                 + (f"{_f:,.0f}" if _f else "—")
                 + (f" ({'fallback' if _m == 'strike' else 'price-domain' if _m == 'price' else 'method n/a'})" if _f else "")
@@ -4932,6 +4948,14 @@ _srv_cache_lock      = _SH["srv_lock"]      # v27: shared across reruns/visitors
 _srv_cache           = _SH["srv_cache"]     # v27: shared across reruns/visitors
 _srv_fetch_in_progress = False     # CI #7 fix: single-flight flag
 
+def _is_demo_fallback(src_or_payload):
+    """v42.2: True when this tick is demo data served after a live Dhan API error.
+    Such ticks are shown on screen (with the red API ERROR banner) but never saved
+    to history, state or log files, so they cannot distort any time series."""
+    s = src_or_payload.get("source", "") if isinstance(src_or_payload, dict) else src_or_payload
+    return bool(USE_DHAN and s and "API ERROR" in str(s))
+
+
 def _raw_fetch_and_compute(expiry_override=None, history=None):
     """Actual Dhan API fetch — never called directly by visitors."""
     df, spot, expiry, source = get_option_chain(expiry_override)
@@ -4971,7 +4995,8 @@ def _raw_fetch_and_compute(expiry_override=None, history=None):
         "is_live":       is_market_hours() and USE_DHAN,
     }
     # v27: synthetic-forward bias ladder + 25Δ RR (Final Decision Matrix) — once per fetch
-    payload["fdm_bias"] = _fdmb_snapshot(df, spot, expiry)
+    payload["fdm_bias"] = (None if _is_demo_fallback(source)            # v42.2
+                           else _fdmb_snapshot(df, spot, expiry))
     return payload, source
 
 
@@ -5714,6 +5739,8 @@ def _v27_record_history_tick(payload, fetch_ts):
     try:
         if not payload or not fetch_ts:
             return
+        if _is_demo_fallback(payload):          # v42.2: never record demo-fallback ticks
+            return
         m = payload["metrics"]
         _recs = payload.get("df_band") or []
         _cot = sum(r.get("call_oi", 0) for r in _recs)      # same formula as the visitor path
@@ -6066,6 +6093,7 @@ if payload is None:
     st.stop()
 
 m        = payload["metrics"]
+_rec_key = None if _is_demo_fallback(payload) else payload.get("ts_ist")   # v42.2: None → nothing saved
 spot     = payload["spot"]
 expiry   = payload["expiry"]
 # CHANGE 1 (audit fix): legacy bias is retained ONLY for its regime / vol_regime /
@@ -6172,7 +6200,8 @@ _s34_breakdown = _s34_bias.get("signal_breakdown", {})
 # requires zero stored history beyond the current session.
 _current_norm_skew = _s34_bias.get("norm_skew", 30.0)
 # v27: anchor fixed once per trading day for all visitors (was once per browser session)
-st.session_state.opening_norm_skew = _v27_daily_skew_anchor(_current_norm_skew)
+st.session_state.opening_norm_skew = (_current_norm_skew if not _rec_key            # v42.2
+                                      else _v27_daily_skew_anchor(_current_norm_skew))
 _delta_skew = _current_norm_skew - st.session_state.opening_norm_skew
 # 15 pct-point intraday change → full ±3 pts; sign: rising skew = bearish (negative)
 _s4_intra = max(-3.0, min(3.0, -(_delta_skew / 15.0) * 3.0))
@@ -6433,7 +6462,7 @@ with _SH["bias_lock"]:
     _bh_disk_cur = _load_bias_history()
     _last_bh_fetch_ts = float(_bh_disk_cur[-1].get("_fetch_ts", 0)) if _bh_disk_cur else 0.0
 
-    if _payload_fetch_ts != _last_bh_fetch_ts:
+    if _payload_fetch_ts != _last_bh_fetch_ts and _rec_key:   # v42.2
         # Start from the freshest disk state so no visitor session goes out of sync
         _bh_tmp = _bh_disk_cur
         _bh_tmp.append({
@@ -8722,7 +8751,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
 
         # v34: rolling 15-min Δ-weighted OI change (call/put split) — full width
         try:
-            _oi15_b, _oi15_c = _oi15_record(payload.get("ts_ist"), df_band, payload.get("expiry"))
+            _oi15_b, _oi15_c = (_oi15_record(_rec_key, df_band, payload.get("expiry")) if _rec_key else (None, None))   # v42.2
             _oi15_fig = _oi15_figure(df_band, spot, _oi15_b, _oi15_c)
             st.plotly_chart(_oi15_fig, width='stretch', config={"displayModeBar":False}, key="s4_oi15")
         except Exception as _oi15_e:
@@ -8955,7 +8984,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
                 _s4_base = json.load(_fh)
         except Exception:
             _s4_base = {}
-        if _s4_base.get("key") != _s4_key:
+        if _s4_base.get("key") != _s4_key and _rec_key:   # v42.2
             _s4_base = {"key": _s4_key,
                         "ratios": {str(int(k)): (float(v) if np.isfinite(v) else None)
                                    for k, v in zip(x, _dwr_oi_s)}}
@@ -9027,6 +9056,8 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
             _jscore = round(_d1 + _d2 + _d3, 2)
             _jgex = "positive" if float(gv[_jm].sum()) > 0 else "negative"
             _J_FILE = os.path.join(_BASE_DIR, "nifty_s4_signal_journal.csv")
+            if not _rec_key:                     # v42.2: no journal row for demo-fallback ticks
+                raise RuntimeError("demo-fallback tick — journal row skipped")
             _jts  = str(payload.get("ts_ist", ""))
             _jrow = (f"{_jts},{spot},{_d1},{_d2},{_d3},{_jscore},{_jgex},"
                      f"{safe_num(m.get('gamma_flip', 0))}\n")
@@ -9065,7 +9096,7 @@ with _slot_s4:   # v8: render into top-of-dashboard slot (display order only)
         _iv_otm_c    = df_band.loc[
             df_band["strike"].between(_iv_atm + 2*_iv_step, _iv_atm + 6*_iv_step) & (df_band["call_iv"] > 0.5), "call_iv"
         ]
-        if len(_iv_otm_p) >= 2 and len(_iv_otm_c) >= 2 and _iv_atm_iv > 0:
+        if len(_iv_otm_p) >= 2 and len(_iv_otm_c) >= 2 and _iv_atm_iv > 0 and _rec_key:   # v42.2
             _iv_pwe  = float(_iv_otm_p.mean()) - _iv_atm_iv
             _iv_cwe  = float(_iv_otm_c.mean()) - _iv_atm_iv
             _iv_tick = {
@@ -9351,7 +9382,7 @@ with _slot_summary:
     try:
         _oi15s_val, _oi15s_win, _oi15s_g = _oi15_strength(df_band, globals().get("_oi15_b"), globals().get("_oi15_c"))
         _oi15s_ss = _oi_session_strength(df_band)
-        st.plotly_chart(_oi15s_figure(_oi15s_record(payload.get("ts_ist"), _oi15s_val, _oi15s_g,
+        st.plotly_chart(_oi15s_figure(_oi15s_record(_rec_key, _oi15s_val, _oi15s_g,
                                                     _oi15s_ss, spot, _oi15s_win)),
                         width='stretch', config={"displayModeBar": False}, key="fdm_oi15_strength")
     except Exception as _oi15s_e:
@@ -9366,7 +9397,7 @@ with _slot_summary:
 
     # v32: Max Pain time series (CURRENT green / NEXT blue)
     try:
-        st.plotly_chart(_mp_ts_figure(_mp_ts_record(payload.get("ts_ist"), _mp_cur_s4, _mp_nxt_s4,
+        st.plotly_chart(_mp_ts_figure(_mp_ts_record(_rec_key, _mp_cur_s4, _mp_nxt_s4,
                                                     _mp_lbl_s4, _mp_nxtlbl_s4)),
                         width='stretch', config={"displayModeBar": False}, key="fdm_mp_ts")
     except Exception as _mpts_e:
@@ -9374,7 +9405,7 @@ with _slot_summary:
 
     # v33: GEX Put Wall / Call Wall time series (same values as the tiles above)
     try:
-        st.plotly_chart(_wall_ts_figure(_wall_ts_record(payload.get("ts_ist"), _sum_pw, _sum_cw)),
+        st.plotly_chart(_wall_ts_figure(_wall_ts_record(_rec_key, _sum_pw, _sum_cw)),
                         width='stretch', config={"displayModeBar": False}, key="fdm_gex_walls_ts")
     except Exception as _wts_e:
         st.caption(f"GEX walls time series unavailable ({_wts_e})")
@@ -9603,7 +9634,7 @@ with _slot_summary:
         if _bs_mp is not None and _prev_mp is not None and _bs_mp != _prev_mp:
             _bs_lines.append(f"MAX PAIN moved {'UP' if _bs_mp > _prev_mp else 'DOWN'} — {_prev_mp:,} → {_bs_mp:,} vs previous data refresh.")
 
-        if _bs_prev.get("ts") != _bs_ts:   # persist once per data tick (not per rerender)
+        if _bs_prev.get("ts") != _bs_ts and _rec_key:   # v42.2 · persist once per data tick (not per rerender)
             # v23: basis_gap appended so Layer C can show the futures−synthetic
             # gap trend on the next tick. Additive key — older state files
             # without it simply read back None and the trend line is skipped.
